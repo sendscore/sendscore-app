@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/mail"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -217,8 +218,8 @@ func (a *App) testCounter(u *db.User, ip string) (string, int) {
 	return "tests:ip:" + ip, a.cfg.AnonDailyTests
 }
 
-// dailyLimit is the user's test addresses per UTC day. Every account is on
-// the free plan until billing adds others.
+// dailyLimit is the user's test addresses per UTC day, the same on every
+// plan for now.
 func (a *App) dailyLimit(u *db.User) int {
 	switch u.Plan {
 	default:
@@ -416,6 +417,7 @@ func (a *App) verify(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, http.StatusInternalServerError, "Could not sign you in. Try the link again in a minute.")
 		return
 	}
+	a.promote(r.Context(), &u)
 	a.setCookie(w, sessionCookie, session, db.SessionTTL)
 	a.rememberBrowser(w, r, u.Email)
 	next := safeNext(u.Next)
@@ -423,6 +425,19 @@ func (a *App) verify(w http.ResponseWriter, r *http.Request) {
 		next = "/account"
 	}
 	localRedirect(w, next)
+}
+
+// promote puts an address listed in ProEmails on the pro plan as it signs
+// in, until billing exists.
+func (a *App) promote(ctx context.Context, u *db.User) {
+	if u.Plan == db.PlanPro || !slices.Contains(a.cfg.ProEmails, u.Email) {
+		return
+	}
+	if err := a.store.SetPlan(ctx, u.ID, db.PlanPro); err != nil {
+		a.log.Error("set plan", "err", err)
+		return
+	}
+	u.Plan = db.PlanPro
 }
 
 // rememberBrowser records that this browser signed in to email, for the

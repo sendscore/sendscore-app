@@ -136,3 +136,49 @@ CREATE TABLE IF NOT EXISTS known_browsers (
 	expires_at  INTEGER NOT NULL,
 	PRIMARY KEY (token_hash, email)
 );
+
+-- Monitored newsletters. Mail to m-<token>@<mail domain> is checked and
+-- stored against the publication, and compared with its last issue. The
+-- address never expires. days is a bit set of weekdays (bit 0 is Sunday) and
+-- at a local time HH:MM in time_zone; days 0 means no schedule. watch_since
+-- is when the schedule last changed or alerts were last turned back on, so a
+-- slot from before then is never reported as missed.
+CREATE TABLE IF NOT EXISTS publications (
+	id             TEXT PRIMARY KEY,
+	user_id        TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	name           TEXT NOT NULL,
+	token          TEXT NOT NULL UNIQUE,
+	days           INTEGER NOT NULL DEFAULT 0,
+	at             TEXT NOT NULL DEFAULT '',
+	time_zone      TEXT NOT NULL DEFAULT 'UTC',
+	grace_minutes  INTEGER NOT NULL DEFAULT 30,
+	alert_email    TEXT NOT NULL,
+	paused         INTEGER NOT NULL DEFAULT 0,
+	watch_since    INTEGER NOT NULL,
+	created_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS publications_user ON publications(user_id, created_at);
+
+-- Alerts, written before they are sent so a restart never sends one twice.
+-- key is what the alert is about (report:<id> or slot:<unix>), and the
+-- unique index makes each one once only. status is pending, sending, sent,
+-- failed, or capped (over the daily cap, never sent).
+CREATE TABLE IF NOT EXISTS alerts (
+	id              TEXT PRIMARY KEY,
+	publication_id  TEXT NOT NULL REFERENCES publications(id) ON DELETE CASCADE,
+	kind            TEXT NOT NULL,            -- worse, missed, or duplicate
+	key             TEXT NOT NULL,
+	report_id       TEXT NOT NULL DEFAULT '',
+	to_addr         TEXT NOT NULL,
+	subject         TEXT NOT NULL,
+	text_body       TEXT NOT NULL,
+	html_body       TEXT NOT NULL,
+	status          TEXT NOT NULL,
+	attempts        INTEGER NOT NULL DEFAULT 0,
+	error           TEXT NOT NULL DEFAULT '',
+	created_at      INTEGER NOT NULL,
+	claimed_at      INTEGER NOT NULL DEFAULT 0,
+	sent_at         INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS alerts_once ON alerts(publication_id, kind, key);
+CREATE INDEX IF NOT EXISTS alerts_status ON alerts(status);

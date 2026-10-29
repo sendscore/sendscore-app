@@ -66,6 +66,16 @@ type Config struct {
 	// service in an hour, on top of the per-network limit. It defaults to
 	// 600.
 	RegistrationsPerHour int
+	// ProPublications and FreePublications are how many newsletters a pro
+	// and a free account may monitor. ProPublications defaults to 5.
+	ProPublications  int
+	FreePublications int
+	// ProEmails are put on the pro plan when they sign in, until billing
+	// exists.
+	ProEmails []string
+	// HistoryDays is how long a pro account's newsletter history is kept,
+	// for the pages to say.
+	HistoryDays int
 }
 
 // Bounds on long polls (API and MCP waits) open at once, per account and in
@@ -119,6 +129,12 @@ func New(cfg Config, store *db.Store, log *slog.Logger) (*App, error) {
 	if cfg.RegistrationsPerHour == 0 {
 		cfg.RegistrationsPerHour = 600
 	}
+	if cfg.ProPublications == 0 {
+		cfg.ProPublications = DefaultProPublications
+	}
+	if cfg.HistoryDays == 0 {
+		cfg.HistoryDays = 365
+	}
 	a := &App{cfg: cfg, store: store, log: log, tmpl: map[string]*template.Template{}, quit: make(chan struct{}),
 		waits: map[string]int{}, uploads: make(chan struct{}, maxUploads)}
 	funcs := template.FuncMap{
@@ -137,8 +153,17 @@ func New(cfg Config, store *db.Store, log *slog.Logger) (*App, error) {
 			b, _ := json.MarshalIndent(v, "", "  ")
 			return string(b)
 		},
+		// local formats t in an IANA time zone, falling back to UTC.
+		"local": func(t time.Time, zone string) string {
+			if loc, err := time.LoadLocation(zone); err == nil {
+				t = t.In(loc)
+			}
+			return t.Format("Mon 2 Jan 2006, 15:04 MST")
+		},
+		"worsened": worsened,
 	}
-	for _, page := range []string{"home", "address", "report", "upload", "error", "signin", "account", "consent"} {
+	for _, page := range []string{"home", "address", "report", "upload", "error", "signin", "account", "consent",
+		"newsletters", "newsletter", "newsletter_form", "newsletter_delete", "message"} {
 		t, err := template.New("layout.html").Funcs(funcs).ParseFS(templateFS, "templates/layout.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, err
@@ -181,6 +206,17 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("POST /account/tokens/{id}/revoke", a.form(formLimit, a.revokeToken))
 	mux.HandleFunc("POST /account/apps/{id}/disconnect", a.form(formLimit, a.disconnect))
 
+	// Monitored newsletters (see newsletters.go).
+	mux.HandleFunc("GET /newsletters", a.newsletters)
+	mux.HandleFunc("GET /newsletters/new", a.newNewsletter)
+	mux.HandleFunc("POST /newsletters", a.form(formLimit, a.createNewsletter))
+	mux.HandleFunc("GET /newsletters/{id}", a.newsletter)
+	mux.HandleFunc("POST /newsletters/{id}", a.form(formLimit, a.updateNewsletter))
+	mux.HandleFunc("GET /newsletters/{id}/edit", a.editNewsletter)
+	mux.HandleFunc("GET /newsletters/{id}/delete", a.deleteNewsletterForm)
+	mux.HandleFunc("POST /newsletters/{id}/delete", a.form(formLimit, a.deleteNewsletter))
+	mux.HandleFunc("GET /newsletters/{id}/messages/{mid}", a.messageView)
+
 	// OAuth for the MCP connector (see oauth.go).
 	mux.Handle("/.well-known/oauth-protected-resource", cors(http.HandlerFunc(a.protectedResource)))
 	mux.Handle("/.well-known/oauth-protected-resource/api/mcp", cors(http.HandlerFunc(a.protectedResource)))
@@ -195,6 +231,8 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/test-addresses", a.api(a.apiCreateAddress))
 	mux.HandleFunc("GET /api/v1/test-addresses/{token}/wait", a.api(a.apiWait))
 	mux.HandleFunc("GET /api/v1/reports/{id}", a.api(a.apiReport))
+	mux.HandleFunc("GET /api/v1/publications", a.api(a.apiPublications))
+	mux.HandleFunc("GET /api/v1/publications/{id}", a.api(a.apiPublicationByID))
 	mux.Handle("/api/mcp", cors(a.mcpAuth(a.mcpHandler())))
 	return a.secure(a.session(mux))
 }
@@ -457,6 +495,12 @@ func (a *App) reportPage(w http.ResponseWriter, r *http.Request) {
 		if addr, err := a.store.AnyAddressByToken(r.Context(), m.Token); err == nil && a.ownsAddress(r, addr) {
 			data["Resend"] = !addr.Expired(a.store.Now())
 			data["Address"] = a.address(addr.Token)
+		}
+	}
+	// The owner of a newsletter gets a way back to its timeline.
+	if u := userFrom(r.Context()); m.PublicationID != "" && u != nil {
+		if p, err := a.store.PublicationForUser(r.Context(), m.PublicationID, u.ID); err == nil {
+			data["Publication"] = p
 		}
 	}
 	a.render(w, r, http.StatusOK, "report", data)

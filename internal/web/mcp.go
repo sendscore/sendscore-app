@@ -85,7 +85,9 @@ func (a *App) mcpHandler() http.Handler {
 		if u == nil {
 			return nil
 		}
-		return mcpserver.New(storeBackend{a: a, user: u}, "app")
+		s := mcpserver.New(storeBackend{a: a, user: u}, "app")
+		a.addPublicationTools(s, u)
+		return s
 	}, &mcp.StreamableHTTPOptions{
 		Stateless: true, JSONResponse: true, Logger: a.log,
 		// The SDK refuses loopback requests with a public Host header, which

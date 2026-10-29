@@ -1,5 +1,6 @@
 // Command sendtest delivers a saved .eml to the local SMTP receiver, for
-// testing without a public MX record.
+// testing without a public MX record. The address may be a test address
+// (t-...) or a newsletter's monitoring address (m-...).
 //
 //	go run ./cmd/sendtest -to t-abc123@localhost message.eml
 package main
@@ -16,11 +17,11 @@ import (
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:2525", "SMTP receiver address")
-	to := flag.String("to", "", "test address to deliver to (required)")
+	to := flag.String("to", "", "test or monitoring address to deliver to (required)")
 	from := flag.String("from", "", "envelope sender; defaults to the message's Return-Path or From")
 	flag.Parse()
 	if *to == "" || flag.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "usage: sendtest -to t-<token>@localhost [-from sender] message.eml")
+		fmt.Fprintln(os.Stderr, "usage: sendtest -to t-<token>@localhost (or m-<token>@localhost) [-from sender] message.eml")
 		os.Exit(64)
 	}
 	raw, err := os.ReadFile(flag.Arg(0))

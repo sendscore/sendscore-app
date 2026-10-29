@@ -1,0 +1,45 @@
+{{define "content"}}
+<section class="sheet">
+  <p class="label">Newsletter</p>
+  <div>
+    <h1>{{.P.Name}}</h1>
+    <p>Subscribe this address to the newsletter, the same way any reader signs up.</p>
+    <p class="address"><code>{{.Address}}</code></p>
+    <p class="muted">The address never expires. If the newsletter sends a confirmation email, it appears below as a signup message. Open it there and press its confirmation link yourself, because SendScore never follows confirmation or unsubscribe links.</p>
+    <p><a href="/newsletters/{{.P.ID}}/edit">Edit</a> · <a href="/newsletters/{{.P.ID}}/delete">Delete</a></p>
+  </div>
+</section>
+<section class="sheet">
+  <p class="label">Schedule</p>
+  <div>
+    <p>{{.Schedule}}</p>
+    {{if .P.Paused}}<p class="notice">Alerts are paused. Issues are still received, checked, and kept, but no alert email is sent.</p>
+    {{else}}<p>Alerts go to <strong>{{.P.AlertEmail}}</strong>.{{with .Next}} The next issue is expected {{local . $.P.TimeZone}}.{{end}}</p>{{end}}
+    {{with .LastAlert}}<p class="muted">The last alert was sent {{local .SentAt $.P.TimeZone}}. Its subject was {{.Subject}}.</p>{{else}}<p class="muted">No alert has been sent yet.</p>{{end}}
+  </div>
+</section>
+<section class="sheet">
+  <p class="label">Issues</p>
+  <div>
+    {{if .Messages}}
+    <table class="tokens timeline">
+      <thead><tr><th>Received</th><th>Subject</th><th>Verdict</th><th>Ready</th><th>Changes</th></tr></thead>
+      <tbody>
+      {{range .Messages}}
+        <tr>
+          <td>{{local .ReceivedAt $.P.TimeZone}}{{if .Late}} <span class="tag s-warn">late</span>{{end}}</td>
+          <td>{{if eq .Kind "signup"}}<span class="tag">signup</span> {{end}}<a href="/r/{{.ID}}">{{if .Verdict.Message.Subject}}{{.Verdict.Message.Subject}}{{else}}(no subject){{end}}</a><br><a class="muted small" href="/newsletters/{{$.P.ID}}/messages/{{.ID}}">View the message</a></td>
+          <td><span class="s-{{status .Verdict.Verdict}}"><span class="mark">{{status .Verdict.Verdict}}</span></span></td>
+          <td>{{if .Verdict.ReadyToSend}}Yes{{else}}No{{end}}</td>
+          <td>{{if eq .Kind "signup"}}<span class="muted">Not compared</span>{{else}}{{len .Verdict.Changes}}{{if worsened .Verdict}} <span class="tag s-warn">worse</span>{{end}}{{end}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+    <p class="muted small">Newest first. Issues are kept for {{.HistoryDays}} days on the Pro plan.</p>
+    {{else}}
+    <p class="muted">Nothing has arrived yet. Once the address is subscribed, each issue appears here with its report.</p>
+    {{end}}
+  </div>
+</section>
+{{end}}

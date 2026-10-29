@@ -22,6 +22,7 @@ import (
 
 	"github.com/sendscore/sendscore-app/internal/db"
 	"github.com/sendscore/sendscore-app/internal/mail"
+	"github.com/sendscore/sendscore-app/internal/monitor"
 	"github.com/sendscore/sendscore-app/internal/receiver"
 	"github.com/sendscore/sendscore-app/internal/web"
 	"github.com/sendscore/sendscore/engine"
@@ -58,20 +59,35 @@ func main() {
 	}
 
 	var mailer mail.Sender = mail.Log{Logger: log}
+	var alerter mail.Alerter = mail.Log{Logger: log}
 	ses, ok, err := mail.FromEnv(context.Background())
 	switch {
 	case err != nil:
 		log.Error("ses config", "err", err)
 		os.Exit(1)
 	case ok:
-		mailer = ses
-		log.Info("sign-in email via SES", "from", ses.From())
+		mailer, alerter = ses, ses
+		log.Info("sign-in email and alerts via SES", "from", ses.From(), "alerts_from", mail.AlertFrom())
 	case secureCookies:
 		// A production log must never hold working sign-in links.
 		log.Error("SES_ACCESS_KEY_ID and SES_SECRET_ACCESS_KEY are required when SENDSCORE_SECURE_COOKIES=true")
 		os.Exit(1)
 	default:
-		log.Warn("SES is not configured, so sign-in links are logged here instead of emailed")
+		log.Warn("SES is not configured, so sign-in links and alerts are logged here instead of emailed")
+	}
+
+	// Until billing exists, these accounts are pro, now and at sign-in.
+	proEmails := emailList(os.Getenv("SENDSCORE_PRO_EMAILS"))
+	if n, err := store.PromoteEmails(context.Background(), proEmails); err != nil {
+		log.Error("pro accounts", "err", err)
+		os.Exit(1)
+	} else if n > 0 {
+		log.Info("accounts moved to the pro plan", "count", n)
+	}
+	historyDays := getpos(log, "SENDSCORE_HISTORY_DAYS", 365)
+	mon := &monitor.Monitor{
+		Store: store, Mailer: alerter, BaseURL: baseURL, Log: log,
+		PerDay: getpos(log, "SENDSCORE_ALERTS_PER_DAY", monitor.DefaultAlertsPerDay),
 	}
 
 	trustProxy := os.Getenv("SENDSCORE_TRUST_PROXY") == "1"
@@ -97,6 +113,10 @@ func main() {
 		AnonDailyTests:       getint(log, "SENDSCORE_ANON_DAILY_TESTS", 5),
 		SigninEmailsPerHour:  getpos(log, "SENDSCORE_SIGNIN_EMAILS_PER_HOUR", 200),
 		RegistrationsPerHour: getpos(log, "SENDSCORE_OAUTH_REGISTRATIONS_PER_HOUR", 600),
+		ProPublications:      getpos(log, "SENDSCORE_PRO_PUBLICATIONS", web.DefaultProPublications),
+		FreePublications:     getint(log, "SENDSCORE_FREE_PUBLICATIONS", 0),
+		ProEmails:            proEmails,
+		HistoryDays:          historyDays,
 		BaseURL:              baseURL,
 		MailDomain:           mailDomain,
 		AddressTTL:           24 * time.Hour,
@@ -130,6 +150,10 @@ func main() {
 		DailyMessages:      getpos(log, "SENDSCORE_FREE_DAILY_MESSAGES", receiver.DefaultDailyMessages),
 		MaxSessions:        getpos(log, "SENDSCORE_SMTP_SESSIONS", receiver.DefaultMaxSessions),
 		MaxSessionsPerIP:   getpos(log, "SENDSCORE_SMTP_SESSIONS_PER_IP", receiver.DefaultMaxSessionsPerIP),
+
+		PublicationDailyMessages: getpos(log, "SENDSCORE_PUBLICATION_DAILY_MESSAGES", receiver.DefaultPublicationDailyMessages),
+		HistoryTTL:               time.Duration(historyDays) * 24 * time.Hour,
+		Monitor:                  mon,
 	}, store, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -158,6 +182,8 @@ func main() {
 		}
 	}()
 	go sweep(ctx, store, log)
+	// The heartbeat: missed issues, and alerts waiting to be sent.
+	go mon.Run(ctx)
 
 	<-ctx.Done()
 	// Open long polls answer not_received at once, so agents call again
@@ -244,6 +270,17 @@ func isLocal(base string) bool {
 	}
 	h := u.Hostname()
 	return h == "localhost" || h == "127.0.0.1" || h == "::1"
+}
+
+// emailList reads a comma separated list of addresses, normalized.
+func emailList(s string) []string {
+	var out []string
+	for _, e := range strings.Split(s, ",") {
+		if e = db.NormalizeEmail(e); e != "" {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func getenv(key, fallback string) string {

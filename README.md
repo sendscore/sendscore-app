@@ -1,6 +1,6 @@
 # sendscore-app
 
-The SendScore app: test addresses, the SMTP receiver, reports, uploads, and the JSON API the MCP tools call. It runs the engine from [sendscore/sendscore](https://github.com/sendscore/sendscore).
+The SendScore app: test addresses, newsletter monitoring with alerts, the SMTP receiver, reports, uploads, and the JSON API the MCP tools call. It runs the engine from [sendscore/sendscore](https://github.com/sendscore/sendscore).
 
 It is open source (AGPL-3.0) and self-hostable: run it on your own server with your own domain, or use the hosted version at [sendscore.ai](https://sendscore.ai). Self-hosting needs a server that can receive mail on port 25 and a domain whose MX record points at it.
 
@@ -37,7 +37,7 @@ Without SES keys the link is written to the app's log instead of emailed. To sig
 
 `/account` shows today's usage and the API tokens. Create a named token there (it is shown once, so copy it then), see each one's prefix (such as `ss_live_abcd`), when it was created, and when it was last used, and revoke it. Sign-in links, sessions, and tokens are stored only as SHA-256 hashes. Every form carries a CSRF token and must come from the site itself by `Origin`, or `Referer` when there is no `Origin`; a post with neither is refused. Both are checked before the body is read. With secure cookies the cookies are named `__Host-ss_session`, `__Host-ss_csrf`, and `__Host-ss_browser`, so no other subdomain can set them, and every response carries `Strict-Transport-Security`.
 
-Test addresses are limited per UTC day. A free account gets 25 (through the API, MCP, or the site while signed in), and an anonymous visitor gets 5 per IP for "Get a test address" and uploads together. Over the limit, the API answers 429 and the site shows a page saying when it starts again. Every account is on the `free` plan (`users.plan`) until billing lifts the limits.
+Test addresses are limited per UTC day. A free account gets 25 (through the API, MCP, or the site while signed in), and an anonymous visitor gets 5 per IP for "Get a test address" and uploads together. Over the limit, the API answers 429 and the site shows a page saying when it starts again. Every account is on the `free` plan (`users.plan`) until billing exists, except the addresses in `SENDSCORE_PRO_EMAILS`, which are moved to `pro` at startup and whenever they sign in. Pro is what allows newsletter monitoring (see below).
 
 Settings (environment, or `.env.local`):
 
@@ -57,6 +57,13 @@ Settings (environment, or `.env.local`):
 | `SES_ACCESS_KEY_ID`, `SES_SECRET_ACCESS_KEY` | unset: sign-in links are logged, not emailed (development only). |
 | `SES_REGION` | `us-east-1` |
 | `SENDSCORE_MAIL_FROM` | `SendScore <hello@sendscore.ai>` |
+| `SENDSCORE_ALERT_FROM` | `SendScore alerts <alerts@sendscore.ai>`, the sender of alerts. The SES IAM user may only send as hello@ or alerts@sendscore.ai. |
+| `SENDSCORE_PRO_EMAILS` | unset. Comma separated addresses whose accounts are on the pro plan, until billing exists. |
+| `SENDSCORE_PRO_PUBLICATIONS` | `5` newsletters a pro account may monitor |
+| `SENDSCORE_FREE_PUBLICATIONS` | `0` newsletters a free account may monitor (a self-hosted instance may raise it) |
+| `SENDSCORE_HISTORY_DAYS` | `365` days a pro account's newsletter issues are kept (a free account's are kept as long as a test report, 7 days) |
+| `SENDSCORE_PUBLICATION_DAILY_MESSAGES` | `50` messages one monitoring address accepts per UTC day (then a 452) |
+| `SENDSCORE_ALERTS_PER_DAY` | `10` alerts one newsletter may send per UTC day |
 | `SENDSCORE_FREE_DAILY_TESTS` | `25` test addresses per UTC day for a free account |
 | `SENDSCORE_ANON_DAILY_TESTS` | `5` test addresses and uploads per UTC day for an anonymous IP |
 | `SENDSCORE_FREE_DAILY_MESSAGES` | `100` messages per UTC day received by a free account's addresses, together |
@@ -66,6 +73,45 @@ Settings (environment, or `.env.local`):
 | `SENDSCORE_SIGNIN_EMAILS_PER_HOUR` | `200` sign-in emails per hour for the whole service |
 | `SENDSCORE_OAUTH_REGISTRATIONS_PER_HOUR` | `600` connector registrations per hour for the whole service |
 | `SENDSCORE_TRUST_PROXY` | unset. `1` behind a reverse proxy: the client IP for limits is the last `X-Forwarded-For` entry, the one the proxy added. Leave it unset when the app is reachable directly, or anyone could choose their IP. A public `SENDSCORE_BASE_URL` without it logs a warning at startup, because behind a proxy every visitor would share one IP and one set of limits. |
+
+## Newsletter monitoring
+
+A signed-in pro account adds a newsletter at `/newsletters` (the "Newsletters" link in the header) with a name, an optional schedule, an alert address (the account's email by default), and a switch to pause alerts. Each newsletter gets a permanent monitoring address, `m-<token>@<mail domain>`, which never expires. Subscribe it to the newsletter like any reader. A free account sees a page explaining that monitoring is part of Pro.
+
+Every message to the address is checked like a test message, stored with the newsletter, and compared with the newsletter's previous issue (the engine's `Options.Previous`, from the stored fingerprint), so its report lists what changed. A paused newsletter still receives, checks, and keeps its issues, and only sends no alerts. Messages whose subject looks like a subscription confirmation or welcome email (such as "Please confirm your subscription") are stored as signup messages, which are never compared, placed in a slot, or alerted on. The newsletter page lists every message newest first, each with its report and a safe view (`/newsletters/{id}/messages/{report id}`) that shows the text and the links without the HTML, images, or anything that could run, so you can find a confirmation link and open it yourself. SendScore never follows confirm links, as the engine never fetches action links.
+
+The newsletter page shows the monitoring address, the schedule, the time of the next expected issue, the last alert sent, and the timeline, which gives each message's received time (in the newsletter's time zone), subject, verdict, ready to send, the number of changes and whether anything got worse, and a "late" mark for an issue that arrived after its deadline. Edit is at `/newsletters/{id}/edit`. Delete asks on a page of its own (`/newsletters/{id}/delete`) and then removes the newsletter, its messages, and its alerts.
+
+### Schedule
+
+A schedule is the days of the week an issue goes out, a local time (HH:MM), an IANA time zone, and a grace period in minutes (default 30, at most 600). With no days set there is no schedule, so issues are still compared but none is expected. Each slot is built from the local date and time, so a 09:00 issue in America/Toronto is expected at 13:00 UTC in summer and 14:00 UTC in winter. An issue counts for the nearest slot (the span between the midpoints to the slots before and after), and is late when it arrives after that slot's time plus the grace period.
+
+### Alerts
+
+Alerts are emailed through SES from `SENDSCORE_ALERT_FROM` to the newsletter's alert address, as plain text and simple HTML with no tracking. Each says why it was sent and links to the newsletter page, where alerts can be redirected, paused, or rescheduled. One is sent:
+
+- when a new issue is worse than the previous one, meaning a check that fails now and did not before, a change the engine marks as worsened, or ready to send going from yes to no;
+- when the expected issue has not arrived by the slot's time plus the grace period (a late issue that arrives before the heartbeat runs cancels it);
+- when a second issue arrives for the same slot (that alert also lists anything that got worse).
+
+Each alert is written to the `alerts` table before it is sent, keyed by the newsletter, the kind, and the report or the slot, so one issue or one missed slot never sends twice, and a restart never resends. A newsletter sends at most `SENDSCORE_ALERTS_PER_DAY` alerts a UTC day; past that they are recorded as capped and not sent. A failed send is retried by the heartbeat, up to 5 attempts, and an alert left half sent by a process that stopped is marked failed rather than sent again. Without SES keys, alerts are written to the log instead.
+
+The heartbeat runs every minute. For each scheduled newsletter that is not paused, it finds the latest slot whose deadline has passed and sends the missed-issue alert once, unless an issue arrived in that slot. Slots due before the newsletter was created or last edited, and deadlines more than a day old (after a long outage), are not reported.
+
+### Try it locally
+
+1. Put `SENDSCORE_PRO_EMAILS=you@example.com` in `.env.local`, run `go run .`, and sign in as that address (the link is in the log without SES).
+2. Open http://127.0.0.1:3014/newsletters, press "Add a newsletter", and save it. Its page shows the address, such as `m-abcdefghijklmnop@localhost`.
+3. Deliver a saved email to it twice, changing it in between to see the comparison (for example, delete its `List-Unsubscribe` line the second time, which is worse and sends an alert to the log):
+
+   ```sh
+   go run ./cmd/sendtest -to m-<token>@localhost ../sendscore/testdata/sample.eml
+   go run ./cmd/sendtest -to m-<token>@localhost changed.eml
+   ```
+
+4. Reload the newsletter page: both issues are listed, and the second report has a Changes section.
+
+To see a missed-issue alert, give the newsletter a schedule a minute or two from now with a grace period of 0, and wait for the heartbeat.
 
 ## Connector (OAuth)
 
@@ -93,13 +139,15 @@ A missing, unknown, or revoked token gets a 401 (`{"error": ...}` on `/api/v1/`,
 
 - `POST /api/v1/test-addresses` returns `address`, `token`, `expires_at`, `wait_url`, and `page_url`.
 - `GET /api/v1/test-addresses/{token}/wait?timeout=30` long-polls (at most 50 seconds, below common proxy timeouts) and returns `{"status": "received", "report_id", "report_url", "verdict"}` or `{"status": "not_received"}`. It returns the newest message at the address, even one that arrived before the call. To check a second send to the same address, add `&after=<report_id>` with the earlier report, and only a newer message counts; an `after` that is not a report from this address is a 400. The page `/t/{token}?after=<report_id>` waits the same way. Waits keep working after the address expires, for as long as its reports are kept; when the address has expired and no matching message arrived, the wait answers 410 at once (and the page says the address expired). An account may hold 5 waits open at once (more get a 429), and the service 200.
-- `GET /api/v1/reports/{id}` returns the verdict JSON.
+- `GET /api/v1/reports/{id}` returns the verdict JSON, for a report of one of the token owner's test addresses, uploads, or newsletters.
+- `GET /api/v1/publications` returns `{"publications": [...]}`, the token owner's newsletters, each with `id`, `name`, `address`, `schedule` (`days`, `time`, `time_zone`, `grace_minutes`, and `description`, or null), `alert_email`, `paused`, `page_url`, `latest` (the newest issue), and `last_alert`.
+- `GET /api/v1/publications/{id}` returns one of them with `reports`, its 50 newest messages, each with `report_id`, `kind` (issue or signup), `received_at`, `subject`, `verdict`, `ready_to_send`, `changes`, `worsened`, `late`, and `report_url`. Another account's newsletter is a 404.
 
-- `/api/mcp` is the remote MCP connector (streamable HTTP, with the token as above) with `get_test_address`, `wait_for_message` (with an optional `after_report_id`, as `after` above), `get_report`, and `compare_to_previous`. The tools live in the engine repository's `mcpserver` package; here they read the database directly.
+- `/api/mcp` is the remote MCP connector (streamable HTTP, with the token as above) with `get_test_address`, `wait_for_message` (with an optional `after_report_id`, as `after` above), `get_report`, and `compare_to_previous`. The tools live in the engine repository's `mcpserver` package; here they read the database directly. The connector also has `list_publications`, which returns the same list as `GET /api/v1/publications`; it is added here, since monitoring is a feature of the app.
 
 Addresses accept mail for 24 hours; reports are kept for 7 days. A message is checked once per transaction and for one test address: a repeated `RCPT` for the same address is accepted once, and a second address gets a 452, so the sender delivers it separately. A `MAIL FROM` with control characters or angle brackets gets a 501. Uploads and messages are limited to 25 MB, and a larger upload is refused, never cut short.
 
-The receiver bounds volume. A test address accepts 20 messages in its life (then a 550 at `RCPT`), an account's addresses together accept 100 a UTC day (then a 452), one connection delivers 10 messages (then a 451 at `MAIL`, so the sender reconnects), and 50 connections may be open at once, 5 from one IP (then a 421). Each read of a message body has 60 seconds, so a slow sender is not cut off, up to 10 minutes for the whole message; a body that stops arriving gets a 451, so the sender retries rather than bouncing. At most 4 uploads are read and checked at once (more get a 503), and an upload over the daily limit is refused before its body is read.
+The receiver bounds volume. A monitoring address accepts 50 messages a UTC day (`SENDSCORE_PUBLICATION_DAILY_MESSAGES`), which no newsletter comes near, and its messages do not count against the account's daily test messages. A test address accepts 20 messages in its life (then a 550 at `RCPT`), an account's addresses together accept 100 a UTC day (then a 452), one connection delivers 10 messages (then a 451 at `MAIL`, so the sender reconnects), and 50 connections may be open at once, 5 from one IP (then a 421). Each read of a message body has 60 seconds, so a slow sender is not cut off, up to 10 minutes for the whole message; a body that stops arriving gets a 451, so the sender retries rather than bouncing. At most 4 uploads are read and checked at once (more get a 503), and an upload over the daily limit is refused before its body is read.
 
 Upload reports say they came from an upload, and mark the sending IP and envelope sender as supplied by the uploader, since SendScore did not see the delivery. SPF and reverse DNS are checked only when the sending IP is given, and TLS is never checked for an upload.
 
@@ -107,12 +155,12 @@ On shutdown (SIGTERM), open waits answer `not_received` at once, and uploads and
 
 ## Not built yet
 
-Monitored publications, the heartbeat, alerts (SES), a Docker image, Creem billing (hosted only), and deploy scripts. Nothing is deployed. Self-hosting is documented on the website.
+A Docker image, Creem billing (hosted only), and deploy scripts. Nothing is deployed. Self-hosting is documented on the website.
 
 ## Develop
 
 ```sh
-go vet ./... && go test ./... && go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+go vet ./... && go test ./... && go test -race ./... && go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 ```
 
 `go.mod` pins the toolchain (`toolchain go1.26.10`), so a build never uses an older Go with known standard library vulnerabilities; move it forward when a new patch release is out.

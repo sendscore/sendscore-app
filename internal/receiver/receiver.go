@@ -1,5 +1,6 @@
-// Package receiver is the SMTP server that accepts mail for test addresses,
-// runs the engine with the envelope it saw, and stores the verdict.
+// Package receiver is the SMTP server that accepts mail for test addresses
+// and monitored publications, runs the engine with the envelope it saw, and
+// stores the verdict.
 //
 // It receives directly instead of through a forwarding service on purpose:
 // SPF, reverse DNS, and TLS are only meaningful with the connecting IP and
@@ -14,7 +15,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
+	"net/mail"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +26,7 @@ import (
 	"github.com/emersion/go-smtp"
 
 	"github.com/sendscore/sendscore-app/internal/db"
+	"github.com/sendscore/sendscore-app/internal/monitor"
 	"github.com/sendscore/sendscore/engine"
 )
 
@@ -32,6 +36,7 @@ const MaxMessageBytes = 25 << 20
 const (
 	analyzeTimeout = 45 * time.Second
 	saveTimeout    = 10 * time.Second
+	alertTimeout   = 30 * time.Second
 	// maxBodyTime bounds how long one message may take to arrive. Each read
 	// of the body gets readTimeout, so a slow but steady sender is fine,
 	// and a sender trickling bytes is cut off here.
@@ -49,6 +54,9 @@ const (
 	DefaultDailyMessages      = 100
 	DefaultMaxSessions        = 50
 	DefaultMaxSessionsPerIP   = 5
+	// A monitoring address takes this many messages a UTC day, far more
+	// than any newsletter sends.
+	DefaultPublicationDailyMessages = 50
 )
 
 // Config configures the receiver.
@@ -76,6 +84,15 @@ type Config struct {
 	DailyMessages      int
 	MaxSessions        int
 	MaxSessionsPerIP   int
+	// PublicationDailyMessages is how many messages one monitoring address
+	// takes per UTC day. Zero means the default.
+	PublicationDailyMessages int
+	// HistoryTTL is how long a pro account's publication messages are kept.
+	// Other publication messages are kept for ReportTTL.
+	HistoryTTL time.Duration
+	// Monitor is told about each publication message once it is saved, to
+	// send alerts. Nil sends none.
+	Monitor *monitor.Monitor
 }
 
 // Receiver wraps the SMTP server.
@@ -104,6 +121,12 @@ func New(cfg Config, store *db.Store, log *slog.Logger) *Receiver {
 	}
 	if cfg.MaxSessionsPerIP == 0 {
 		cfg.MaxSessionsPerIP = DefaultMaxSessionsPerIP
+	}
+	if cfg.PublicationDailyMessages == 0 {
+		cfg.PublicationDailyMessages = DefaultPublicationDailyMessages
+	}
+	if cfg.HistoryTTL == 0 {
+		cfg.HistoryTTL = cfg.ReportTTL
 	}
 	r := &Receiver{cfg: cfg, store: store, log: log, conns: map[string]int{}, readTimeout: readTimeout}
 	s := smtp.NewServer(r)
@@ -239,12 +262,14 @@ type session struct {
 	from  string
 	token string
 	owner string // the account the address belongs to, or empty
-	rcpt  string
-	sent  int // messages delivered in this session
+	// pub is the monitored publication when the recipient is an m- address.
+	pub  *db.Publication
+	rcpt string
+	sent int // messages delivered in this session
 }
 
 func (s *session) Reset() {
-	s.from, s.token, s.owner, s.rcpt = "", "", "", ""
+	s.from, s.token, s.owner, s.rcpt, s.pub = "", "", "", "", nil
 }
 
 func (s *session) Logout() error { return nil }
@@ -277,8 +302,17 @@ var errNoMailbox = &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5,
 
 func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 	local, domain, ok := strings.Cut(strings.ToLower(strings.Trim(to, "<>")), "@")
-	if !ok || domain != strings.ToLower(s.r.cfg.MailDomain) || !strings.HasPrefix(local, "t-") {
+	if !ok || domain != strings.ToLower(s.r.cfg.MailDomain) {
 		return errNoMailbox
+	}
+	if strings.HasPrefix(local, "m-") {
+		return s.rcptPublication(to, strings.TrimPrefix(local, "m-"))
+	}
+	if !strings.HasPrefix(local, "t-") {
+		return errNoMailbox
+	}
+	if s.pub != nil {
+		return errOneRecipient
 	}
 	token := strings.TrimPrefix(local, "t-")
 	addr, err := s.r.store.AddressByToken(context.Background(), token)
@@ -307,9 +341,54 @@ func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 	case s.token != token:
 		// One test address per transaction, so a message is stored once.
 		// RFC 5321 has the client send the rest in another transaction.
-		return &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 5, 3}, Message: "One test address per message, send to the others separately"}
+		return errOneRecipient
 	}
 	return nil
+}
+
+var errOneRecipient = &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 5, 3}, Message: "One test address per message, send to the others separately"}
+
+var errNoPublication = &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 1}, Message: "No such monitoring address"}
+
+// rcptPublication accepts a monitoring address, which never expires. A
+// paused publication still accepts and stores mail; it only sends no alerts.
+func (s *session) rcptPublication(to, token string) error {
+	if s.token != "" {
+		return errOneRecipient
+	}
+	p, err := s.r.store.PublicationByToken(context.Background(), token)
+	if err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			return errNoPublication
+		}
+		s.r.log.Error("publication lookup", "err", err)
+		return errTemporary
+	}
+	if s.pub != nil {
+		if s.pub.ID != p.ID {
+			return errOneRecipient
+		}
+		return nil
+	}
+	l := s.r.publicationLimit(p.ID)
+	n, err := s.r.store.Count(context.Background(), l.name, l.bucket)
+	if err != nil {
+		s.r.log.Error("message count", "err", err)
+		return errTemporary
+	}
+	if n >= l.limit {
+		return l.err
+	}
+	s.pub, s.owner, s.rcpt = &p, p.UserID, to
+	return nil
+}
+
+// publicationLimit is the daily count a monitoring address's messages are
+// taken against. It does not count against the account's test messages.
+func (r *Receiver) publicationLimit(pubID string) limit {
+	return limit{"messages:pub:" + pubID, db.Day(r.store.Now()), r.cfg.PublicationDailyMessages, 48 * time.Hour,
+		&smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 2, 2},
+			Message: fmt.Sprintf("This monitoring address has received its %d messages for today, try again after midnight UTC", r.cfg.PublicationDailyMessages)}}
 }
 
 // limit is one count a message is taken against.
@@ -337,7 +416,11 @@ func (r *Receiver) limits(token, owner string) []limit {
 func (s *session) Data(rd io.Reader) error {
 	s.sent++
 	ctx := context.Background()
-	for _, l := range s.r.limits(s.token, s.owner) {
+	ls := s.r.limits(s.token, s.owner)
+	if s.pub != nil {
+		ls = []limit{s.r.publicationLimit(s.pub.ID)}
+	}
+	for _, l := range ls {
 		if _, err := s.r.store.Take(ctx, l.name, l.bucket, l.limit, l.keep); err != nil {
 			if errors.Is(err, db.ErrLimit) {
 				return l.err
@@ -380,26 +463,81 @@ func (s *session) Data(rd io.Reader) error {
 	actx, acancel := context.WithTimeout(context.Background(), analyzeTimeout)
 	defer acancel()
 	now := s.r.store.Now().UTC()
-	v, err := engine.Analyze(actx, stamped, engine.Options{
+	opts := engine.Options{
 		Envelope: env, Resolver: s.r.cfg.Resolver, CheckLinks: s.r.cfg.CheckLinks,
 		Blocklists: s.r.cfg.Blocklists, ReceivedAt: now,
-	})
+	}
+	m := &db.Message{
+		Token: s.token, Source: "smtp", ReceivedAt: now, ExpiresAt: now.Add(s.r.cfg.ReportTTL),
+		RemoteIP: ipString(s.ip), Helo: env.Helo, MailFrom: s.from, RcptTo: s.rcpt,
+		TLS: &isTLS, Raw: stamped,
+	}
+	var prev *db.Message
+	if s.pub != nil {
+		prev = s.r.preparePublication(actx, *s.pub, m, stamped, &opts)
+	}
+	v, err := engine.Analyze(actx, stamped, opts)
 	sctx, cancel := context.WithTimeout(context.Background(), saveTimeout)
 	defer cancel()
 	if err != nil {
 		return &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 6, 0}, Message: "Could not read the message: " + err.Error()}
 	}
-	m := &db.Message{
-		Token: s.token, Source: "smtp", ReceivedAt: now, ExpiresAt: now.Add(s.r.cfg.ReportTTL),
-		RemoteIP: ipString(s.ip), Helo: env.Helo, MailFrom: s.from, RcptTo: s.rcpt,
-		TLS: &isTLS, Raw: stamped, Verdict: v,
+	m.Verdict = v
+	if s.pub != nil {
+		v.Publication = s.pub.ID
 	}
 	if err := s.r.store.SaveMessage(sctx, m); err != nil {
 		s.r.log.Error("save message", "err", err)
 		return errTemporary
 	}
-	s.r.log.Info("received", "report", m.ID, "from", s.from, "ip", m.RemoteIP, "verdict", v.Verdict)
+	s.r.log.Info("received", "report", m.ID, "from", s.from, "ip", m.RemoteIP, "verdict", v.Verdict, "publication", m.PublicationID)
+	if s.pub != nil && s.r.cfg.Monitor != nil {
+		// Its own deadline, covering an alert's send.
+		mctx, mcancel := context.WithTimeout(context.Background(), alertTimeout)
+		defer mcancel()
+		s.r.cfg.Monitor.Received(mctx, *s.pub, m, prev)
+	}
 	return nil
+}
+
+// preparePublication fills in a publication's message before its checks:
+// the owner, how long it is kept, whether it is an issue or a signup
+// message (a subscription confirmation or welcome email), and for an issue,
+// its slot and the previous issue to compare with, which it returns.
+func (r *Receiver) preparePublication(ctx context.Context, p db.Publication, m *db.Message, raw []byte, opts *engine.Options) *db.Message {
+	m.PublicationID, m.UserID, m.Kind = p.ID, p.UserID, db.KindIssue
+	if p.OwnerPlan == db.PlanPro {
+		m.ExpiresAt = m.ReceivedAt.Add(r.cfg.HistoryTTL)
+	}
+	if monitor.IsSignup(subject(raw)) {
+		m.Kind = db.KindSignup
+		return nil
+	}
+	if s, ok := monitor.ScheduleOf(p); ok {
+		m.SlotAt, m.Late = s.Place(m.ReceivedAt)
+	}
+	prev, err := r.store.LatestIssue(ctx, p.ID)
+	if err != nil {
+		if !errors.Is(err, db.ErrNotFound) {
+			r.log.Error("previous issue", "publication", p.ID, "err", err)
+		}
+		return nil
+	}
+	opts.Previous = prev.Verdict.Fingerprint
+	return prev
+}
+
+// subject reads a message's decoded Subject, or empty.
+func subject(raw []byte) string {
+	msg, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		return ""
+	}
+	s := msg.Header.Get("Subject")
+	if d, err := new(mime.WordDecoder).DecodeHeader(s); err == nil {
+		s = d
+	}
+	return s
 }
 
 func minTime(a, b time.Time) time.Time {

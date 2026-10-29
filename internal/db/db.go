@@ -80,6 +80,14 @@ func migrate(d *sql.DB) error {
 		// When the grant a token belongs to was first allowed, kept across
 		// refreshes; 0 for rows from before the column, which use created_at.
 		`ALTER TABLE oauth_tokens ADD COLUMN granted_at INTEGER NOT NULL DEFAULT 0`,
+		// The monitored publication a message was received for, its kind
+		// (issue or signup, empty for test addresses and uploads), the
+		// scheduled slot it counted for (Unix seconds, 0 for none), and
+		// whether it arrived after that slot's deadline.
+		`ALTER TABLE messages ADD COLUMN publication_id TEXT REFERENCES publications(id) ON DELETE CASCADE`,
+		`ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE messages ADD COLUMN slot_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE messages ADD COLUMN late INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, a := range alters {
 		if _, err := d.Exec(a); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -93,6 +101,7 @@ func migrate(d *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS oauth_clients_created ON oauth_clients(created_at)`,
 		`CREATE INDEX IF NOT EXISTS oauth_tokens_client ON oauth_tokens(client_id)`,
 		`CREATE INDEX IF NOT EXISTS oauth_codes_client ON oauth_codes(client_id)`,
+		`CREATE INDEX IF NOT EXISTS messages_publication ON messages(publication_id, received_at)`,
 	} {
 		if _, err := d.Exec(idx); err != nil {
 			return err
@@ -180,17 +189,28 @@ func (a Address) Expired(now time.Time) bool { return !a.ExpiresAt.After(now) }
 
 // Message is a stored message and its verdict.
 type Message struct {
-	ID         string
-	Token      string // empty for uploads
-	UserID     string // the account of a signed-in upload, or empty
-	Source     string
-	ReceivedAt time.Time
-	ExpiresAt  time.Time
-	RemoteIP   string
-	Helo       string
-	MailFrom   string
-	RcptTo     string
-	TLS        *bool
+	ID    string
+	Token string // empty for uploads and publications
+	// UserID is the account of a signed-in upload or of the publication the
+	// message was received for, or empty.
+	UserID string
+	// PublicationID is the monitored publication, or empty. Kind is
+	// KindIssue or KindSignup for a publication's message, and empty
+	// otherwise. SlotAt is the scheduled slot an issue counted for (zero
+	// without a schedule), and Late is set when it arrived after the slot's
+	// deadline.
+	PublicationID string
+	Kind          string
+	SlotAt        time.Time
+	Late          bool
+	Source        string
+	ReceivedAt    time.Time
+	ExpiresAt     time.Time
+	RemoteIP      string
+	Helo          string
+	MailFrom      string
+	RcptTo        string
+	TLS           *bool
 	// Raw is written by SaveMessage but never loaded by the queries that
 	// read a message, since it can be 25 MB; RawByID loads it.
 	Raw     []byte
@@ -205,9 +225,16 @@ func (s *Store) SaveMessage(ctx context.Context, m *Message) error {
 	if err != nil {
 		return err
 	}
-	var tok, tls, uid any
+	var tok, tls, uid, pub any
 	if m.Token != "" {
 		tok = m.Token
+	}
+	if m.PublicationID != "" {
+		pub = m.PublicationID
+	}
+	var slot int64
+	if !m.SlotAt.IsZero() {
+		slot = m.SlotAt.Unix()
 	}
 	if m.UserID != "" {
 		uid = m.UserID
@@ -216,26 +243,29 @@ func (s *Store) SaveMessage(ctx context.Context, m *Message) error {
 		tls = *m.TLS
 	}
 	_, err = s.DB.ExecContext(ctx, `INSERT INTO messages
-		(id, token, user_id, source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, raw, verdict)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.ID, tok, uid, m.Source, m.ReceivedAt.Unix(), m.ExpiresAt.Unix(), m.RemoteIP, m.Helo, m.MailFrom, m.RcptTo, tls, m.Raw, string(vj))
+		(id, token, user_id, publication_id, kind, slot_at, late, source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, raw, verdict)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID, tok, uid, pub, m.Kind, slot, m.Late, m.Source, m.ReceivedAt.Unix(), m.ExpiresAt.Unix(), m.RemoteIP, m.Helo, m.MailFrom, m.RcptTo, tls, m.Raw, string(vj))
 	return err
 }
 
-const messageCols = `id, COALESCE(token, ''), COALESCE(user_id, ''), source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, verdict`
+const messageCols = `id, COALESCE(token, ''), COALESCE(user_id, ''), COALESCE(publication_id, ''), kind, slot_at, late, source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, verdict`
 
 func scanMessage(row interface{ Scan(...any) error }) (*Message, error) {
 	m := &Message{}
-	var received, expires int64
+	var received, expires, slot int64
 	var tls sql.NullBool
 	var vj string
-	if err := row.Scan(&m.ID, &m.Token, &m.UserID, &m.Source, &received, &expires, &m.RemoteIP, &m.Helo, &m.MailFrom, &m.RcptTo, &tls, &vj); err != nil {
+	if err := row.Scan(&m.ID, &m.Token, &m.UserID, &m.PublicationID, &m.Kind, &slot, &m.Late, &m.Source, &received, &expires, &m.RemoteIP, &m.Helo, &m.MailFrom, &m.RcptTo, &tls, &vj); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
 	m.ReceivedAt, m.ExpiresAt = time.Unix(received, 0).UTC(), time.Unix(expires, 0).UTC()
+	if slot != 0 {
+		m.SlotAt = time.Unix(slot, 0).UTC()
+	}
 	if tls.Valid {
 		t := tls.Bool
 		m.TLS = &t
@@ -254,8 +284,8 @@ func (s *Store) MessageByID(ctx context.Context, id string) (*Message, error) {
 }
 
 // MessageForUser returns a report that has not expired, only when it was
-// received at a test address the user owns or uploaded while signed in to
-// the user's account.
+// received at a test address the user owns, uploaded while signed in to the
+// user's account, or received for one of the user's publications.
 func (s *Store) MessageForUser(ctx context.Context, id, userID string) (*Message, error) {
 	if userID == "" {
 		return nil, ErrNotFound
@@ -305,7 +335,8 @@ const AddressGrace = time.Hour
 
 // Sweep deletes expired messages, addresses that expired more than
 // AddressGrace ago and have no messages left, and expired sign-in links,
-// sessions, usage counters, OAuth codes and tokens, and known browsers.
+// sessions, usage counters, OAuth codes and tokens, known browsers, and
+// alerts older than AlertKeep.
 func (s *Store) Sweep(ctx context.Context) (int64, error) {
 	now := s.Now()
 	res, err := s.DB.ExecContext(ctx, `DELETE FROM messages WHERE expires_at <= ?`, now.Unix())
@@ -322,6 +353,10 @@ func (s *Store) Sweep(ctx context.Context) (int64, error) {
 		if _, err := s.DB.ExecContext(ctx, `DELETE FROM `+table+` WHERE expires_at <= ?`, now.Unix()); err != nil {
 			return n, err
 		}
+	}
+	// Alerts are kept a little longer than the longest history.
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM alerts WHERE created_at <= ?`, now.Add(-AlertKeep).Unix()); err != nil {
+		return n, err
 	}
 	return n, nil
 }

@@ -11,6 +11,7 @@
     {{end}}
     <p class="verdict s-{{status .V.Verdict}}"><span class="mark">{{status .V.Verdict}}</span> {{.V.Summary}}</p>
     <p>Ready to send: <strong>{{if .V.ReadyToSend}}yes{{else}}no{{end}}</strong></p>
+    {{with .Publication}}<p class="muted">This issue was received for <a href="/newsletters/{{.ID}}">{{.Name}}</a>.</p>{{end}}
     {{if .Resend}}<p class="muted">Fixed something? Send it again to <code>{{.Address}}</code> and <a href="/t/{{.M.Token}}?after={{.M.ID}}">wait for the new report</a>.</p>{{else if .Address}}<p class="muted">This report was sent to <code>{{.Address}}</code>, which no longer accepts mail. Start a new test to check a fixed version.</p>{{end}}
   </div>
 </section>

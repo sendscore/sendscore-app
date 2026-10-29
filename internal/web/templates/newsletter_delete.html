@@ -1,0 +1,16 @@
+{{define "content"}}
+<section class="sheet">
+  <p class="label">Delete</p>
+  <div>
+    <h1>Delete {{.P.Name}}?</h1>
+    <p>This deletes the newsletter, every message and report received for it, and its alerts. It cannot be undone.</p>
+    <p>Mail sent to <code>{{.Address}}</code> afterwards is refused, so unsubscribe the address from the newsletter too.</p>
+    <form method="post" action="/newsletters/{{.P.ID}}/delete" class="consent">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="confirm" value="delete">
+      <button type="submit" class="danger">Delete it and its history</button>
+      <a class="button secondary" href="/newsletters/{{.P.ID}}">Keep it</a>
+    </form>
+  </div>
+</section>
+{{end}}

@@ -1,0 +1,22 @@
+{{define "content"}}
+<section class="sheet">
+  <p class="label">Message</p>
+  <div>
+    <h1>{{if .View.Subject}}{{.View.Subject}}{{else}}(no subject){{end}}</h1>
+    <p class="muted">From {{.View.From}} · received {{local .M.ReceivedAt .P.TimeZone}} for <a href="/newsletters/{{.P.ID}}">{{.P.Name}}</a> · <a href="/r/{{.M.ID}}">report</a></p>
+    <p class="notice">This is a safe view. It shows the text and the links of the message without its layout, images, or anything that could run. SendScore never opens confirmation, preference, or unsubscribe links, so to confirm a subscription, find the confirmation link below and open it yourself.</p>
+  </div>
+</section>
+{{if .View.Links}}
+<section class="sheet">
+  <p class="label">Links</p>
+  <ol class="links">
+    {{range .View.Links}}<li>{{if .Text}}<span>{{.Text}}</span><br>{{end}}{{if .Web}}<a href="{{.URL}}" rel="noopener noreferrer nofollow">{{.URL}}</a>{{else}}<code>{{.URL}}</code>{{end}}</li>{{end}}
+  </ol>
+</section>
+{{end}}
+<section class="sheet">
+  <p class="label">Text</p>
+  <pre class="mail">{{.View.Text}}</pre>
+</section>
+{{end}}

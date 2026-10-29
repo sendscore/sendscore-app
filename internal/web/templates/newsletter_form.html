@@ -1,0 +1,25 @@
+{{define "content"}}
+<section class="sheet">
+  <p class="label">Newsletter</p>
+  <div>
+    <h1>{{.Title}}</h1>
+    {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+    <form method="post" action="{{.Action}}" class="form">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <label>Name<input type="text" name="name" value="{{.P.Name}}" maxlength="100" placeholder="The Friday Letter" required></label>
+      <fieldset class="days">
+        <legend>Days it usually goes out (leave all clear for no schedule)</legend>
+        {{range .Days}}<label class="check"><input type="checkbox" name="day" value="{{.Value}}"{{if .Checked}} checked{{end}}> {{.Name}}</label>{{end}}
+      </fieldset>
+      <label>Send time, in the time zone below<input type="time" name="at" value="{{.P.At}}"></label>
+      <label>Time zone<input type="text" name="time_zone" value="{{.P.TimeZone}}" list="zones" autocomplete="off" required></label>
+      <datalist id="zones">{{range .Zones}}<option value="{{.}}">{{end}}</datalist>
+      <label>Grace period in minutes, before an issue counts as missed<input type="number" name="grace_minutes" value="{{.P.GraceMinutes}}" min="0" max="{{.MaxGrace}}"></label>
+      <label>Send alerts to<input type="email" name="alert_email" value="{{.P.AlertEmail}}" required></label>
+      <label class="check"><input type="checkbox" name="paused"{{if .P.Paused}} checked{{end}}> Pause alerts (issues are still received and checked)</label>
+      <button type="submit">Save</button>
+    </form>
+    {{if .P.ID}}<p><a href="/newsletters/{{.P.ID}}">Back to {{.P.Name}}</a></p>{{else}}<p><a href="/newsletters">Back to newsletters</a></p>{{end}}
+  </div>
+</section>
+{{end}}
