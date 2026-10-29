@@ -4,12 +4,13 @@
   <div>
     <h1>Allow {{.Name}} to use SendScore?</h1>
     <p>{{.Name}} will act as <strong>{{.User.Email}}</strong>. It can create test addresses, wait for the emails sent to them, and read their reports, and each address counts against your daily allowance. It cannot see your other addresses, your API tokens, or your account settings.</p>
-    <p class="muted">If you allow it, SendScore sends you back to <code>{{.Destination}}</code>. Only allow it if you started connecting this app yourself. You can disconnect it at any time from your account page.</p>
+    <p>If you allow it, SendScore sends you back to <code>{{.Req.RedirectURI}}</code>.</p>
+    <p class="muted">Only allow it if you started connecting this app yourself. You can disconnect it at any time from your account page.</p>
     <form method="post" action="/oauth/authorize" class="consent">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <input type="hidden" name="response_type" value="code">
       <input type="hidden" name="client_id" value="{{.Req.Client.ID}}">
-      <input type="hidden" name="redirect_uri" value="{{.Req.RedirectURI}}">
+      {{if .Req.RedirectGiven}}<input type="hidden" name="redirect_uri" value="{{.Req.RedirectURI}}">{{end}}
       <input type="hidden" name="code_challenge" value="{{.Req.Challenge}}">
       <input type="hidden" name="code_challenge_method" value="S256">
       <input type="hidden" name="state" value="{{.Req.State}}">

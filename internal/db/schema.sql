@@ -127,3 +127,12 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
 CREATE INDEX IF NOT EXISTS oauth_tokens_selector ON oauth_tokens(selector);
 CREATE INDEX IF NOT EXISTS oauth_tokens_user ON oauth_tokens(user_id, client_id);
 CREATE INDEX IF NOT EXISTS oauth_tokens_family ON oauth_tokens(family);
+
+-- Browsers that have signed in to an address, so their sign-in requests get
+-- their own allowance and a stranger cannot lock the owner out.
+CREATE TABLE IF NOT EXISTS known_browsers (
+	token_hash  TEXT NOT NULL,
+	email       TEXT NOT NULL,
+	expires_at  INTEGER NOT NULL,
+	PRIMARY KEY (token_hash, email)
+);

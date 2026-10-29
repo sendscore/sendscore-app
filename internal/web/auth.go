@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/mail"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -16,13 +17,22 @@ import (
 	"github.com/sendscore/sendscore-app/internal/db"
 )
 
+// Cookie names. With SecureCookies they get the __Host- prefix, which the
+// browser accepts only from this host over HTTPS, so a sibling subdomain
+// cannot set or shadow them.
 const (
 	sessionCookie = "ss_session"
 	csrfCookie    = "ss_csrf"
+	// browserCookie marks a browser that has signed in before, so its
+	// sign-in requests have their own allowance (see signin).
+	browserCookie = "ss_browser"
 )
 
-// Sign-in emails allowed per address and per IP in an hour.
+// Sign-in emails allowed per address and per network in an hour.
 const signinPerHour = 5
+
+// knownBrowserTTL is how long a browser that signed in is remembered.
+const knownBrowserTTL = 365 * 24 * time.Hour
 
 // maxAPITokens is how many API tokens one account may hold.
 const maxAPITokens = 25
@@ -56,7 +66,7 @@ func (a *App) session(next http.Handler) http.Handler {
 			return
 		}
 		ctx := r.Context()
-		if c, err := r.Cookie(sessionCookie); err == nil {
+		if c, err := r.Cookie(a.cookie(sessionCookie)); err == nil {
 			u, err := a.store.UserBySession(ctx, c.Value)
 			switch {
 			case err == nil:
@@ -66,7 +76,7 @@ func (a *App) session(next http.Handler) http.Handler {
 			}
 		}
 		token := ""
-		if c, err := r.Cookie(csrfCookie); err == nil && len(c.Value) >= 32 {
+		if c, err := r.Cookie(a.cookie(csrfCookie)); err == nil && len(c.Value) >= 32 {
 			token = c.Value
 		} else {
 			token = db.NewToken(32)
@@ -77,9 +87,17 @@ func (a *App) session(next http.Handler) http.Handler {
 	})
 }
 
+// cookie is the name a cookie is sent under.
+func (a *App) cookie(name string) string {
+	if a.cfg.SecureCookies {
+		return "__Host-" + name
+	}
+	return name
+}
+
 func (a *App) setCookie(w http.ResponseWriter, name, value string, ttl time.Duration) {
 	c := &http.Cookie{
-		Name: name, Value: value, Path: "/", MaxAge: int(ttl.Seconds()),
+		Name: a.cookie(name), Value: value, Path: "/", MaxAge: int(ttl.Seconds()),
 		HttpOnly: true, Secure: a.cfg.SecureCookies, SameSite: http.SameSiteLaxMode,
 	}
 	if ttl < 0 {
@@ -88,14 +106,24 @@ func (a *App) setCookie(w http.ResponseWriter, name, value string, ttl time.Dura
 	http.SetCookie(w, c)
 }
 
-// form wraps every handler of a state-changing form. It parses the body
-// (at most limit bytes), then requires a request from this site (by Origin,
-// or Referer when there is no Origin) and the CSRF token from the cookie in
-// the form's csrf field.
+// formMemory is how much of a form is held in memory; a larger upload is
+// spilled to a temporary file, which the server removes after the request.
+const formMemory = 1 << 20
+
+// form wraps every handler of a state-changing form. It first requires a
+// request from this site (by Origin, or Referer when there is no Origin) and
+// a CSRF cookie, so a forged post is refused before its body is read. Then it
+// parses the body (at most limit bytes) and compares the form's csrf field
+// with the cookie.
 func (a *App) form(limit int64, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		want, _ := r.Context().Value(csrfKey).(string)
+		if !a.sameOrigin(r) || !a.hasCSRFCookie(r) {
+			a.fail(w, r, http.StatusForbidden, formExpired)
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, limit)
-		if err := r.ParseMultipartForm(32 << 20); err != nil && !errors.Is(err, http.ErrNotMultipart) {
+		if err := r.ParseMultipartForm(formMemory); err != nil && !errors.Is(err, http.ErrNotMultipart) {
 			if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {
 				a.fail(w, r, http.StatusRequestEntityTooLarge, tooLargeMessage)
 				return
@@ -103,26 +131,35 @@ func (a *App) form(limit int64, h http.HandlerFunc) http.HandlerFunc {
 			a.fail(w, r, http.StatusBadRequest, "The form could not be read.")
 			return
 		}
-		want, _ := r.Context().Value(csrfKey).(string)
 		sent := r.PostFormValue("csrf")
-		if !a.sameOrigin(r) || want == "" || subtle.ConstantTimeCompare([]byte(sent), []byte(want)) != 1 {
-			a.fail(w, r, http.StatusForbidden, "This form expired or came from another site. Go back, reload the page, and try again.")
+		if want == "" || subtle.ConstantTimeCompare([]byte(sent), []byte(want)) != 1 {
+			a.fail(w, r, http.StatusForbidden, formExpired)
 			return
 		}
 		h(w, r)
 	}
 }
 
-// sameOrigin reports whether a form post came from this site. A request
-// with neither header (an old browser, or a privacy setting) relies on the
-// CSRF token alone.
+const formExpired = "This form expired or came from another site. Go back, reload the page, and try again."
+
+// hasCSRFCookie reports whether the browser sent a CSRF cookie, which a
+// form needs before its body is worth reading.
+func (a *App) hasCSRFCookie(r *http.Request) bool {
+	c, err := r.Cookie(a.cookie(csrfCookie))
+	return err == nil && len(c.Value) >= 32
+}
+
+// sameOrigin reports whether a form post came from this site, by Origin or,
+// when there is none, Referer. A request with neither is refused: every
+// current browser sends Origin on a POST, and the pages' Referrer-Policy
+// keeps Referer for same-origin requests.
 func (a *App) sameOrigin(r *http.Request) bool {
 	src := r.Header.Get("Origin")
 	if src == "" {
 		src = r.Header.Get("Referer")
 	}
 	if src == "" {
-		return true
+		return false
 	}
 	u, err := url.Parse(src)
 	if err != nil || u.Host == "" {
@@ -139,7 +176,10 @@ func (a *App) sameOrigin(r *http.Request) bool {
 // (SENDSCORE_TRUST_PROXY=1) it is the last X-Forwarded-For entry, the one
 // the proxy added; earlier entries come from the client and can be forged.
 // An IPv6 address counts as its /64, since one machine usually has many.
-func (a *App) clientIP(r *http.Request) string {
+func (a *App) clientIP(r *http.Request) string { return a.clientNet(r, 64) }
+
+// clientNet is clientIP with IPv6 counted per prefix of the given length.
+func (a *App) clientNet(r *http.Request, v6bits int) string {
 	raw := r.RemoteAddr
 	if host, _, err := net.SplitHostPort(raw); err == nil {
 		raw = host
@@ -155,7 +195,7 @@ func (a *App) clientIP(r *http.Request) string {
 		return raw
 	}
 	if ip.To4() == nil {
-		return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
+		return ip.Mask(net.CIDRMask(v6bits, 128)).String() + "/" + strconv.Itoa(v6bits)
 	}
 	return ip.String()
 }
@@ -164,12 +204,17 @@ func (a *App) clientIP(r *http.Request) string {
 // allowance, or the IP's when nobody is signed in. It returns the limit and
 // db.ErrLimit when the allowance is used up.
 func (a *App) takeTest(ctx context.Context, u *db.User, ip string) (int, error) {
-	name, limit := "tests:ip:"+ip, a.cfg.AnonDailyTests
-	if u != nil {
-		name, limit = "tests:user:"+u.ID, a.dailyLimit(u)
-	}
+	name, limit := a.testCounter(u, ip)
 	_, err := a.store.Take(ctx, name, db.Day(a.store.Now()), limit, 48*time.Hour)
 	return limit, err
+}
+
+// testCounter is the counter and daily limit takeTest uses.
+func (a *App) testCounter(u *db.User, ip string) (string, int) {
+	if u != nil {
+		return "tests:user:" + u.ID, a.dailyLimit(u)
+	}
+	return "tests:ip:" + ip, a.cfg.AnonDailyTests
 }
 
 // dailyLimit is the user's test addresses per UTC day. Every account is on
@@ -197,9 +242,13 @@ func limitError(limit int) string {
 // Sign-in by emailed link
 
 // safeNext keeps only a path on this site, so the page to open after
-// signing in cannot send anyone elsewhere.
+// signing in cannot send anyone elsewhere. Backslashes, control characters,
+// and anything with a scheme or host are refused, and so is a path with an
+// empty segment, which a browser could resolve to "//host" once dot
+// segments are removed. The result goes out through localRedirect, which
+// writes it as it is.
 func safeNext(p string) string {
-	if len(p) > 2048 || !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") || strings.HasPrefix(p, "/\\") {
+	if len(p) > 2048 || !strings.HasPrefix(p, "/") || strings.ContainsRune(p, '\\') {
 		return ""
 	}
 	for _, r := range p {
@@ -207,7 +256,22 @@ func safeNext(p string) string {
 			return ""
 		}
 	}
+	u, err := url.Parse(p)
+	if err != nil || u.Scheme != "" || u.Host != "" || u.User != nil || u.Opaque != "" {
+		return ""
+	}
+	if strings.Contains(u.Path, "//") || strings.Contains(u.EscapedPath(), "//") {
+		return ""
+	}
 	return p
+}
+
+// localRedirect answers 303 with Location set to a path safeNext passed.
+// http.Redirect would clean the path first, which can turn a safe-looking
+// value into one a browser reads as another host.
+func localRedirect(w http.ResponseWriter, p string) {
+	w.Header().Set("Location", p)
+	w.WriteHeader(http.StatusSeeOther)
 }
 
 func (a *App) signinForm(w http.ResponseWriter, r *http.Request) {
@@ -216,7 +280,7 @@ func (a *App) signinForm(w http.ResponseWriter, r *http.Request) {
 		if next == "" {
 			next = "/account"
 		}
-		http.Redirect(w, r, next, http.StatusSeeOther)
+		localRedirect(w, next)
 		return
 	}
 	a.render(w, r, http.StatusOK, "signin", map[string]any{"Title": "Sign in", "Next": next})
@@ -240,16 +304,8 @@ func (a *App) signin(w http.ResponseWriter, r *http.Request) {
 		a.render(w, r, http.StatusBadRequest, "signin", map[string]any{"Title": "Sign in", "Email": email, "Next": next, "Error": "Enter a full email address, such as you@example.com."})
 		return
 	}
-	hour := db.Hour(a.store.Now())
-	for _, name := range []string{"signin:ip:" + a.clientIP(r), "signin:email:" + email} {
-		if _, err := a.store.Take(ctx, name, hour, signinPerHour, 2*time.Hour); err != nil {
-			if !errors.Is(err, db.ErrLimit) {
-				a.log.Error("signin limit", "err", err)
-			}
-			a.render(w, r, http.StatusTooManyRequests, "error", map[string]any{"Title": "Too many sign-in emails",
-				"Message": "Too many sign-in links were requested in the last hour. Use the newest link you received, or try again in an hour."})
-			return
-		}
+	if !a.takeSignin(w, r, email) {
+		return
 	}
 	token, err := a.store.CreateLoginTokenNext(ctx, email, next)
 	if err != nil {
@@ -268,6 +324,60 @@ func (a *App) signin(w http.ResponseWriter, r *http.Request) {
 	a.render(w, r, http.StatusOK, "signin", map[string]any{"Title": "Check your email", "Sent": true, "Email": email})
 }
 
+// takeSignin counts a sign-in email against three limits, and answers 429
+// when one is used up: the network per hour (an IPv6 address counts as its
+// /48, since a single host is often given that many), the address per hour,
+// and the whole service per hour (SigninEmailsPerHour, which protects the
+// sending reputation). The address limit is kept per browser kind: a
+// browser that has signed in to this address before has its own allowance,
+// so a stranger who uses up the address's allowance cannot lock its owner
+// out of the browsers they already use.
+func (a *App) takeSignin(w http.ResponseWriter, r *http.Request, email string) bool {
+	ctx := r.Context()
+	hour := db.Hour(a.store.Now())
+	emailKey := "signin:email:" + email
+	if c, err := r.Cookie(a.cookie(browserCookie)); err == nil {
+		if ok, err := a.store.KnownBrowser(ctx, c.Value, email); err != nil {
+			a.log.Error("known browser", "err", err)
+		} else if ok {
+			emailKey += ":known:" + db.HashToken(c.Value)[:16]
+		}
+	}
+	limits := []struct {
+		name  string
+		limit int
+		msg   string
+	}{
+		{"signin:ip:" + a.clientNet(r, 48), signinPerHour, "Too many sign-in links were requested from this network in the last hour. Use the newest link you received, or try again in an hour."},
+		{emailKey, signinPerHour, "Too many sign-in links were requested for this address in the last hour. Use the newest link you received, or try again in an hour."},
+		{"signin:all", a.cfg.SigninEmailsPerHour, "SendScore is sending a lot of sign-in emails right now. Try again in a few minutes."},
+	}
+	// Every limit is checked before any is counted, so a request refused by
+	// one (such as a flood from one network) never uses up the others.
+	refuse := func(msg string) bool {
+		a.render(w, r, http.StatusTooManyRequests, "error", map[string]any{"Title": "Too many sign-in emails", "Message": msg})
+		return false
+	}
+	for _, l := range limits {
+		n, err := a.store.Count(ctx, l.name, hour)
+		if err != nil {
+			a.log.Error("signin limit", "err", err)
+		}
+		if n >= l.limit {
+			return refuse(l.msg)
+		}
+	}
+	for _, l := range limits {
+		if _, err := a.store.Take(ctx, l.name, hour, l.limit, 2*time.Hour); err != nil {
+			if !errors.Is(err, db.ErrLimit) {
+				a.log.Error("signin limit", "err", err)
+			}
+			return refuse(l.msg)
+		}
+	}
+	return true
+}
+
 // verifyForm shows a button that signs in. Following the link only shows
 // the page, so a mail scanner that opens links cannot use it up.
 func (a *App) verifyForm(w http.ResponseWriter, r *http.Request) {
@@ -277,7 +387,21 @@ func (a *App) verifyForm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	a.render(w, r, http.StatusOK, "signin", map[string]any{"Title": "Sign in", "Verify": t})
+	// The page names the account, so a link someone else forwarded cannot
+	// sign anyone in to the wrong account without saying so.
+	email, next, err := a.store.PeekLoginToken(r.Context(), t)
+	if errors.Is(err, db.ErrNotFound) {
+		a.render(w, r, http.StatusBadRequest, "signin", map[string]any{"Title": "Sign in",
+			"Error": "That sign-in link has expired or was already used. Enter your email to get a new one."})
+		return
+	}
+	if err != nil {
+		a.log.Error("peek login token", "err", err)
+		a.fail(w, r, http.StatusInternalServerError, "Could not check the sign-in link. Try it again in a minute.")
+		return
+	}
+	a.render(w, r, http.StatusOK, "signin", map[string]any{"Title": "Sign in", "Verify": t, "Email": email,
+		"Connecting": strings.HasPrefix(safeNext(next), "/oauth/authorize")})
 }
 
 func (a *App) verify(w http.ResponseWriter, r *http.Request) {
@@ -293,15 +417,32 @@ func (a *App) verify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.setCookie(w, sessionCookie, session, db.SessionTTL)
+	a.rememberBrowser(w, r, u.Email)
 	next := safeNext(u.Next)
 	if next == "" {
 		next = "/account"
 	}
-	http.Redirect(w, r, next, http.StatusSeeOther)
+	localRedirect(w, next)
+}
+
+// rememberBrowser records that this browser signed in to email, for the
+// sign-in limits.
+func (a *App) rememberBrowser(w http.ResponseWriter, r *http.Request, email string) {
+	token := ""
+	if c, err := r.Cookie(a.cookie(browserCookie)); err == nil && len(c.Value) >= 32 && len(c.Value) <= 64 {
+		token = c.Value
+	} else {
+		token = db.NewToken(32)
+	}
+	if err := a.store.RememberBrowser(r.Context(), token, email, knownBrowserTTL); err != nil {
+		a.log.Error("remember browser", "err", err)
+		return
+	}
+	a.setCookie(w, browserCookie, token, knownBrowserTTL)
 }
 
 func (a *App) signout(w http.ResponseWriter, r *http.Request) {
-	if c, err := r.Cookie(sessionCookie); err == nil {
+	if c, err := r.Cookie(a.cookie(sessionCookie)); err == nil {
 		if err := a.store.DeleteSession(r.Context(), c.Value); err != nil {
 			a.log.Error("delete session", "err", err)
 		}
@@ -361,12 +502,11 @@ func (a *App) createToken(w http.ResponseWriter, r *http.Request) {
 		a.renderAccount(w, r, http.StatusBadRequest, map[string]any{"Error": "Keep the name to 60 characters or fewer.", "Name": name})
 		return
 	}
-	existing, err := a.store.APITokens(r.Context(), u.ID)
-	if err == nil && len(existing) >= maxAPITokens {
+	t, token, err := a.store.CreateAPIToken(r.Context(), u.ID, name, maxAPITokens)
+	if errors.Is(err, db.ErrLimit) {
 		a.renderAccount(w, r, http.StatusBadRequest, map[string]any{"Error": fmt.Sprintf("An account can hold %d tokens. Revoke one you no longer use first.", maxAPITokens)})
 		return
 	}
-	t, token, err := a.store.CreateAPIToken(r.Context(), u.ID, name)
 	if err != nil {
 		a.log.Error("create token", "err", err)
 		a.fail(w, r, http.StatusInternalServerError, "Could not create the token.")

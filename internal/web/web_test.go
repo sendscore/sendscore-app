@@ -140,7 +140,7 @@ func newUser(t *testing.T, store *db.Store, email string) (u db.User, session, t
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, token, err = store.CreateAPIToken(ctx, u.ID, "test")
+	_, token, err = store.CreateAPIToken(ctx, u.ID, "test", 25)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func sample(t *testing.T) []byte {
 
 func TestPagesAndCSP(t *testing.T) {
 	_, _, h := newApp(t)
-	for _, p := range []string{"/", "/upload", "/signin", "/signin/verify?t=abc", "/assets/app.css"} {
+	for _, p := range []string{"/", "/upload", "/signin", "/assets/app.css"} {
 		w := do(h, "GET", p, nil, "")
 		if w.Code != 200 {
 			t.Errorf("%s = %d", p, w.Code)
@@ -319,8 +319,9 @@ func TestWaitAfter(t *testing.T) {
 	if w := do(h, "GET", "/r/"+second.ID+"/raw", nil, ""); w.Code != 200 || !strings.Contains(w.Body.String(), "Shooting into the sun") {
 		t.Errorf("raw = %d", w.Code)
 	}
-	// The report page offers to wait for the next send.
-	if w := do(h, "GET", "/r/"+second.ID, nil, ""); !strings.Contains(w.Body.String(), "/t/"+addr.Token+"?after="+second.ID) {
+	// The report page offers its owner a link to wait for the next send.
+	_, session, _ := newUser(t, store, "after@example.com")
+	if w := serve(h, request("GET", "/r/"+second.ID, nil, "", session)); !strings.Contains(w.Body.String(), "/t/"+addr.Token+"?after="+second.ID) {
 		t.Error("report page has no link to wait for the next send")
 	}
 }

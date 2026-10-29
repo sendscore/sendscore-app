@@ -3,7 +3,7 @@
   <p class="label">Upload</p>
   <div>
     <h1>Check a saved email</h1>
-    <p>A saved file does not record which server delivered it, so SPF, reverse DNS, and TLS are skipped unless you fill in the sending IP.</p>
+    <p>A saved file does not record which server delivered it or whether the delivery used TLS. SPF and reverse DNS are checked only when you fill in the sending IP (with the envelope sender, if you know it), and TLS is always skipped for uploads.</p>
     <form method="post" action="/upload" enctype="multipart/form-data" class="form">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <label>Message (.eml)<input type="file" name="message" accept=".eml,message/rfc822" required></label>

@@ -69,14 +69,36 @@ func migrate(d *sql.DB) error {
 		`ALTER TABLE addresses ADD COLUMN user_id TEXT REFERENCES users(id) ON DELETE SET NULL`,
 		// Where to go after signing in, such as back to an OAuth consent page.
 		`ALTER TABLE login_tokens ADD COLUMN next TEXT NOT NULL DEFAULT ''`,
+		// The hash of the CSRF cookie of the browser that made an anonymous
+		// address, so its reports show the address only to that browser.
+		`ALTER TABLE addresses ADD COLUMN creator TEXT NOT NULL DEFAULT ''`,
+		// The account a signed-in upload belongs to; NULL otherwise.
+		`ALTER TABLE messages ADD COLUMN user_id TEXT REFERENCES users(id) ON DELETE SET NULL`,
+		// Whether the authorization request named its redirect_uri, which
+		// decides whether the token request must (RFC 6749 section 4.1.3).
+		`ALTER TABLE oauth_codes ADD COLUMN redirect_given INTEGER NOT NULL DEFAULT 1`,
+		// When the grant a token belongs to was first allowed, kept across
+		// refreshes; 0 for rows from before the column, which use created_at.
+		`ALTER TABLE oauth_tokens ADD COLUMN granted_at INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, a := range alters {
 		if _, err := d.Exec(a); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			return err
 		}
 	}
-	_, err := d.Exec(`CREATE INDEX IF NOT EXISTS addresses_user ON addresses(user_id)`)
-	return err
+	for _, idx := range []string{
+		`CREATE INDEX IF NOT EXISTS addresses_user ON addresses(user_id)`,
+		`CREATE INDEX IF NOT EXISTS messages_user ON messages(user_id)`,
+		// For pruning registrations (see CreateOAuthClient).
+		`CREATE INDEX IF NOT EXISTS oauth_clients_created ON oauth_clients(created_at)`,
+		`CREATE INDEX IF NOT EXISTS oauth_tokens_client ON oauth_tokens(client_id)`,
+		`CREATE INDEX IF NOT EXISTS oauth_codes_client ON oauth_codes(client_id)`,
+	} {
+		if _, err := d.Exec(idx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Close closes the database.
@@ -96,8 +118,11 @@ func NewToken(n int) string {
 
 // Address is a test address.
 type Address struct {
-	Token     string
-	UserID    string // empty for an anonymous address
+	Token  string
+	UserID string // empty for an anonymous address
+	// Creator is the hash of the CSRF cookie of the browser that made an
+	// anonymous address, or empty.
+	Creator   string
 	CreatedAt time.Time
 	ExpiresAt time.Time
 }
@@ -109,23 +134,40 @@ func (s *Store) CreateAddress(ctx context.Context, ttl time.Duration) (Address, 
 
 // CreateAddressFor makes a test address owned by userID (none when empty).
 func (s *Store) CreateAddressFor(ctx context.Context, ttl time.Duration, userID string) (Address, error) {
+	return s.CreateAddressBy(ctx, ttl, userID, "")
+}
+
+// CreateAddressBy makes a test address owned by userID, or for an anonymous
+// one, made by the browser whose CSRF cookie hashes to creator.
+func (s *Store) CreateAddressBy(ctx context.Context, ttl time.Duration, userID, creator string) (Address, error) {
 	now := s.Now().UTC()
-	a := Address{Token: NewToken(10), UserID: userID, CreatedAt: now, ExpiresAt: now.Add(ttl)}
+	a := Address{Token: NewToken(10), UserID: userID, Creator: creator, CreatedAt: now, ExpiresAt: now.Add(ttl)}
 	var uid any
 	if userID != "" {
 		uid = userID
 	}
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO addresses (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
-		a.Token, uid, a.CreatedAt.Unix(), a.ExpiresAt.Unix())
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO addresses (token, user_id, creator, created_at, expires_at) VALUES (?, ?, ?, ?, ?)`,
+		a.Token, uid, creator, a.CreatedAt.Unix(), a.ExpiresAt.Unix())
 	return a, err
 }
 
 // AddressByToken returns an address that has not expired.
 func (s *Store) AddressByToken(ctx context.Context, token string) (Address, error) {
+	a, err := s.AnyAddressByToken(ctx, token)
+	if err == nil && !a.ExpiresAt.After(s.Now()) {
+		return Address{}, ErrNotFound
+	}
+	return a, err
+}
+
+// AnyAddressByToken returns an address, expired or not, while Sweep keeps
+// it (as long as any of its reports are kept). Waits use it, so a report
+// that arrived just before expiry can still be fetched.
+func (s *Store) AnyAddressByToken(ctx context.Context, token string) (Address, error) {
 	var a Address
 	var created, expires int64
-	err := s.DB.QueryRowContext(ctx, `SELECT token, COALESCE(user_id, ''), created_at, expires_at FROM addresses WHERE token = ? AND expires_at > ?`,
-		strings.ToLower(token), s.Now().Unix()).Scan(&a.Token, &a.UserID, &created, &expires)
+	err := s.DB.QueryRowContext(ctx, `SELECT token, COALESCE(user_id, ''), creator, created_at, expires_at FROM addresses WHERE token = ?`,
+		strings.ToLower(token)).Scan(&a.Token, &a.UserID, &a.Creator, &created, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
 		return a, ErrNotFound
 	}
@@ -133,10 +175,14 @@ func (s *Store) AddressByToken(ctx context.Context, token string) (Address, erro
 	return a, err
 }
 
+// Expired reports whether the address no longer accepts mail.
+func (a Address) Expired(now time.Time) bool { return !a.ExpiresAt.After(now) }
+
 // Message is a stored message and its verdict.
 type Message struct {
 	ID         string
 	Token      string // empty for uploads
+	UserID     string // the account of a signed-in upload, or empty
 	Source     string
 	ReceivedAt time.Time
 	ExpiresAt  time.Time
@@ -159,28 +205,31 @@ func (s *Store) SaveMessage(ctx context.Context, m *Message) error {
 	if err != nil {
 		return err
 	}
-	var tok, tls any
+	var tok, tls, uid any
 	if m.Token != "" {
 		tok = m.Token
+	}
+	if m.UserID != "" {
+		uid = m.UserID
 	}
 	if m.TLS != nil {
 		tls = *m.TLS
 	}
 	_, err = s.DB.ExecContext(ctx, `INSERT INTO messages
-		(id, token, source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, raw, verdict)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.ID, tok, m.Source, m.ReceivedAt.Unix(), m.ExpiresAt.Unix(), m.RemoteIP, m.Helo, m.MailFrom, m.RcptTo, tls, m.Raw, string(vj))
+		(id, token, user_id, source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, raw, verdict)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID, tok, uid, m.Source, m.ReceivedAt.Unix(), m.ExpiresAt.Unix(), m.RemoteIP, m.Helo, m.MailFrom, m.RcptTo, tls, m.Raw, string(vj))
 	return err
 }
 
-const messageCols = `id, COALESCE(token, ''), source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, verdict`
+const messageCols = `id, COALESCE(token, ''), COALESCE(user_id, ''), source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, verdict`
 
 func scanMessage(row interface{ Scan(...any) error }) (*Message, error) {
 	m := &Message{}
 	var received, expires int64
 	var tls sql.NullBool
 	var vj string
-	if err := row.Scan(&m.ID, &m.Token, &m.Source, &received, &expires, &m.RemoteIP, &m.Helo, &m.MailFrom, &m.RcptTo, &tls, &vj); err != nil {
+	if err := row.Scan(&m.ID, &m.Token, &m.UserID, &m.Source, &received, &expires, &m.RemoteIP, &m.Helo, &m.MailFrom, &m.RcptTo, &tls, &vj); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -205,15 +254,15 @@ func (s *Store) MessageByID(ctx context.Context, id string) (*Message, error) {
 }
 
 // MessageForUser returns a report that has not expired, only when it was
-// received at a test address the user owns. Uploads belong to no address,
-// so they are never returned.
+// received at a test address the user owns or uploaded while signed in to
+// the user's account.
 func (s *Store) MessageForUser(ctx context.Context, id, userID string) (*Message, error) {
 	if userID == "" {
 		return nil, ErrNotFound
 	}
 	return scanMessage(s.DB.QueryRowContext(ctx,
 		`SELECT `+messageCols+` FROM messages WHERE id = ? AND expires_at > ?
-		AND token IN (SELECT token FROM addresses WHERE user_id = ?)`, id, s.Now().Unix(), userID))
+		AND (token IN (SELECT token FROM addresses WHERE user_id = ?) OR user_id = ?)`, id, s.Now().Unix(), userID, userID))
 }
 
 // RawByID returns the raw message of a report that has not expired.
@@ -256,7 +305,7 @@ const AddressGrace = time.Hour
 
 // Sweep deletes expired messages, addresses that expired more than
 // AddressGrace ago and have no messages left, and expired sign-in links,
-// sessions, and usage counters.
+// sessions, usage counters, OAuth codes and tokens, and known browsers.
 func (s *Store) Sweep(ctx context.Context) (int64, error) {
 	now := s.Now()
 	res, err := s.DB.ExecContext(ctx, `DELETE FROM messages WHERE expires_at <= ?`, now.Unix())
@@ -269,7 +318,7 @@ func (s *Store) Sweep(ctx context.Context) (int64, error) {
 	if err != nil {
 		return n, err
 	}
-	for _, table := range []string{"login_tokens", "sessions", "counters", "oauth_codes", "oauth_tokens"} {
+	for _, table := range []string{"login_tokens", "sessions", "counters", "oauth_codes", "oauth_tokens", "known_browsers"} {
 		if _, err := s.DB.ExecContext(ctx, `DELETE FROM `+table+` WHERE expires_at <= ?`, now.Unix()); err != nil {
 			return n, err
 		}

@@ -29,11 +29,13 @@ Or upload a saved file at http://127.0.0.1:3014/upload.
 
 ## Accounts
 
-Sign-in is by emailed link, with no passwords. `/signin` takes an email address and sends a link to `/signin/verify` that works once and expires in 15 minutes. Opening the link shows a "Sign in" button, so a mail scanner that follows links cannot use it up; pressing it creates the account on a first sign-in, starts a 30-day session, and opens `/account`. The page after the form always says "Check your email", whether or not the address has an account. Each address and each IP may request 5 links an hour.
+Sign-in is by emailed link, with no passwords. `/signin` takes an email address and sends a link to `/signin/verify` that works once and expires in 15 minutes. Opening the link shows the address it signs in as and a "Sign in" button, so a mail scanner that follows links cannot use it up, and a link someone else forwarded says whose account it opens. Pressing it creates the account on a first sign-in, starts a 30-day session, and opens `/account`. The page after the form always says "Check your email", whether or not the address has an account.
+
+Sign-in emails are limited per hour: 5 per network (an IPv4 address, or an IPv6 /48), 5 per address, and `SENDSCORE_SIGNIN_EMAILS_PER_HOUR` for the whole service. A browser that has signed in to an address before (it keeps a `ss_browser` cookie for a year) has its own 5 an hour for that address, so a stranger who uses up the address's allowance cannot lock its owner out of the browsers they already use.
 
 Without SES keys the link is written to the app's log instead of emailed. To sign in locally that way, submit the form, then copy the `/signin/verify?t=...` link from the terminal. With the SES keys in `.env.local`, a local run sends real email, and the link points at `SENDSCORE_BASE_URL`.
 
-`/account` shows today's usage and the API tokens. Create a named token there (it is shown once, so copy it then), see each one's prefix (such as `ss_live_abcd`), when it was created, and when it was last used, and revoke it. Sign-in links, sessions, and tokens are stored only as SHA-256 hashes. Every form carries a CSRF token and must come from the site itself (by `Origin` or `Referer`).
+`/account` shows today's usage and the API tokens. Create a named token there (it is shown once, so copy it then), see each one's prefix (such as `ss_live_abcd`), when it was created, and when it was last used, and revoke it. Sign-in links, sessions, and tokens are stored only as SHA-256 hashes. Every form carries a CSRF token and must come from the site itself by `Origin`, or `Referer` when there is no `Origin`; a post with neither is refused. Both are checked before the body is read. With secure cookies the cookies are named `__Host-ss_session`, `__Host-ss_csrf`, and `__Host-ss_browser`, so no other subdomain can set them, and every response carries `Strict-Transport-Security`.
 
 Test addresses are limited per UTC day. A free account gets 25 (through the API, MCP, or the site while signed in), and an anonymous visitor gets 5 per IP for "Get a test address" and uploads together. Over the limit, the API answers 429 and the site shows a page saying when it starts again. Every account is on the `free` plan (`users.plan`) until billing lifts the limits.
 
@@ -50,14 +52,20 @@ Settings (environment, or `.env.local`):
 | `SENDSCORE_SURBL_ZONE` | unset: no SURBL lookups. A SURBL data feed zone, for subscribers. |
 | `SENDSCORE_PUBLIC_BLOCKLISTS` | unset. `1` uses the free public Spamhaus and SURBL zones, which are for non-commercial use only (a personal self-hosted instance). |
 | `SENDSCORE_CHECK_LINKS` | on. Fetches every link and image in received and uploaded messages, with a client that refuses private and loopback addresses and never fetches unsubscribe, confirm, or preference links. `0` turns it off, and `content.links` and `content.images` are skipped. |
-| `SENDSCORE_TLS_CERT`, `SENDSCORE_TLS_KEY` | unset: STARTTLS off. Production must set them (a certificate for the mail domain), or every message fails `auth.tls`. |
-| `SENDSCORE_SECURE_COOKIES` | unset. `true` in production (HTTPS): cookies are marked Secure, and the app refuses to start without `SENDSCORE_BASE_URL` and the SES keys, so sign-in links never come from the Host header or land in the log. |
+| `SENDSCORE_TLS_CERT`, `SENDSCORE_TLS_KEY` | unset: STARTTLS off. Production must set them (a certificate for the mail domain), or every message fails `auth.tls`. The files are checked once a minute and reloaded when they change, so a renewal needs no restart. |
+| `SENDSCORE_SECURE_COOKIES` | `true` when `SENDSCORE_BASE_URL` is https, otherwise `false`. When true, cookies are Secure and `__Host-` named, responses carry HSTS, and the app refuses to start without `SENDSCORE_BASE_URL` and the SES keys, so sign-in links never come from the Host header or land in the log. |
 | `SES_ACCESS_KEY_ID`, `SES_SECRET_ACCESS_KEY` | unset: sign-in links are logged, not emailed (development only). |
 | `SES_REGION` | `us-east-1` |
 | `SENDSCORE_MAIL_FROM` | `SendScore <hello@sendscore.ai>` |
 | `SENDSCORE_FREE_DAILY_TESTS` | `25` test addresses per UTC day for a free account |
 | `SENDSCORE_ANON_DAILY_TESTS` | `5` test addresses and uploads per UTC day for an anonymous IP |
-| `SENDSCORE_TRUST_PROXY` | unset. `1` behind a reverse proxy: the client IP for limits is the last `X-Forwarded-For` entry, the one the proxy added. Leave it unset when the app is reachable directly, or anyone could choose their IP. |
+| `SENDSCORE_FREE_DAILY_MESSAGES` | `100` messages per UTC day received by a free account's addresses, together |
+| `SENDSCORE_MESSAGES_PER_ADDRESS` | `20` messages one test address accepts in its life |
+| `SENDSCORE_SMTP_SESSIONS` | `50` SMTP connections open at once |
+| `SENDSCORE_SMTP_SESSIONS_PER_IP` | `5` SMTP connections open at once from one sending IP |
+| `SENDSCORE_SIGNIN_EMAILS_PER_HOUR` | `200` sign-in emails per hour for the whole service |
+| `SENDSCORE_OAUTH_REGISTRATIONS_PER_HOUR` | `600` connector registrations per hour for the whole service |
+| `SENDSCORE_TRUST_PROXY` | unset. `1` behind a reverse proxy: the client IP for limits is the last `X-Forwarded-For` entry, the one the proxy added. Leave it unset when the app is reachable directly, or anyone could choose their IP. A public `SENDSCORE_BASE_URL` without it logs a warning at startup, because behind a proxy every visitor would share one IP and one set of limits. |
 
 ## Connector (OAuth)
 
@@ -65,11 +73,11 @@ To connect Claude or another MCP client, add `https://app.sendscore.ai/api/mcp` 
 
 1. An unauthenticated call to `/api/mcp` gets a 401 with `WWW-Authenticate: Bearer resource_metadata="<base>/.well-known/oauth-protected-resource/api/mcp"` (and `error="invalid_token"` when a token was sent but is no good).
 2. `/.well-known/oauth-protected-resource` (and its `/api/mcp` variant) is RFC 9728 metadata naming the app as the authorization server, and `/.well-known/oauth-authorization-server` is RFC 8414 metadata. There is also `/.well-known/mcp/server-card.json`.
-3. The client registers itself at `POST /oauth/register` (RFC 7591). Clients are public, so a request for a secret is registered without one, and the reply says `token_endpoint_auth_method` is `none`. A redirect URI must be https, http on 127.0.0.1 or localhost, or a native app's own scheme (such as `cursor://` or `vscode://`, which those editors use), with no fragment or wildcard; unusable ones are dropped, and a list with none left is refused. Each IP may register 20 clients an hour, and the oldest registrations that never connected are deleted past 2,000. A name that claims to be SendScore is not kept.
-4. `GET /oauth/authorize` sends a signed-out visitor through email sign-in and back, then shows a consent page naming the client and where it sends you, with Allow and Deny. It checks the client, an exact `redirect_uri`, PKCE with `S256`, and `resource` (RFC 8707), which must be `<base>/api/mcp` when given, and passes `state` through. Allow returns a single-use code that expires in 10 minutes, bound to the client, the redirect URI, the user, and the PKCE challenge, along with `iss` (RFC 9207).
-5. `POST /oauth/token` swaps the code and its `code_verifier` for an access token (an hour) and a refresh token (30 days). A refresh token is used once. Each refresh returns a new pair, and presenting an old one again revokes every token of that connection. A code used twice does the same.
+3. The client registers itself at `POST /oauth/register` (RFC 7591). Clients are public, so a request for a secret is registered without one, and the reply says `token_endpoint_auth_method` is `none`. A redirect URI must be https, http on 127.0.0.1 or localhost, or a native app's own scheme (such as `cursor://` or `vscode://`, which those editors use), with no fragment or wildcard; unusable ones are dropped, and a list with none left is refused. Each network may register 120 clients an hour, and the whole service `SENDSCORE_OAUTH_REGISTRATIONS_PER_HOUR`, since hosted clients such as claude.ai register from a few shared servers. At 10,000 registrations, a new one first deletes the oldest clients that are more than an hour old and hold no live token or unused code; when none can go, it gets a 503 with `temporarily_unavailable`, never a `client_id` that does not exist. A name that claims to be SendScore is not kept.
+4. `GET /oauth/authorize` sends a signed-out visitor through email sign-in and back, then shows a consent page naming the client, the account, and the full redirect URI it sends you to, with Allow and Deny. It checks the client, the `redirect_uri` (an exact match, except that an http loopback URI matches on any port, as RFC 8252 section 7.3 requires; it may be left out when the client registered only one), PKCE with `S256`, and `resource` (RFC 8707), which must be `<base>/api/mcp` when given, and passes `state` through. A request that fails these checks is shown as an error page and never redirected without the user seeing a page, since anyone can register a redirect URI (RFC 9700 section 4.11.2); Deny on the consent page goes back to the client with `access_denied`. An account may connect 20 apps at once. Allow returns a single-use code that expires in 10 minutes, bound to the client, the redirect URI, the user, and the PKCE challenge, along with `iss` (RFC 9207).
+5. `POST /oauth/token` swaps the code and its `code_verifier` for an access token (an hour) and a refresh token (30 days). The token request must send the same `redirect_uri` when the authorization request named one, and may leave it out when it did not (RFC 6749 section 4.1.3). A refresh token is used once. Each refresh returns a new pair; the same refresh token sent again within 30 seconds (a retry, or two workers refreshing at once) gets another new pair, and sent again later it revokes every token of that connection. A code used twice also revokes them.
 
-OAuth tokens (`ss_oat_...`) work only on `/api/mcp`, where an API token works too. They act for the user who allowed them, so ownership and the daily allowance apply as for API tokens. `/account` lists connected apps with a Disconnect button that revokes their tokens. All codes and tokens are stored only as SHA-256 hashes.
+OAuth tokens (`ss_oat_...`) work only on `/api/mcp`, where an API token works too. They act for the user who allowed them, so ownership and the daily allowance apply as for API tokens. `/account` lists connected apps, with the date each was first allowed and a Disconnect button that revokes their tokens. All codes and tokens are stored only as SHA-256 hashes.
 
 To try it locally, run `npx @modelcontextprotocol/inspector`, choose Streamable HTTP with `http://127.0.0.1:3014/api/mcp`, and use its OAuth flow; the sign-in link is in the app's log when SES is off.
 
@@ -78,32 +86,36 @@ To try it locally, run `npx @modelcontextprotocol/inspector`, choose Streamable 
 Every `/api/v1/` route and `/api/mcp` take an API token from the account page in the `Authorization` header:
 
 ```sh
-curl -H "Authorization: Bearer ss_live_..." -X POST https://sendscore.ai/api/v1/test-addresses
+curl -H "Authorization: Bearer ss_live_..." -X POST https://app.sendscore.ai/api/v1/test-addresses
 ```
 
-A missing, unknown, or revoked token gets a 401 (`{"error": ...}` on `/api/v1/`, and a plain 401 with `WWW-Authenticate: Bearer` on `/api/mcp`). Addresses made with a token belong to its account, and the wait, report, and MCP tools answer only for that account's addresses, with a 404 for anyone else's. The report page `/r/{id}`, its `/r/{id}/json`, and the address page `/t/{token}` stay viewable by their unguessable links. `sendscore mcp` sends the token from `SENDSCORE_TOKEN`.
+A missing, unknown, or revoked token gets a 401 (`{"error": ...}` on `/api/v1/`, and a plain 401 with `WWW-Authenticate: Bearer` on `/api/mcp`). Addresses made with a token belong to its account, and the wait, report, and MCP tools answer only for that account's addresses, with a 404 for anyone else's. The report page `/r/{id}`, its `/r/{id}/json`, and the address page `/t/{token}` stay viewable by their unguessable links. A report page shows its test address and the link to send again only to whoever made the address (its account, or for an anonymous address, the browser that made it), since a shared report link should not let anyone else send to it. Uploads made while signed in belong to the account, so the report API and `get_report` return them. `sendscore mcp` sends the token from `SENDSCORE_TOKEN`.
 
 - `POST /api/v1/test-addresses` returns `address`, `token`, `expires_at`, `wait_url`, and `page_url`.
-- `GET /api/v1/test-addresses/{token}/wait?timeout=30` long-polls (at most 50 seconds, below common proxy timeouts) and returns `{"status": "received", "report_id", "report_url", "verdict"}` or `{"status": "not_received"}`. It returns the newest message at the address, even one that arrived before the call. To check a second send to the same address, add `&after=<report_id>` with the earlier report, and only a newer message counts; an `after` that is not a report from this address is a 400. The page `/t/{token}?after=<report_id>` waits the same way.
+- `GET /api/v1/test-addresses/{token}/wait?timeout=30` long-polls (at most 50 seconds, below common proxy timeouts) and returns `{"status": "received", "report_id", "report_url", "verdict"}` or `{"status": "not_received"}`. It returns the newest message at the address, even one that arrived before the call. To check a second send to the same address, add `&after=<report_id>` with the earlier report, and only a newer message counts; an `after` that is not a report from this address is a 400. The page `/t/{token}?after=<report_id>` waits the same way. Waits keep working after the address expires, for as long as its reports are kept; when the address has expired and no matching message arrived, the wait answers 410 at once (and the page says the address expired). An account may hold 5 waits open at once (more get a 429), and the service 200.
 - `GET /api/v1/reports/{id}` returns the verdict JSON.
 
 - `/api/mcp` is the remote MCP connector (streamable HTTP, with the token as above) with `get_test_address`, `wait_for_message` (with an optional `after_report_id`, as `after` above), `get_report`, and `compare_to_previous`. The tools live in the engine repository's `mcpserver` package; here they read the database directly.
 
 Addresses accept mail for 24 hours; reports are kept for 7 days. A message is checked once per transaction and for one test address: a repeated `RCPT` for the same address is accepted once, and a second address gets a 452, so the sender delivers it separately. A `MAIL FROM` with control characters or angle brackets gets a 501. Uploads and messages are limited to 25 MB, and a larger upload is refused, never cut short.
 
-Upload reports say they came from an upload, and mark the sending IP and envelope sender as supplied by the uploader, since SendScore did not see the delivery.
+The receiver bounds volume. A test address accepts 20 messages in its life (then a 550 at `RCPT`), an account's addresses together accept 100 a UTC day (then a 452), one connection delivers 10 messages (then a 451 at `MAIL`, so the sender reconnects), and 50 connections may be open at once, 5 from one IP (then a 421). Each read of a message body has 60 seconds, so a slow sender is not cut off, up to 10 minutes for the whole message; a body that stops arriving gets a 451, so the sender retries rather than bouncing. At most 4 uploads are read and checked at once (more get a 503), and an upload over the daily limit is refused before its body is read.
+
+Upload reports say they came from an upload, and mark the sending IP and envelope sender as supplied by the uploader, since SendScore did not see the delivery. SPF and reverse DNS are checked only when the sending IP is given, and TLS is never checked for an upload.
 
 On shutdown (SIGTERM), open waits answer `not_received` at once, and uploads and SMTP sessions get up to a minute to finish their checks and save; anything still open after that is dropped and retried by the sender. Give the process manager a stop timeout of more than a minute (systemd's default is 90 seconds).
 
 ## Not built yet
 
-Monitored publications, the heartbeat, alerts (SES), a Docker image and self-hosting docs, Creem billing (hosted only), and deploy scripts. Nothing is deployed.
+Monitored publications, the heartbeat, alerts (SES), a Docker image, Creem billing (hosted only), and deploy scripts. Nothing is deployed. Self-hosting is documented on the website.
 
 ## Develop
 
 ```sh
-go vet ./... && go test ./...
+go vet ./... && go test ./... && go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 ```
+
+`go.mod` pins the toolchain (`toolchain go1.26.10`), so a build never uses an older Go with known standard library vulnerabilities; move it forward when a new patch release is out.
 
 No em or en dashes anywhere. Commits: short one-line messages, no attribution lines.
 

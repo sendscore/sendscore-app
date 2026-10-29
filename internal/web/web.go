@@ -7,6 +7,7 @@ import (
 	"embed"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"html/template"
 	"io"
 	"io/fs"
@@ -58,7 +59,22 @@ type Config struct {
 	// uploads) per UTC day for a free account and for an anonymous IP.
 	FreeDailyTests int
 	AnonDailyTests int
+	// SigninEmailsPerHour caps the sign-in emails the whole service sends
+	// in an hour. It defaults to 200.
+	SigninEmailsPerHour int
+	// RegistrationsPerHour caps OAuth client registrations for the whole
+	// service in an hour, on top of the per-network limit. It defaults to
+	// 600.
+	RegistrationsPerHour int
 }
+
+// Bounds on long polls (API and MCP waits) open at once, per account and in
+// all, and on uploads being checked at once.
+const (
+	maxWaitsPerUser = 5
+	maxWaits        = 200
+	maxUploads      = 4
+)
 
 // MaxUploadBytes is the largest upload checked, the same as the largest
 // message the receiver accepts.
@@ -76,6 +92,12 @@ type App struct {
 	// quit is closed by StopWaits, so long polls answer before shutdown.
 	quit     chan struct{}
 	quitOnce sync.Once
+
+	// waits counts open long polls per user ("" is the total).
+	waitMu sync.Mutex
+	waits  map[string]int
+	// uploads holds a slot per upload being read or checked.
+	uploads chan struct{}
 }
 
 // StopWaits makes every open and future long poll answer at once, as if its
@@ -91,7 +113,14 @@ func New(cfg Config, store *db.Store, log *slog.Logger) (*App, error) {
 	if cfg.Mailer == nil {
 		cfg.Mailer = mail.Log{Logger: log}
 	}
-	a := &App{cfg: cfg, store: store, log: log, tmpl: map[string]*template.Template{}, quit: make(chan struct{})}
+	if cfg.SigninEmailsPerHour == 0 {
+		cfg.SigninEmailsPerHour = 200
+	}
+	if cfg.RegistrationsPerHour == 0 {
+		cfg.RegistrationsPerHour = 600
+	}
+	a := &App{cfg: cfg, store: store, log: log, tmpl: map[string]*template.Template{}, quit: make(chan struct{}),
+		waits: map[string]int{}, uploads: make(chan struct{}, maxUploads)}
 	funcs := template.FuncMap{
 		"lower":  strings.ToLower,
 		"status": func(s verdict.Status) string { return string(s) },
@@ -135,7 +164,9 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("GET /t/{token}", a.addressPage)
 	mux.HandleFunc("GET /upload", a.uploadForm)
 	// The body may be a little larger than the file, for the form fields.
-	mux.HandleFunc("POST /upload", a.form(MaxUploadBytes+1<<20, a.upload))
+	// uploadGate refuses an upload over the daily limit, or when too many
+	// are in progress, before a.form reads the body.
+	mux.HandleFunc("POST /upload", a.uploadGate(a.form(MaxUploadBytes+1<<20, a.upload)))
 	mux.HandleFunc("GET /r/{id}", a.reportPage)
 	mux.HandleFunc("GET /r/{id}/raw", a.rawMessage)
 	mux.HandleFunc("GET /r/{id}/json", a.reportJSON)
@@ -165,19 +196,24 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/test-addresses/{token}/wait", a.api(a.apiWait))
 	mux.HandleFunc("GET /api/v1/reports/{id}", a.api(a.apiReport))
 	mux.Handle("/api/mcp", cors(a.mcpAuth(a.mcpHandler())))
-	return secure(a.session(mux))
+	return a.secure(a.session(mux))
 }
 
 // csp allows no inline script or style, like Preflight.
 const csp = "default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
 
-// secure sets the headers every response carries.
-func secure(h http.Handler) http.Handler {
+// secure sets the headers every response carries. A site served over HTTPS
+// (SecureCookies) also gets Strict-Transport-Security, so a browser never
+// tries plain HTTP again.
+func (a *App) secure(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hd := w.Header()
 		hd.Set("Content-Security-Policy", csp)
 		hd.Set("X-Content-Type-Options", "nosniff")
 		hd.Set("Referrer-Policy", "same-origin")
+		if a.cfg.SecureCookies {
+			hd.Set("Strict-Transport-Security", "max-age=31536000")
+		}
 		h.ServeHTTP(w, r)
 	})
 }
@@ -229,11 +265,16 @@ func (a *App) createAddressPage(w http.ResponseWriter, r *http.Request) {
 		a.limitPage(w, r, limit)
 		return
 	}
-	uid := ""
+	// An address belongs to the account, or for an anonymous visitor, to
+	// this browser (by its CSRF cookie), so its reports show the address
+	// only to whoever made it.
+	uid, creator := "", ""
 	if u != nil {
 		uid = u.ID
+	} else if c, _ := r.Context().Value(csrfKey).(string); c != "" {
+		creator = db.HashToken(c)
 	}
-	addr, err := a.store.CreateAddressFor(r.Context(), a.cfg.AddressTTL, uid)
+	addr, err := a.store.CreateAddressBy(r.Context(), a.cfg.AddressTTL, uid, creator)
 	if err != nil {
 		a.log.Error("create address", "err", err)
 		a.fail(w, r, http.StatusInternalServerError, "Could not create a test address.")
@@ -244,9 +285,10 @@ func (a *App) createAddressPage(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) addressPage(w http.ResponseWriter, r *http.Request) {
 	token := r.PathValue("token")
-	addr, err := a.store.AddressByToken(r.Context(), token)
+	// An expired address still opens its reports while they are kept.
+	addr, err := a.store.AnyAddressByToken(r.Context(), token)
 	if err != nil {
-		a.fail(w, r, http.StatusNotFound, "This test address does not exist, or it has expired.")
+		a.fail(w, r, http.StatusNotFound, "This test address does not exist, or it has expired and its reports were deleted.")
 		return
 	}
 	// After a report, the page waits for the next message instead.
@@ -259,6 +301,11 @@ func (a *App) addressPage(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, http.StatusNotFound, "That report did not come from this test address.")
 		return
 	}
+	if addr.Expired(a.store.Now()) {
+		a.render(w, r, http.StatusGone, "error", map[string]any{"Title": "Address expired",
+			"Message": "This test address stopped accepting mail on " + addr.ExpiresAt.Format("2 Jan 2006 at 15:04 UTC") + ", and no new message arrived before then. Start a new test to get another address."})
+		return
+	}
 	a.render(w, r, http.StatusOK, "address", map[string]any{
 		"Title": "Waiting for your email", "Address": a.address(addr.Token), "Expires": addr.ExpiresAt,
 		"Refresh": true,
@@ -269,8 +316,38 @@ func (a *App) uploadForm(w http.ResponseWriter, r *http.Request) {
 	a.render(w, r, http.StatusOK, "upload", map[string]any{"Title": "Check a saved email"})
 }
 
+// uploadGate runs before an upload's body is read. It refuses a post from
+// another site, a visitor whose daily allowance is used up, and an upload
+// while maxUploads others are being read or checked, so a flood of large
+// bodies costs neither memory nor disk. The allowance is only looked at
+// here; upload counts it once the file has been read.
+func (a *App) uploadGate(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !a.sameOrigin(r) || !a.hasCSRFCookie(r) {
+			a.fail(w, r, http.StatusForbidden, formExpired)
+			return
+		}
+		name, limit := a.testCounter(userFrom(r.Context()), a.clientIP(r))
+		if n, err := a.store.Count(r.Context(), name, db.Day(a.store.Now())); err != nil {
+			a.log.Error("count test", "err", err)
+		} else if n >= limit {
+			a.limitPage(w, r, limit)
+			return
+		}
+		select {
+		case a.uploads <- struct{}{}:
+			defer func() { <-a.uploads }()
+		default:
+			a.fail(w, r, http.StatusServiceUnavailable, "SendScore is checking several uploads right now. Try again in a minute.")
+			return
+		}
+		h(w, r)
+	}
+}
+
 func (a *App) upload(w http.ResponseWriter, r *http.Request) {
-	// a.form has parsed the body, within the size limit.
+	// a.form has parsed the body, within the size limit; a large file was
+	// spilled to a temporary file.
 	file, _, err := r.FormFile("message")
 	if err != nil {
 		if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {
@@ -290,7 +367,8 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, http.StatusRequestEntityTooLarge, tooLargeMessage)
 		return
 	}
-	if limit, err := a.takeTest(r.Context(), userFrom(r.Context()), a.clientIP(r)); err != nil {
+	u := userFrom(r.Context())
+	if limit, err := a.takeTest(r.Context(), u, a.clientIP(r)); err != nil {
 		if !errors.Is(err, db.ErrLimit) {
 			a.log.Error("count test", "err", err)
 		}
@@ -306,19 +384,26 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	now := a.store.Now().UTC()
-	// Bounded well inside the server's write timeout.
-	actx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	// The server's write deadline started when the headers were read, and
+	// reading a large body may have used most of it, so the response gets a
+	// fresh one that covers the checks and the save.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(uploadCheckTimeout + 30*time.Second))
+	actx, cancel := context.WithTimeout(r.Context(), uploadCheckTimeout)
 	defer cancel()
 	v, err := engine.Analyze(actx, raw, engine.Options{
 		Envelope: env, Resolver: a.cfg.Resolver, CheckLinks: a.cfg.CheckLinks,
 		Blocklists: a.cfg.Blocklists, ReceivedAt: now,
 	})
 	if err != nil {
-		a.fail(w, r, http.StatusBadRequest, "That file is not an email message: "+err.Error())
+		a.fail(w, r, http.StatusBadRequest, "That file is not an email message. "+err.Error())
 		return
 	}
 	m := &db.Message{Source: "upload", ReceivedAt: now, ExpiresAt: now.Add(a.cfg.ReportTTL),
 		RemoteIP: r.FormValue("ip"), MailFrom: env.MailFrom, Raw: raw, Verdict: v}
+	if u != nil {
+		// A signed-in upload is the account's, so the API and MCP can read it.
+		m.UserID = u.ID
+	}
 	if err := a.store.SaveMessage(r.Context(), m); err != nil {
 		a.log.Error("save upload", "err", err)
 		a.fail(w, r, http.StatusInternalServerError, "Could not save the report.")
@@ -326,6 +411,9 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 	}
 	http.Redirect(w, r, "/r/"+m.ID, http.StatusSeeOther)
 }
+
+// uploadCheckTimeout bounds the checks on an upload.
+const uploadCheckTimeout = 45 * time.Second
 
 type section struct {
 	Name   string
@@ -362,9 +450,27 @@ func (a *App) reportPage(w http.ResponseWriter, r *http.Request) {
 			secs = append(secs, section{Name: s.name, Checks: cs})
 		}
 	}
-	a.render(w, r, http.StatusOK, "report", map[string]any{
-		"Title": m.Verdict.Message.Subject, "M": m, "V": m.Verdict, "Sections": secs,
-	})
+	data := map[string]any{"Title": m.Verdict.Message.Subject, "M": m, "V": m.Verdict, "Sections": secs}
+	// Only whoever made the address sees it and the link to send again,
+	// since a report link is shared and the address takes mail from anyone.
+	if m.Token != "" {
+		if addr, err := a.store.AnyAddressByToken(r.Context(), m.Token); err == nil && a.ownsAddress(r, addr) {
+			data["Resend"] = !addr.Expired(a.store.Now())
+			data["Address"] = a.address(addr.Token)
+		}
+	}
+	a.render(w, r, http.StatusOK, "report", data)
+}
+
+// ownsAddress reports whether the request comes from the account that owns
+// addr, or for an anonymous address, the browser that made it.
+func (a *App) ownsAddress(r *http.Request, addr db.Address) bool {
+	if addr.UserID != "" {
+		u := userFrom(r.Context())
+		return u != nil && u.ID == addr.UserID
+	}
+	c, _ := r.Context().Value(csrfKey).(string)
+	return addr.Creator != "" && c != "" && db.HashToken(c) == addr.Creator
 }
 
 func (a *App) rawMessage(w http.ResponseWriter, r *http.Request) {
@@ -426,9 +532,12 @@ func (a *App) apiCreateAddress(w http.ResponseWriter, r *http.Request) {
 // id>, only a message received after that report counts.
 func (a *App) apiWait(w http.ResponseWriter, r *http.Request) {
 	token := r.PathValue("token")
-	// Another account's address is answered as if it did not exist.
-	if addr, err := a.store.AddressByToken(r.Context(), token); err != nil || addr.UserID != userFrom(r.Context()).ID {
-		apiError(w, http.StatusNotFound, "no such test address, or it has expired")
+	u := userFrom(r.Context())
+	// Another account's address is answered as if it did not exist. An
+	// expired address still answers while its reports are kept.
+	addr, err := a.store.AnyAddressByToken(r.Context(), token)
+	if err != nil || addr.UserID != u.ID {
+		apiError(w, http.StatusNotFound, "no such test address, or it has expired and its reports were deleted")
 		return
 	}
 	timeout := 30 * time.Second
@@ -440,7 +549,7 @@ func (a *App) apiWait(w http.ResponseWriter, r *http.Request) {
 		}
 		timeout = time.Duration(n) * time.Second
 	}
-	m, err := a.wait(r.Context(), token, r.URL.Query().Get("after"), timeout)
+	m, err := a.wait(r.Context(), u.ID, addr, r.URL.Query().Get("after"), timeout)
 	switch {
 	case err == nil:
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -450,6 +559,10 @@ func (a *App) apiWait(w http.ResponseWriter, r *http.Request) {
 		})
 	case errors.Is(err, errNotReceived):
 		writeJSON(w, http.StatusOK, map[string]any{"status": "not_received"})
+	case errors.Is(err, errExpired):
+		apiError(w, http.StatusGone, expiredMessage(addr))
+	case errors.Is(err, errTooManyWaits):
+		apiError(w, http.StatusTooManyRequests, errTooManyWaits.Error())
 	case errors.Is(err, db.ErrUnknownAfter):
 		apiError(w, http.StatusBadRequest, "after must be a report_id from this test address")
 	default:
@@ -458,24 +571,45 @@ func (a *App) apiWait(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-var errNotReceived = errors.New("not received")
+var (
+	errNotReceived  = errors.New("not received")
+	errExpired      = errors.New("the test address has expired")
+	errTooManyWaits = fmt.Errorf("too many waits are open for this account (at most %d at once); finish one before starting another", maxWaitsPerUser)
+	errBusy         = errors.New("SendScore has too many waits open right now; try again in a minute")
+)
+
+func expiredMessage(addr db.Address) string {
+	return "the test address expired at " + addr.ExpiresAt.Format(time.RFC3339) + " and no matching message arrived before then; create a new test address"
+}
 
 // wait polls for a message at the address, newer than the after report when
 // one is given, for up to timeout (capped at MaxWait). It returns
 // errNotReceived when the timeout passes, the request ends, or StopWaits is
-// called.
-func (a *App) wait(ctx context.Context, token, after string, timeout time.Duration) (*db.Message, error) {
+// called, and errExpired at once when the address no longer accepts mail
+// and has no such message. Each user may hold maxWaitsPerUser waits at once,
+// and the app maxWaits.
+func (a *App) wait(ctx context.Context, userID string, addr db.Address, after string, timeout time.Duration) (*db.Message, error) {
+	release, err := a.holdWait(userID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	ctx, cancel := context.WithTimeout(ctx, min(timeout, a.cfg.MaxWait))
 	defer cancel()
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
-		m, err := a.store.LatestForToken(ctx, token, after)
+		m, err := a.store.LatestForToken(ctx, addr.Token, after)
 		if err == nil || errors.Is(err, db.ErrUnknownAfter) {
 			return m, err
 		}
 		if !errors.Is(err, db.ErrNotFound) && ctx.Err() == nil {
 			return nil, err
+		}
+		// A message accepted just before expiry is still being checked for
+		// up to a minute, so give up only after that.
+		if a.store.Now().After(addr.ExpiresAt.Add(time.Minute)) {
+			return nil, errExpired
 		}
 		select {
 		case <-ctx.Done():
@@ -485,6 +619,30 @@ func (a *App) wait(ctx context.Context, token, after string, timeout time.Durati
 		case <-tick.C:
 		}
 	}
+}
+
+// holdWait takes a wait slot for userID, or returns errTooManyWaits or
+// errBusy.
+func (a *App) holdWait(userID string) (release func(), err error) {
+	a.waitMu.Lock()
+	defer a.waitMu.Unlock()
+	switch {
+	case a.waits[""] >= maxWaits:
+		return nil, errBusy
+	case a.waits[userID] >= maxWaitsPerUser:
+		return nil, errTooManyWaits
+	}
+	a.waits[""]++
+	a.waits[userID]++
+	return func() {
+		a.waitMu.Lock()
+		defer a.waitMu.Unlock()
+		for _, k := range []string{"", userID} {
+			if a.waits[k]--; a.waits[k] <= 0 {
+				delete(a.waits, k)
+			}
+		}
+	}, nil
 }
 
 // apiReport returns a report from one of the token owner's test addresses.

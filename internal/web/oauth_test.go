@@ -271,21 +271,21 @@ func TestOAuthAuthorize(t *testing.T) {
 			t.Errorf("%s = %d %q", name, w.Code, w.Header().Get("Location"))
 		}
 	}
-	// Others go back to the client with an error and the state.
+	// Others are shown here too, never redirected without a page, since
+	// anyone can register a redirect URI (RFC 9700 section 4.11.2).
 	for name, c := range map[string]struct {
 		mod  func(url.Values)
 		want string
 	}{
-		"no PKCE":        {func(v url.Values) { v.Del("code_challenge") }, "invalid_request"},
-		"plain PKCE":     {func(v url.Values) { v.Set("code_challenge_method", "plain") }, "invalid_request"},
-		"other resource": {func(v url.Values) { v.Set("resource", "https://elsewhere.example/mcp") }, "invalid_target"},
-		"token response": {func(v url.Values) { v.Set("response_type", "token") }, "unsupported_response_type"},
+		"no PKCE":        {func(v url.Values) { v.Del("code_challenge") }, "PKCE"},
+		"plain PKCE":     {func(v url.Values) { v.Set("code_challenge_method", "plain") }, "PKCE"},
+		"other resource": {func(v url.Values) { v.Set("resource", "https://elsewhere.example/mcp") }, "resource must be"},
+		"token response": {func(v url.Values) { v.Set("response_type", "token") }, "response_type must be code"},
 	} {
 		v := authorizeQuery(client, challenge)
 		c.mod(v)
 		w := serve(h, request("GET", "/oauth/authorize?"+v.Encode(), nil, "", session))
-		loc, _ := url.Parse(w.Header().Get("Location"))
-		if w.Code != http.StatusSeeOther || loc.Query().Get("error") != c.want || loc.Query().Get("state") != "st8" {
+		if w.Code != http.StatusBadRequest || w.Header().Get("Location") != "" || !strings.Contains(w.Body.String(), c.want) {
 			t.Errorf("%s = %d %q", name, w.Code, w.Header().Get("Location"))
 		}
 	}
@@ -390,8 +390,11 @@ func TestOAuthRefreshRotation(t *testing.T) {
 		t.Fatal("the refreshed access token is refused")
 	}
 
-	// The first refresh token is used up, and presenting it again revokes
-	// the whole family, including the pair it was swapped for.
+	// The first refresh token is used up. Presenting it again after the
+	// grace for retries revokes the whole family, including the pair it was
+	// swapped for.
+	store.Now = func() time.Time { return time.Now().Add(db.RefreshGrace + time.Second) }
+	defer func() { store.Now = time.Now }()
 	if w := refresh(h, client, first); w.Code != 400 {
 		t.Errorf("reuse = %d", w.Code)
 	}

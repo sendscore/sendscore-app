@@ -40,19 +40,22 @@ func (b storeBackend) CreateTestAddress(ctx context.Context) (mcpserver.TestAddr
 }
 
 func (b storeBackend) Wait(ctx context.Context, token, after string, timeout time.Duration) (*verdict.Verdict, error) {
-	addr, err := b.a.store.AddressByToken(ctx, token)
+	// An expired address still answers while its reports are kept.
+	addr, err := b.a.store.AnyAddressByToken(ctx, token)
 	if err != nil {
 		return nil, translate(err)
 	}
 	if addr.UserID != b.user.ID {
 		return nil, mcpserver.ErrNotFound
 	}
-	m, err := b.a.wait(ctx, token, after, timeout)
+	m, err := b.a.wait(ctx, b.user.ID, addr, after, timeout)
 	switch {
 	case err == nil:
 		return m.Verdict, nil
 	case errors.Is(err, errNotReceived):
 		return nil, mcpserver.ErrNotReceived
+	case errors.Is(err, errExpired):
+		return nil, errors.New(expiredMessage(addr))
 	case errors.Is(err, db.ErrUnknownAfter):
 		return nil, errors.New("after_report_id is not a report from this test address")
 	}

@@ -157,6 +157,36 @@ func (s *Store) ConsumeLoginToken(ctx context.Context, token string) (User, stri
 	return u, session, tx.Commit()
 }
 
+// PeekLoginToken returns the address and next path of a sign-in link that
+// is unused and unexpired, without using it up, so the page it opens can
+// say which account it signs in to.
+func (s *Store) PeekLoginToken(ctx context.Context, token string) (email, next string, err error) {
+	hash, err := match(ctx, s.DB, `SELECT token_hash, token_hash FROM login_tokens WHERE selector = ? AND used_at = 0 AND expires_at > ?`, token, s.Now().Unix())
+	if err != nil {
+		return "", "", err
+	}
+	err = s.DB.QueryRowContext(ctx, `SELECT email, next FROM login_tokens WHERE token_hash = ?`, hash).Scan(&email, &next)
+	return email, next, err
+}
+
+// RememberBrowser records that the browser holding token signed in to email,
+// for ttl.
+func (s *Store) RememberBrowser(ctx context.Context, token, email string, ttl time.Duration) error {
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO known_browsers (token_hash, email, expires_at) VALUES (?, ?, ?)
+		ON CONFLICT(token_hash, email) DO UPDATE SET expires_at = excluded.expires_at`,
+		HashToken(token), NormalizeEmail(email), s.Now().Add(ttl).Unix())
+	return err
+}
+
+// KnownBrowser reports whether the browser holding token has signed in to
+// email before.
+func (s *Store) KnownBrowser(ctx context.Context, token, email string) (bool, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM known_browsers WHERE token_hash = ? AND email = ? AND expires_at > ?`,
+		HashToken(token), NormalizeEmail(email), s.Now().Unix()).Scan(&n)
+	return n > 0, err
+}
+
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
 	var created int64
@@ -188,13 +218,24 @@ func (s *Store) DeleteSession(ctx context.Context, token string) error {
 }
 
 // CreateAPIToken makes a named API token for the user and returns it with
-// the full token, which is shown once and never stored.
-func (s *Store) CreateAPIToken(ctx context.Context, userID, name string) (APIToken, string, error) {
+// the full token, which is shown once and never stored. It returns ErrLimit
+// when the user already holds max tokens; the count and the insert are one
+// statement, so concurrent requests cannot pass the limit.
+func (s *Store) CreateAPIToken(ctx context.Context, userID, name string, max int) (APIToken, string, error) {
 	token := APITokenPrefix + NewToken(32)
 	t := APIToken{ID: "tok_" + NewToken(8), Name: name, Prefix: selector(token), CreatedAt: s.Now().UTC().Truncate(time.Second)}
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO api_tokens (id, user_id, name, selector, token_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		t.ID, userID, name, t.Prefix, HashToken(token), t.CreatedAt.Unix())
-	return t, token, err
+	res, err := s.DB.ExecContext(ctx, `INSERT INTO api_tokens (id, user_id, name, selector, token_hash, created_at)
+		SELECT ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM api_tokens WHERE user_id = ?) < ?`,
+		t.ID, userID, name, t.Prefix, HashToken(token), t.CreatedAt.Unix(), userID, max)
+	if err != nil {
+		return t, "", err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return t, "", err
+	} else if n == 0 {
+		return t, "", ErrLimit
+	}
+	return t, token, nil
 }
 
 // APITokens lists a user's tokens, newest first.

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -24,13 +25,19 @@ import (
 // access, and swaps the code (with its PKCE verifier) for tokens. Clients
 // are public, with no secret.
 
-// Registration limits.
+// Registration limits. Hosted clients (such as claude.ai) register from a
+// few shared servers, one registration per user who adds the connector, so
+// the per-network limit is generous and RegistrationsPerHour bounds the
+// whole service.
 const (
 	maxClientName      = 120
 	maxRedirectURIs    = 8
 	maxRedirectURI     = 400
-	registrationsPerIP = 20 // an hour
+	registrationsPerIP = 120 // an hour
 )
+
+// maxConnectedApps is how many apps one account may connect at once.
+const maxConnectedApps = 20
 
 func (a *App) mcpResource() string { return a.cfg.BaseURL + "/api/mcp" }
 
@@ -181,12 +188,24 @@ func cleanClientName(s string) string {
 // so. Unusable redirect URIs are dropped, and only a list with none left is
 // refused.
 func (a *App) register(w http.ResponseWriter, r *http.Request) {
-	if _, err := a.store.Take(r.Context(), "oauth-register:ip:"+a.clientIP(r), db.Hour(a.store.Now()), registrationsPerIP, 2*time.Hour); err != nil {
-		if !errors.Is(err, db.ErrLimit) {
-			a.log.Error("register limit", "err", err)
+	hour := db.Hour(a.store.Now())
+	for _, l := range []struct {
+		name  string
+		limit int
+		desc  string
+	}{
+		// The network first, so one network's refused requests never use up
+		// the service's allowance.
+		{"oauth-register:ip:" + a.clientIP(r), registrationsPerIP, "Too many registrations from this network. Try again in an hour."},
+		{"oauth-register:all", a.cfg.RegistrationsPerHour, "Too many apps are registering right now. Try again in a few minutes."},
+	} {
+		if _, err := a.store.Take(r.Context(), l.name, hour, l.limit, 2*time.Hour); err != nil {
+			if !errors.Is(err, db.ErrLimit) {
+				a.log.Error("register limit", "err", err)
+			}
+			oauthError(w, http.StatusTooManyRequests, "too_many_requests", l.desc)
+			return
 		}
-		oauthError(w, http.StatusTooManyRequests, "too_many_requests", "Too many registrations from this network. Try again in an hour.")
-		return
 	}
 	var req struct {
 		ClientName   string   `json:"client_name"`
@@ -212,6 +231,12 @@ func (a *App) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c, err := a.store.CreateOAuthClient(r.Context(), cleanClientName(req.ClientName), keep)
+	if errors.Is(err, db.ErrClientLimit) {
+		a.log.Warn("oauth client table is full of clients that cannot be deleted yet")
+		w.Header().Set("Retry-After", "3600")
+		oauthError(w, http.StatusServiceUnavailable, "temporarily_unavailable", "SendScore cannot register more apps right now. Try again in an hour.")
+		return
+	}
 	if err != nil {
 		a.log.Error("register client", "err", err)
 		oauthError(w, http.StatusInternalServerError, "server_error", "Could not register the client.")
@@ -242,10 +267,13 @@ func contains(list []string, s string) bool {
 type authzRequest struct {
 	Client      db.OAuthClient
 	RedirectURI string
-	State       string
-	Challenge   string
-	Resource    string
-	Scope       string
+	// RedirectGiven is false when the request left redirect_uri out and the
+	// client's single registered one is used.
+	RedirectGiven bool
+	State         string
+	Challenge     string
+	Resource      string
+	Scope         string
 }
 
 var challengeRE = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
@@ -261,10 +289,11 @@ func (a *App) readAuthorize(ctx context.Context, v url.Values) (req authzRequest
 	}
 	req.Client = c
 	req.RedirectURI = v.Get("redirect_uri")
-	if req.RedirectURI == "" && len(c.RedirectURIs) == 1 {
+	req.RedirectGiven = req.RedirectURI != ""
+	if !req.RedirectGiven && len(c.RedirectURIs) == 1 {
 		req.RedirectURI = c.RedirectURIs[0]
 	}
-	if !contains(c.RedirectURIs, req.RedirectURI) {
+	if !matchRedirect(c.RedirectURIs, req.RedirectURI) {
 		return req, "The app asked to send you back to an address it did not register, so SendScore stopped here.", "", ""
 	}
 	req.State, req.Resource, req.Scope = v.Get("state"), v.Get("resource"), v.Get("scope")
@@ -278,6 +307,47 @@ func (a *App) readAuthorize(ctx context.Context, v url.Values) (req authzRequest
 		return req, "", "invalid_target", "resource must be " + a.mcpResource()
 	}
 	return req, "", "", ""
+}
+
+// matchRedirect reports whether uri is one of the registered redirect URIs.
+// An http loopback URI matches whatever its port, as RFC 8252 section 7.3
+// requires, since a native app listens on the port it was given.
+func matchRedirect(registered []string, uri string) bool {
+	if contains(registered, uri) {
+		return true
+	}
+	u, err := url.Parse(uri)
+	if err != nil || u.Scheme != "http" || !validRedirect(uri) {
+		return false
+	}
+	for _, reg := range registered {
+		v, err := url.Parse(reg)
+		if err == nil && v.Scheme == "http" && v.Hostname() == u.Hostname() && v.EscapedPath() == u.EscapedPath() && v.RawQuery == u.RawQuery {
+			return true
+		}
+	}
+	return false
+}
+
+// canConnect reports whether the user may connect the client: an account
+// holds at most maxConnectedApps, and reconnecting one it holds is fine.
+func (a *App) canConnect(ctx context.Context, u *db.User, clientID string) (bool, error) {
+	apps, err := a.store.ConnectedApps(ctx, u.ID)
+	if err != nil {
+		return false, err
+	}
+	for _, app := range apps {
+		if app.ClientID == clientID {
+			return true, nil
+		}
+	}
+	return len(apps) < maxConnectedApps, nil
+}
+
+// tooManyApps explains a used-up connected app allowance.
+func (a *App) tooManyApps(w http.ResponseWriter, r *http.Request) {
+	a.render(w, r, http.StatusForbidden, "error", map[string]any{"Title": "Too many connected apps",
+		"Message": fmt.Sprintf("An account can connect %d apps at once. Disconnect one you no longer use on your account page, then try again.", maxConnectedApps)})
 }
 
 // redirectTo sends the browser back to the client with params added to its
@@ -305,8 +375,21 @@ func (a *App) authorize(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, http.StatusBadRequest, fatal)
 		return
 	}
+	// A malformed request is shown here, not sent back to the client: anyone
+	// can register a redirect URI, so redirecting without a page would make
+	// this site an open redirector (RFC 9700 section 4.11.2). Errors after
+	// the user has seen the consent page (approve) go back to the client.
 	if code != "" {
-		a.redirectTo(w, r, req.RedirectURI, map[string]string{"error": code, "error_description": desc, "state": req.State})
+		a.fail(w, r, http.StatusBadRequest, "The app asked to connect in a way SendScore does not accept, because "+desc+
+			". SendScore stopped here instead of sending you back. Remove the connector and add it again, or tell the app's developer.")
+		return
+	}
+	if ok, err := a.canConnect(r.Context(), userFrom(r.Context()), req.Client.ID); err != nil {
+		a.log.Error("connected apps", "err", err)
+		a.fail(w, r, http.StatusInternalServerError, "Could not check your connected apps. Try again in a minute.")
+		return
+	} else if !ok {
+		a.tooManyApps(w, r)
 		return
 	}
 	name := req.Client.Name
@@ -319,7 +402,7 @@ func (a *App) authorize(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Security-Policy", strings.Replace(csp, "form-action 'self'", "form-action 'self' "+dest, 1))
 	w.Header().Set("Cache-Control", "no-store")
 	a.render(w, r, http.StatusOK, "consent", map[string]any{
-		"Title": "Connect " + name, "Name": name, "Destination": strings.TrimSuffix(dest, ":"), "Req": req,
+		"Title": "Connect " + name, "Name": name, "Req": req,
 	})
 }
 
@@ -343,7 +426,16 @@ func (a *App) approve(w http.ResponseWriter, r *http.Request) {
 		a.redirectTo(w, r, req.RedirectURI, map[string]string{"error": "access_denied", "error_description": "the user did not allow access", "state": req.State})
 		return
 	}
-	c, err := a.store.CreateOAuthCode(r.Context(), db.OAuthCode{ClientID: req.Client.ID, UserID: u.ID, RedirectURI: req.RedirectURI, CodeChallenge: req.Challenge})
+	if ok, err := a.canConnect(r.Context(), u, req.Client.ID); err != nil {
+		a.log.Error("connected apps", "err", err)
+		a.fail(w, r, http.StatusInternalServerError, "Could not check your connected apps. Try again in a minute.")
+		return
+	} else if !ok {
+		a.tooManyApps(w, r)
+		return
+	}
+	c, err := a.store.CreateOAuthCode(r.Context(), db.OAuthCode{ClientID: req.Client.ID, UserID: u.ID,
+		RedirectURI: req.RedirectURI, RedirectGiven: req.RedirectGiven, CodeChallenge: req.Challenge})
 	if err != nil {
 		a.log.Error("create oauth code", "err", err)
 		a.fail(w, r, http.StatusInternalServerError, "Could not finish connecting the app. Try again.")
@@ -384,7 +476,11 @@ func (a *App) token(w http.ResponseWriter, r *http.Request) {
 		t, err = a.store.ExchangeOAuthCode(r.Context(), f.Get("code"), func(c db.OAuthCode) error {
 			sum := sha256.Sum256([]byte(verifier))
 			want := base64.RawURLEncoding.EncodeToString(sum[:])
-			if c.ClientID != clientID || c.RedirectURI != redirect || subtle.ConstantTimeCompare([]byte(want), []byte(c.CodeChallenge)) != 1 {
+			// redirect_uri must match when the authorization request named
+			// it, and may be left out when it did not (RFC 6749 section
+			// 4.1.3).
+			redirectOK := redirect == c.RedirectURI || (!c.RedirectGiven && redirect == "")
+			if c.ClientID != clientID || !redirectOK || subtle.ConstantTimeCompare([]byte(want), []byte(c.CodeChallenge)) != 1 {
 				return db.ErrInvalidGrant
 			}
 			return nil

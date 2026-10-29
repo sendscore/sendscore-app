@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -43,10 +44,14 @@ func main() {
 	smtpAddr := getenv("SENDSCORE_SMTP_ADDR", "127.0.0.1:2525")
 	mailDomain := getenv("SENDSCORE_MAIL_DOMAIN", "localhost")
 	baseURL := strings.TrimRight(getenv("SENDSCORE_BASE_URL", "http://"+httpAddr), "/")
-	// Secure cookies are the production switch. Sign-in links are built
-	// from SENDSCORE_BASE_URL, never the Host header, so production must set
-	// it.
-	secureCookies := os.Getenv("SENDSCORE_SECURE_COOKIES") == "true"
+	// Secure cookies are the production switch, on by default for an https
+	// base URL. Sign-in links are built from SENDSCORE_BASE_URL, never the
+	// Host header, so production must set it.
+	secureCookies, err := secureCookiesFor(baseURL, os.Getenv("SENDSCORE_SECURE_COOKIES"))
+	if err != nil {
+		log.Error(err.Error())
+		os.Exit(1)
+	}
 	if secureCookies && os.Getenv("SENDSCORE_BASE_URL") == "" {
 		log.Error("SENDSCORE_BASE_URL is required when SENDSCORE_SECURE_COOKIES=true")
 		os.Exit(1)
@@ -69,23 +74,33 @@ func main() {
 		log.Warn("SES is not configured, so sign-in links are logged here instead of emailed")
 	}
 
+	trustProxy := os.Getenv("SENDSCORE_TRUST_PROXY") == "1"
+	if needsProxyWarning(baseURL, trustProxy) {
+		// Behind a proxy every visitor would share the proxy's address, so
+		// one person could use up the sign-in and anonymous limits for all.
+		log.Warn("WARNING: SENDSCORE_BASE_URL is public but SENDSCORE_TRUST_PROXY is not set. Behind a reverse proxy every visitor then counts as the proxy's IP, " +
+			"and one person can use up the sign-in and anonymous limits for everyone. Set SENDSCORE_TRUST_PROXY=1 behind a proxy, and only then.")
+	}
+
 	lists := blocklists()
 	// Links are fetched with the engine's safe client, which refuses
 	// non-public addresses and never follows unsubscribe or confirm links.
 	checkLinks := os.Getenv("SENDSCORE_CHECK_LINKS") != "0"
 	app, err := web.New(web.Config{
-		Blocklists:     lists,
-		CheckLinks:     checkLinks,
-		BehindProxy:    !isLocal(baseURL),
-		TrustProxy:     os.Getenv("SENDSCORE_TRUST_PROXY") == "1",
-		SecureCookies:  secureCookies,
-		Mailer:         mailer,
-		FreeDailyTests: getint(log, "SENDSCORE_FREE_DAILY_TESTS", 25),
-		AnonDailyTests: getint(log, "SENDSCORE_ANON_DAILY_TESTS", 5),
-		BaseURL:        baseURL,
-		MailDomain:     mailDomain,
-		AddressTTL:     24 * time.Hour,
-		ReportTTL:      7 * 24 * time.Hour,
+		Blocklists:           lists,
+		CheckLinks:           checkLinks,
+		BehindProxy:          !isLocal(baseURL),
+		TrustProxy:           trustProxy,
+		SecureCookies:        secureCookies,
+		Mailer:               mailer,
+		FreeDailyTests:       getint(log, "SENDSCORE_FREE_DAILY_TESTS", 25),
+		AnonDailyTests:       getint(log, "SENDSCORE_ANON_DAILY_TESTS", 5),
+		SigninEmailsPerHour:  getpos(log, "SENDSCORE_SIGNIN_EMAILS_PER_HOUR", 200),
+		RegistrationsPerHour: getpos(log, "SENDSCORE_OAUTH_REGISTRATIONS_PER_HOUR", 600),
+		BaseURL:              baseURL,
+		MailDomain:           mailDomain,
+		AddressTTL:           24 * time.Hour,
+		ReportTTL:            7 * 24 * time.Hour,
 	}, store, log)
 	if err != nil {
 		log.Error("templates", "err", err)
@@ -93,12 +108,13 @@ func main() {
 	}
 	var tlsConfig *tls.Config
 	if cert, key := os.Getenv("SENDSCORE_TLS_CERT"), os.Getenv("SENDSCORE_TLS_KEY"); cert != "" || key != "" {
-		pair, err := tls.LoadX509KeyPair(cert, key)
+		// Reloaded when the files change, so a renewal needs no restart.
+		certs, err := receiver.NewCertLoader(cert, key, func(err error) { log.Error("tls certificate reload", "err", err) })
 		if err != nil {
 			log.Error("tls certificate", "err", err)
 			os.Exit(1)
 		}
-		tlsConfig = &tls.Config{Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12}
+		tlsConfig = &tls.Config{GetCertificate: certs.GetCertificate, MinVersion: tls.VersionTLS12}
 	} else {
 		log.Warn("STARTTLS is off: set SENDSCORE_TLS_CERT and SENDSCORE_TLS_KEY, or every message fails auth.tls")
 	}
@@ -109,6 +125,11 @@ func main() {
 		TLS:        tlsConfig,
 		Blocklists: lists,
 		CheckLinks: checkLinks,
+
+		MessagesPerAddress: getpos(log, "SENDSCORE_MESSAGES_PER_ADDRESS", receiver.DefaultMessagesPerAddress),
+		DailyMessages:      getpos(log, "SENDSCORE_FREE_DAILY_MESSAGES", receiver.DefaultDailyMessages),
+		MaxSessions:        getpos(log, "SENDSCORE_SMTP_SESSIONS", receiver.DefaultMaxSessions),
+		MaxSessionsPerIP:   getpos(log, "SENDSCORE_SMTP_SESSIONS_PER_IP", receiver.DefaultMaxSessionsPerIP),
 	}, store, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -195,6 +216,26 @@ func blocklists() []engine.Blocklist {
 	return out
 }
 
+// secureCookiesFor reads SENDSCORE_SECURE_COOKIES: true or false, and when
+// unset, on for an https base URL.
+func secureCookiesFor(baseURL, setting string) (bool, error) {
+	switch setting {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	case "":
+		return strings.HasPrefix(baseURL, "https://"), nil
+	}
+	return false, fmt.Errorf("SENDSCORE_SECURE_COOKIES must be true or false, not %q", setting)
+}
+
+// needsProxyWarning reports whether a public site runs without trusting the
+// proxy's X-Forwarded-For, which behind a proxy makes every visitor one IP.
+func needsProxyWarning(baseURL string, trustProxy bool) bool {
+	return !isLocal(baseURL) && !trustProxy
+}
+
 // isLocal reports whether the public URL is this machine, as in development.
 func isLocal(base string) bool {
 	u, err := url.Parse(base)
@@ -221,6 +262,17 @@ func getint(log *slog.Logger, key string, fallback int) int {
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 0 {
 		log.Error("setting must be a whole number", "key", key, "value", v)
+		os.Exit(1)
+	}
+	return n
+}
+
+// getpos is getint for a setting that must be at least 1, since 0 would
+// mean the default.
+func getpos(log *slog.Logger, key string, fallback int) int {
+	n := getint(log, key, fallback)
+	if n == 0 {
+		log.Error("setting must be at least 1", "key", key)
 		os.Exit(1)
 	}
 	return n

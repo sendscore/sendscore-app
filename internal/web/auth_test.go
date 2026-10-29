@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -94,13 +95,34 @@ func TestSigninLinkIsSingleUse(t *testing.T) {
 func TestSecureCookies(t *testing.T) {
 	a, _, h := newApp(t, func(c *Config) { c.SecureCookies = true })
 	w := do(h, "GET", "/signin", nil, "")
-	if c := cookieNamed(w, csrfCookie); c == nil || !c.Secure || !c.HttpOnly {
+	if c := cookieNamed(w, "__Host-"+csrfCookie); c == nil || !c.Secure || !c.HttpOnly || c.Path != "/" || c.Domain != "" {
 		t.Errorf("csrf cookie = %+v", c)
 	}
-	post(h, "/signin", url.Values{"email": {"secure@example.com"}}, "")
-	w = post(h, "/signin/verify", url.Values{"t": {mailer(a).lastLink(t)}}, "")
-	if c := cookieNamed(w, sessionCookie); c == nil || !c.Secure || !c.HttpOnly || c.SameSite != http.SameSiteLaxMode {
+	if got := w.Header().Get("Strict-Transport-Security"); !strings.Contains(got, "max-age=") {
+		t.Errorf("HSTS = %q", got)
+	}
+	// A browser sends the cookie under its __Host- name.
+	securePost := func(path string, vals url.Values) *httptest.ResponseRecorder {
+		vals.Set("csrf", testCSRF)
+		req := httptest.NewRequest("POST", path, strings.NewReader(vals.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "http://test")
+		req.AddCookie(&http.Cookie{Name: "__Host-" + csrfCookie, Value: testCSRF})
+		return serve(h, req)
+	}
+	securePost("/signin", url.Values{"email": {"secure@example.com"}})
+	w = securePost("/signin/verify", url.Values{"t": {mailer(a).lastLink(t)}})
+	if c := cookieNamed(w, "__Host-"+sessionCookie); c == nil || !c.Secure || !c.HttpOnly || c.SameSite != http.SameSiteLaxMode {
 		t.Errorf("session cookie = %+v", c)
+	}
+	// The unprefixed cookie a sibling subdomain could set is ignored.
+	if w := post(h, "/signin", url.Values{"email": {"secure@example.com"}}, ""); w.Code != http.StatusForbidden {
+		t.Errorf("post with an unprefixed csrf cookie = %d", w.Code)
+	}
+	// Without SecureCookies there is no HSTS.
+	_, _, plain := newApp(t)
+	if got := do(plain, "GET", "/", nil, "").Header().Get("Strict-Transport-Security"); got != "" {
+		t.Errorf("HSTS over http = %q", got)
 	}
 }
 

@@ -8,7 +8,8 @@
     <p class="muted">Nothing arrived? Check the spam folder, or <a href="/signin">send another link</a>.</p>
   {{else if .Verify}}
     <h1>Sign in to SendScore</h1>
-    <p>Press the button to finish signing in on this device.</p>
+    <p>This link signs you in as <strong>{{.Email}}</strong>. Press the button to finish signing in on this device.</p>
+    <p class="muted">If that is not your address, close this page. Someone may have sent you their own link to get you into their account.{{if .Connecting}} After signing in, SendScore asks whether to connect an app. Allow it only if you started connecting it yourself.{{end}}</p>
     <form method="post" action="/signin/verify" class="form">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
       <input type="hidden" name="t" value="{{.Verify}}">
