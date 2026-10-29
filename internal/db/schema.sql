@@ -26,7 +26,9 @@ CREATE INDEX IF NOT EXISTS messages_token ON messages(token, received_at);
 CREATE INDEX IF NOT EXISTS messages_expires ON messages(expires_at);
 
 -- Accounts. Sign-in is by emailed link, so there are no passwords. plan is
--- "free" until billing lifts the limits.
+-- "pro" only for an account the operator granted Pro (SENDSCORE_PRO_EMAILS),
+-- and "free" otherwise; a paid plan lives in subscriptions, and the plan in
+-- effect is either one (see planExpr in billing.go).
 CREATE TABLE IF NOT EXISTS users (
 	id          TEXT PRIMARY KEY,
 	email       TEXT NOT NULL UNIQUE,
@@ -182,3 +184,36 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS alerts_once ON alerts(publication_id, kind, key);
 CREATE INDEX IF NOT EXISTS alerts_status ON alerts(status);
+
+-- The Creem subscription behind an account's paid plan, kept up to date by
+-- Creem's webhooks and by nothing else. status is empty until an event says
+-- one, then active, past_due, paused, or cancelled. period_end is Unix
+-- seconds (0 for none). event_at is the Creem time, in milliseconds, of the
+-- newest event whose status was applied, so a late delivery of an older one
+-- is recorded and ignored; NULL orders nothing.
+CREATE TABLE IF NOT EXISTS subscriptions (
+	user_id          TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+	customer_id      TEXT NOT NULL DEFAULT '',
+	subscription_id  TEXT NOT NULL DEFAULT '',
+	status           TEXT NOT NULL DEFAULT '',
+	product_id       TEXT NOT NULL DEFAULT '',
+	period_end       INTEGER NOT NULL DEFAULT 0,
+	event_at         INTEGER,
+	updated_at       INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS subscriptions_subscription ON subscriptions(subscription_id);
+CREATE INDEX IF NOT EXISTS subscriptions_customer ON subscriptions(customer_id);
+
+-- Every Creem webhook event, applied or not. The id is the primary key, so a
+-- retry of an event already recorded is never applied twice. user_id is NULL
+-- for an event that names no account here, which is the operator's queue.
+-- event_at is Creem's time in milliseconds, or NULL; body is the first 20000
+-- bytes of what Creem sent.
+CREATE TABLE IF NOT EXISTS creem_events (
+	id           TEXT PRIMARY KEY,
+	kind         TEXT NOT NULL,
+	user_id      TEXT,
+	received_at  INTEGER NOT NULL,
+	event_at     INTEGER,
+	body         TEXT NOT NULL
+);

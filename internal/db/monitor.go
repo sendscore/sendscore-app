@@ -14,8 +14,8 @@ const (
 	KindSignup = "signup"
 )
 
-// Plans. Every account is free until billing (or SENDSCORE_PRO_EMAILS)
-// makes it pro.
+// Plans. Every account is free until a subscription in good standing (or
+// SENDSCORE_PRO_EMAILS) makes it pro.
 const (
 	PlanFree = "free"
 	PlanPro  = "pro"
@@ -43,8 +43,11 @@ type Publication struct {
 	// turned on; a slot due before it is never reported missed.
 	WatchSince time.Time
 	CreatedAt  time.Time
-	// OwnerPlan is the owner's plan, filled by PublicationByToken.
-	OwnerPlan string
+	// OwnerPlan is the owner's plan in effect, and OwnerLapsed is set when
+	// the owner's Pro subscription ended; both are filled by
+	// PublicationByToken.
+	OwnerPlan   string
+	OwnerLapsed bool
 }
 
 // Scheduled reports whether the publication has an expected schedule.
@@ -147,9 +150,11 @@ func (s *Store) PublicationByID(ctx context.Context, id string) (Publication, er
 // to, with its owner's plan.
 func (s *Store) PublicationByToken(ctx context.Context, token string) (Publication, error) {
 	var plan string
-	p, err := scanPublication(s.DB.QueryRowContext(ctx, `SELECT `+prefixed("p.", publicationCols)+`, u.plan
-		FROM publications p JOIN users u ON u.id = p.user_id WHERE p.token = ?`, strings.ToLower(token)), &plan)
-	p.OwnerPlan = plan
+	var lapsed bool
+	p, err := scanPublication(s.DB.QueryRowContext(ctx, `SELECT `+prefixed("p.", publicationCols)+`, `+planExpr+`, `+lapsedExpr+`
+		FROM publications p JOIN users u ON u.id = p.user_id LEFT JOIN subscriptions s ON s.user_id = u.id
+		WHERE p.token = ?`, strings.ToLower(token)), &plan, &lapsed)
+	p.OwnerPlan, p.OwnerLapsed = plan, lapsed
 	return p, err
 }
 
@@ -167,9 +172,11 @@ func (s *Store) Publications(ctx context.Context, userID string) ([]Publication,
 }
 
 // ScheduledPublications lists every publication with a schedule and alerts
-// on, for the heartbeat.
+// on, for the heartbeat. A lapsed owner's publications are left out.
 func (s *Store) ScheduledPublications(ctx context.Context) ([]Publication, error) {
-	return s.queryPublications(ctx, `SELECT `+publicationCols+` FROM publications WHERE days != 0 AND at != '' AND paused = 0 ORDER BY rowid`)
+	return s.queryPublications(ctx, `SELECT `+prefixed("p.", publicationCols)+`
+		FROM publications p JOIN users u ON u.id = p.user_id LEFT JOIN subscriptions s ON s.user_id = u.id
+		WHERE p.days != 0 AND p.at != '' AND p.paused = 0 AND NOT `+lapsedExpr+` ORDER BY p.rowid`)
 }
 
 func (s *Store) queryPublications(ctx context.Context, q string, args ...any) ([]Publication, error) {
@@ -234,14 +241,15 @@ func (s *Store) IssuesBetween(ctx context.Context, pubID string, from, to time.T
 	return n, err
 }
 
-// SetPlan sets a user's plan.
+// SetPlan sets the plan the operator granted a user (users.plan). Billing
+// never calls it: a subscription lives in subscriptions.
 func (s *Store) SetPlan(ctx context.Context, userID, plan string) error {
 	_, err := s.DB.ExecContext(ctx, `UPDATE users SET plan = ? WHERE id = ?`, plan, userID)
 	return err
 }
 
-// PromoteEmails puts the accounts with these addresses on the pro plan and
-// returns how many changed. Addresses without an account are left for
+// PromoteEmails grants the accounts with these addresses Pro and returns how
+// many changed. No webhook can take that away. Addresses without an account are left for
 // their first sign-in.
 func (s *Store) PromoteEmails(ctx context.Context, emails []string) (int64, error) {
 	var total int64

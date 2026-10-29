@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sendscore/sendscore-app/internal/billing"
 	"github.com/sendscore/sendscore-app/internal/db"
 	"github.com/sendscore/sendscore-app/internal/mail"
 	"github.com/sendscore/sendscore/engine"
@@ -70,9 +71,11 @@ type Config struct {
 	// and a free account may monitor. ProPublications defaults to 5.
 	ProPublications  int
 	FreePublications int
-	// ProEmails are put on the pro plan when they sign in, until billing
-	// exists.
+	// ProEmails are granted Pro when they sign in, whatever billing says.
 	ProEmails []string
+	// Billing sells Pro through Creem. Nil turns billing off, as on a
+	// self-hosted instance: no plan section, no checkout, and no webhook.
+	Billing *billing.Client
 	// HistoryDays is how long a pro account's newsletter history is kept,
 	// for the pages to say.
 	HistoryDays int
@@ -108,6 +111,8 @@ type App struct {
 	waits  map[string]int
 	// uploads holds a slot per upload being read or checked.
 	uploads chan struct{}
+	// billingMu applies one Creem event at a time.
+	billingMu sync.Mutex
 }
 
 // StopWaits makes every open and future long poll answer at once, as if its
@@ -205,6 +210,13 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("POST /account/tokens", a.form(formLimit, a.createToken))
 	mux.HandleFunc("POST /account/tokens/{id}/revoke", a.form(formLimit, a.revokeToken))
 	mux.HandleFunc("POST /account/apps/{id}/disconnect", a.form(formLimit, a.disconnect))
+	if a.cfg.Billing != nil {
+		// Billing (see billing.go). The webhook is under /api/, so it gets no
+		// session or CSRF cookie: its signature is its authentication.
+		mux.HandleFunc("POST /account/billing/checkout", a.form(formLimit, a.checkout))
+		mux.HandleFunc("POST /account/billing/portal", a.form(formLimit, a.billingPortal))
+		mux.HandleFunc("POST /api/creem/webhook", a.creemWebhook)
+	}
 
 	// Monitored newsletters (see newsletters.go).
 	mux.HandleFunc("GET /newsletters", a.newsletters)
@@ -274,6 +286,7 @@ func (a *App) render(w http.ResponseWriter, r *http.Request, status int, page st
 	}
 	data["MailDomain"] = a.cfg.MailDomain
 	data["User"] = userFrom(r.Context())
+	data["ReportDays"] = int(a.cfg.ReportTTL / (24 * time.Hour))
 	data["CSRF"], _ = r.Context().Value(csrfKey).(string)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)

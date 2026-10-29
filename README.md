@@ -6,7 +6,7 @@ It is open source (AGPL-3.0) and self-hostable: run it on your own server with y
 
 ## Stack
 
-Go (one binary serving HTTP and SMTP), `html/template`, SQLite (modernc), hand-written CSS with no build, and a CSP with no inline script or style. Modelled on preflightsh-app. Billing for the hosted version will be Creem, ported from Scratchpad, as an optional module: a self-hosted instance runs without it.
+Go (one binary serving HTTP and SMTP), `html/template`, SQLite (modernc), hand-written CSS with no build, and a CSP with no inline script or style. Modelled on preflightsh-app. Billing for the hosted version is Creem, ported from Scratchpad, and optional: a self-hosted instance runs without it (see Billing below).
 
 ## Run locally
 
@@ -37,7 +37,7 @@ Without SES keys the link is written to the app's log instead of emailed. To sig
 
 `/account` shows today's usage and the API tokens. Create a named token there (it is shown once, so copy it then), see each one's prefix (such as `ss_live_abcd`), when it was created, and when it was last used, and revoke it. Sign-in links, sessions, and tokens are stored only as SHA-256 hashes. Every form carries a CSRF token and must come from the site itself by `Origin`, or `Referer` when there is no `Origin`; a post with neither is refused. Both are checked before the body is read. With secure cookies the cookies are named `__Host-ss_session`, `__Host-ss_csrf`, and `__Host-ss_browser`, so no other subdomain can set them, and every response carries `Strict-Transport-Security`.
 
-Test addresses are limited per UTC day. A free account gets 25 (through the API, MCP, or the site while signed in), and an anonymous visitor gets 5 per IP for "Get a test address" and uploads together. Over the limit, the API answers 429 and the site shows a page saying when it starts again. Every account is on the `free` plan (`users.plan`) until billing exists, except the addresses in `SENDSCORE_PRO_EMAILS`, which are moved to `pro` at startup and whenever they sign in. Pro is what allows newsletter monitoring (see below).
+Test addresses are limited per UTC day. A free account gets 25 (through the API, MCP, or the site while signed in), and an anonymous visitor gets 5 per IP for "Get a test address" and uploads together. Over the limit, the API answers 429 and the site shows a page saying when it starts again. An account is Pro when the operator granted it (the addresses in `SENDSCORE_PRO_EMAILS`, set to `pro` in `users.plan` at startup and whenever they sign in) or when its Creem subscription is in good standing, and free otherwise. No webhook can take Pro away from a granted account. Pro is what allows newsletter monitoring (see below).
 
 Settings (environment, or `.env.local`):
 
@@ -58,7 +58,12 @@ Settings (environment, or `.env.local`):
 | `SES_REGION` | `us-east-1` |
 | `SENDSCORE_MAIL_FROM` | `SendScore <hello@sendscore.ai>` |
 | `SENDSCORE_ALERT_FROM` | `SendScore alerts <alerts@sendscore.ai>`, the sender of alerts. The SES IAM user may only send as hello@ or alerts@sendscore.ai. |
-| `SENDSCORE_PRO_EMAILS` | unset. Comma separated addresses whose accounts are on the pro plan, until billing exists. |
+| `SENDSCORE_PRO_EMAILS` | unset. Comma separated addresses whose accounts are Pro whatever billing says. |
+| `CREEM_API_KEY` | unset: billing off, as on a self-hosted instance. A Creem key; one starting `creem_test_` talks to Creem's test API, any other to the live one. |
+| `CREEM_WEBHOOK_SECRET` | unset. The secret Creem signs webhooks with. |
+| `CREEM_PRODUCT_PRO_MONTHLY` | unset. The Creem product for Pro at $9 a month. Billing is on only with this, the key, and the webhook secret; setting some of the three and not all stops the app at startup. |
+| `CREEM_PRODUCT_PRO_YEARLY` | unset: yearly is not offered. The Creem product for Pro at $90 a year. |
+| `SENDSCORE_SECRET` | unset. Required when billing is on (at least 32 characters, such as the output of `openssl rand -hex 32`). It signs the account in each checkout, so a public Creem payment link cannot bind a stranger's subscription to an account. |
 | `SENDSCORE_PRO_PUBLICATIONS` | `5` newsletters a pro account may monitor |
 | `SENDSCORE_FREE_PUBLICATIONS` | `0` newsletters a free account may monitor (a self-hosted instance may raise it) |
 | `SENDSCORE_HISTORY_DAYS` | `365` days a pro account's newsletter issues are kept (a free account's are kept as long as a test report, 7 days) |
@@ -153,9 +158,17 @@ Upload reports say they came from an upload, and mark the sending IP and envelop
 
 On shutdown (SIGTERM), open waits answer `not_received` at once, and uploads and SMTP sessions get up to a minute to finish their checks and save; anything still open after that is dropped and retried by the sender. Give the process manager a stop timeout of more than a minute (systemd's default is 90 seconds).
 
+## Billing
+
+With the Creem settings above, the account page has a Plan section. A free account sees "Upgrade to Pro" with a monthly and a yearly button, which open a Creem checkout. Creem decides. Returning from the checkout grants nothing, and Pro turns on when Creem's webhook says the payment went through, usually within seconds. A Pro account sees when it is paid through and a "Manage billing" button for Creem's own page (card, invoices, and cancelling). A failed renewal shows that Creem is retrying, and Pro stays on meanwhile. A granted account says so and has no billing buttons. Without the settings, none of this shows and nothing changes.
+
+Creem posts events to `POST /api/creem/webhook`, which takes no session or CSRF token and is authenticated by the `creem-signature` header alone (the hex HMAC-SHA256 of the raw body). Point the Creem webhook there. Every event is stored in `creem_events` (its id is the primary key, so a retry is never applied twice), and the subscription in `subscriptions`. These rules come from Scratchpad. A bad signature is 401, a body over 1 MB is 413, an event with no id is 500, anything understood or deliberately ignored is 200, and a failure while applying gives the event back and answers 500 so Creem retries. An event older than the newest one applied is recorded and ignored. The account comes from the signed claim the checkout put in the metadata, then the bound subscription id, then the bound customer id, and never from an email address. Past due only keeps a plan that was already paid, a product this install does not sell grants nothing, only the bound subscription can end a plan, a healthy plan is never rebound to another customer, and a running period end is never wiped.
+
+When Pro lapses (paused, expired, or cancelled), nothing is deleted. Newsletters stay listed and their addresses keep receiving mail, but no alert is sent and the heartbeat skips them, new issues are kept for 7 days as on the free plan, and adding a newsletter is refused with a link to the plan. Paying again turns it all back on.
+
 ## Not built yet
 
-A Docker image, Creem billing (hosted only), and deploy scripts. Nothing is deployed. Self-hosting is documented on the website.
+A Docker image and deploy scripts. Nothing is deployed. Self-hosting is documented on the website.
 
 ## Develop
 

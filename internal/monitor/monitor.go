@@ -50,9 +50,10 @@ type Monitor struct {
 // Received is called once a publication's message is saved, with the
 // issue before it (nil for the first). It sends at most one alert for the
 // message: when it is a second issue in the same slot, or when it is worse
-// than the previous issue. A paused publication gets none.
+// than the previous issue. A paused publication gets none, and neither does
+// one whose owner's Pro plan has lapsed.
 func (m *Monitor) Received(ctx context.Context, p db.Publication, msg, prev *db.Message) {
-	if p.Paused || msg.Kind != db.KindIssue {
+	if p.Paused || p.OwnerLapsed || msg.Kind != db.KindIssue {
 		return
 	}
 	var worse []string

@@ -91,6 +91,9 @@ func (a *App) planMessage(u *db.User, count int) string {
 	switch {
 	case count < limit:
 		return ""
+	case u.Lapsed:
+		return fmt.Sprintf("This account's Pro plan has ended, so it cannot add newsletters. The ones it has stay listed and keep receiving mail, "+
+			"but SendScore no longer alerts on them or checks their schedule, and new issues are kept for %d days.", int(a.cfg.ReportTTL/(24*time.Hour)))
 	case limit == 0:
 		return "Monitoring newsletters is part of the Pro plan. This account is on the free plan, so it cannot add a newsletter yet. Test addresses and uploads work as before."
 	case limit == 1:
@@ -127,7 +130,7 @@ func (a *App) newsletters(w http.ResponseWriter, r *http.Request) {
 		rows = append(rows, row)
 	}
 	a.render(w, r, http.StatusOK, "newsletters", map[string]any{"Title": "Newsletters", "Rows": rows,
-		"PlanMessage": a.planMessage(u, len(pubs)), "Limit": a.publicationLimit(u)})
+		"PlanMessage": a.planMessage(u, len(pubs)), "Limit": a.publicationLimit(u), "PlanLink": a.planLink(u)})
 }
 
 // formData is what the add and edit form shows.
@@ -159,7 +162,7 @@ func (a *App) newNewsletter(w http.ResponseWriter, r *http.Request) {
 		a.log.Error("publications", "err", err)
 	}
 	if msg := a.planMessage(u, len(pubs)); msg != "" {
-		a.render(w, r, http.StatusForbidden, "error", map[string]any{"Title": "Monitoring needs Pro", "Message": msg})
+		a.render(w, r, http.StatusForbidden, "error", map[string]any{"Title": "Monitoring needs Pro", "Message": msg, "PlanLink": a.planLink(u)})
 		return
 	}
 	p := db.Publication{TimeZone: "UTC", GraceMinutes: DefaultGraceMinutes, AlertEmail: u.Email}
@@ -237,7 +240,7 @@ func (a *App) createNewsletter(w http.ResponseWriter, r *http.Request) {
 	err := a.store.CreatePublication(r.Context(), &p, a.publicationLimit(u))
 	if errors.Is(err, db.ErrLimit) {
 		pubs, _ := a.store.Publications(r.Context(), u.ID)
-		a.render(w, r, http.StatusForbidden, "error", map[string]any{"Title": "Monitoring needs Pro", "Message": a.planMessage(u, len(pubs))})
+		a.render(w, r, http.StatusForbidden, "error", map[string]any{"Title": "Monitoring needs Pro", "Message": a.planMessage(u, len(pubs)), "PlanLink": a.planLink(u)})
 		return
 	}
 	if err != nil {

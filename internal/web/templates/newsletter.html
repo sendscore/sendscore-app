@@ -13,7 +13,8 @@
   <p class="label">Schedule</p>
   <div>
     <p>{{.Schedule}}</p>
-    {{if .P.Paused}}<p class="notice">Alerts are paused. Issues are still received, checked, and kept, but no alert email is sent.</p>
+    {{if .User.Lapsed}}<p class="notice">Pro has ended for this account, so SendScore sends no alert and does not check the schedule. Issues are still received and checked, and kept for {{.ReportDays}} days.</p>
+    {{else if .P.Paused}}<p class="notice">Alerts are paused. Issues are still received, checked, and kept, but no alert email is sent.</p>
     {{else}}<p>Alerts go to <strong>{{.P.AlertEmail}}</strong>.{{with .Next}} The next issue is expected {{local . $.P.TimeZone}}.{{end}}</p>{{end}}
     {{with .LastAlert}}<p class="muted">The last alert was sent {{local .SentAt $.P.TimeZone}}. Its subject was {{.Subject}}.</p>{{else}}<p class="muted">No alert has been sent yet.</p>{{end}}
   </div>

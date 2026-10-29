@@ -20,6 +20,7 @@ import (
 
 	"github.com/emersion/go-smtp"
 
+	"github.com/sendscore/sendscore-app/internal/billing"
 	"github.com/sendscore/sendscore-app/internal/db"
 	"github.com/sendscore/sendscore-app/internal/mail"
 	"github.com/sendscore/sendscore-app/internal/monitor"
@@ -76,7 +77,7 @@ func main() {
 		log.Warn("SES is not configured, so sign-in links and alerts are logged here instead of emailed")
 	}
 
-	// Until billing exists, these accounts are pro, now and at sign-in.
+	// These accounts are Pro, now and at sign-in, whatever billing says.
 	proEmails := emailList(os.Getenv("SENDSCORE_PRO_EMAILS"))
 	if n, err := store.PromoteEmails(context.Background(), proEmails); err != nil {
 		log.Error("pro accounts", "err", err)
@@ -116,6 +117,7 @@ func main() {
 		ProPublications:      getpos(log, "SENDSCORE_PRO_PUBLICATIONS", web.DefaultProPublications),
 		FreePublications:     getint(log, "SENDSCORE_FREE_PUBLICATIONS", 0),
 		ProEmails:            proEmails,
+		Billing:              creem(log),
 		HistoryDays:          historyDays,
 		BaseURL:              baseURL,
 		MailDomain:           mailDomain,
@@ -201,6 +203,34 @@ func main() {
 	go func() { defer wg.Done(); _ = rcv.Shutdown(shutdown) }()
 	wg.Wait()
 	_ = rcv.Close()
+}
+
+// creem reads the Creem settings and returns the billing client, or nil
+// when billing is off (a self-hosted instance sells nothing). It exits on a
+// half-configured billing, and on one without SENDSCORE_SECRET, which signs
+// the account in every checkout.
+func creem(log *slog.Logger) *billing.Client {
+	cfg := billing.Config{
+		APIKey:         strings.TrimSpace(os.Getenv("CREEM_API_KEY")),
+		WebhookSecret:  strings.TrimSpace(os.Getenv("CREEM_WEBHOOK_SECRET")),
+		ProductMonthly: strings.TrimSpace(os.Getenv("CREEM_PRODUCT_PRO_MONTHLY")),
+		ProductYearly:  strings.TrimSpace(os.Getenv("CREEM_PRODUCT_PRO_YEARLY")),
+		Secret:         os.Getenv("SENDSCORE_SECRET"),
+	}
+	if !cfg.Configured() {
+		if missing := cfg.Missing(); len(missing) < 3 {
+			log.Error("billing is half configured; set the rest or none of them", "missing", strings.Join(missing, ", "))
+			os.Exit(1)
+		}
+		return nil
+	}
+	if len(cfg.Secret) < billing.MinSecretLen {
+		log.Error(fmt.Sprintf("SENDSCORE_SECRET must be at least %d characters when billing is on; it signs the account in each checkout", billing.MinSecretLen))
+		os.Exit(1)
+	}
+	c := billing.New(cfg)
+	log.Info("billing via Creem", "mode", c.Mode(), "yearly", c.YearlyOffered())
+	return c
 }
 
 // sweep deletes expired reports every hour.

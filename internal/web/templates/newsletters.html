@@ -4,7 +4,7 @@
   <div>
     <h1>Monitored newsletters</h1>
     <p>Each newsletter gets a permanent monitoring address. Subscribe it to the newsletter like any reader, and SendScore checks every issue that arrives, compares it with the issue before, and emails you when something gets worse, when an expected issue does not arrive, or when one goes out twice.</p>
-    {{if .PlanMessage}}<p class="notice">{{.PlanMessage}}</p>{{else}}<p><a class="button" href="/newsletters/new">Add a newsletter</a></p>{{end}}
+    {{if .PlanMessage}}<p class="notice">{{.PlanMessage}}</p>{{with .PlanLink}}<p><a class="button" href="{{.}}">Upgrade to Pro</a></p>{{end}}{{else}}<p><a class="button" href="/newsletters/new">Add a newsletter</a></p>{{end}}
   </div>
 </section>
 {{if .Rows}}
@@ -19,7 +19,7 @@
           <td><a href="/newsletters/{{.P.ID}}">{{.P.Name}}</a><br><span class="muted small">{{.Schedule}}</span></td>
           <td>{{with .Latest}}<a href="/r/{{.ID}}">{{if .Verdict.Message.Subject}}{{.Verdict.Message.Subject}}{{else}}(no subject){{end}}</a><br><span class="muted small">{{local .ReceivedAt $zone}}</span>{{else}}<span class="muted">No issue yet</span>{{end}}</td>
           <td>{{with .Latest}}<span class="s-{{status .Verdict.Verdict}}"><span class="mark">{{status .Verdict.Verdict}}</span></span>{{if worsened .Verdict}} <span class="tag s-warn">worse</span>{{end}}{{else}}<span class="muted">None</span>{{end}}</td>
-          <td>{{if .P.Paused}}<span class="muted">Paused</span>{{else}}On{{end}}</td>
+          <td>{{if $.User.Lapsed}}<span class="muted">Off</span>{{else if .P.Paused}}<span class="muted">Paused</span>{{else}}On{{end}}</td>
         </tr>
       {{end}}
       </tbody>

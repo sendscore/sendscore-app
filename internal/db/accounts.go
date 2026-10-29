@@ -30,9 +30,17 @@ const selectorLen = 12
 
 // User is an account.
 type User struct {
-	ID        string
-	Email     string
-	Plan      string
+	ID    string
+	Email string
+	// Plan is the plan in effect: PlanPro when the operator granted it or a
+	// subscription is in good standing, otherwise PlanFree.
+	Plan string
+	// Comped is set when the operator granted Pro (SENDSCORE_PRO_EMAILS),
+	// whatever billing says.
+	Comped bool
+	// Lapsed is set when the account is not Pro and its subscription
+	// ended, so its newsletters get no alerts or heartbeat.
+	Lapsed    bool
 	CreatedAt time.Time
 	// Next is set only by ConsumeLoginToken: the path the sign-in link
 	// asked to open afterwards, or empty.
@@ -144,7 +152,7 @@ func (s *Store) ConsumeLoginToken(ctx context.Context, token string) (User, stri
 		"usr_"+NewToken(10), email, now.Unix()); err != nil {
 		return User{}, "", err
 	}
-	u, err := scanUser(tx.QueryRowContext(ctx, `SELECT id, email, plan, created_at FROM users WHERE email = ?`, email))
+	u, err := scanUser(tx.QueryRowContext(ctx, `SELECT `+userCols+` FROM `+userTable+` WHERE u.email = ?`, email))
 	if err != nil {
 		return User{}, "", err
 	}
@@ -190,7 +198,7 @@ func (s *Store) KnownBrowser(ctx context.Context, token, email string) (bool, er
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
 	var created int64
-	err := row.Scan(&u.ID, &u.Email, &u.Plan, &created)
+	err := row.Scan(&u.ID, &u.Email, &u.Plan, &u.Comped, &u.Lapsed, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return u, ErrNotFound
 	}
@@ -208,7 +216,7 @@ func (s *Store) UserBySession(ctx context.Context, token string) (User, error) {
 	if err != nil {
 		return User{}, err
 	}
-	return scanUser(s.DB.QueryRowContext(ctx, `SELECT id, email, plan, created_at FROM users WHERE id = ?`, uid))
+	return scanUser(s.DB.QueryRowContext(ctx, `SELECT `+userCols+` FROM `+userTable+` WHERE u.id = ?`, uid))
 }
 
 // DeleteSession ends a session (sign out).
@@ -292,7 +300,7 @@ func (s *Store) UserByAPIToken(ctx context.Context, token string) (User, error) 
 	if _, err := tx.ExecContext(ctx, `UPDATE api_tokens SET last_used_at = ? WHERE id = ?`, s.Now().Unix(), id); err != nil {
 		return User{}, err
 	}
-	u, err := scanUser(tx.QueryRowContext(ctx, `SELECT u.id, u.email, u.plan, u.created_at FROM users u JOIN api_tokens t ON t.user_id = u.id WHERE t.id = ?`, id))
+	u, err := scanUser(tx.QueryRowContext(ctx, `SELECT `+userCols+` FROM `+userTable+` JOIN api_tokens t ON t.user_id = u.id WHERE t.id = ?`, id))
 	if err != nil {
 		return User{}, err
 	}

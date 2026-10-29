@@ -427,17 +427,17 @@ func (a *App) verify(w http.ResponseWriter, r *http.Request) {
 	localRedirect(w, next)
 }
 
-// promote puts an address listed in ProEmails on the pro plan as it signs
-// in, until billing exists.
+// promote grants Pro to an address listed in ProEmails as it signs in,
+// whatever billing says.
 func (a *App) promote(ctx context.Context, u *db.User) {
-	if u.Plan == db.PlanPro || !slices.Contains(a.cfg.ProEmails, u.Email) {
+	if u.Comped || !slices.Contains(a.cfg.ProEmails, u.Email) {
 		return
 	}
 	if err := a.store.SetPlan(ctx, u.ID, db.PlanPro); err != nil {
 		a.log.Error("set plan", "err", err)
 		return
 	}
-	u.Plan = db.PlanPro
+	u.Plan, u.Comped, u.Lapsed = db.PlanPro, true, false
 }
 
 // rememberBrowser records that this browser signed in to email, for the
@@ -494,9 +494,13 @@ func (a *App) renderAccount(w http.ResponseWriter, r *http.Request, status int, 
 		a.log.Error("connected apps", "err", err)
 	}
 	data := map[string]any{"Title": "Account", "Tokens": tokens, "Apps": apps, "Used": used, "Limit": a.dailyLimit(u), "BaseURL": a.cfg.BaseURL}
+	if p := a.planFor(ctx, r, u); p != nil {
+		data["Plan"] = p
+	}
 	for k, v := range extra {
 		data[k] = v
 	}
+	a.accountCSP(w)
 	a.render(w, r, status, "account", data)
 }
 
