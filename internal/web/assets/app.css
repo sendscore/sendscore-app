@@ -74,3 +74,5 @@ input[type=email] { background: transparent; color: var(--fg); border: 1px solid
 @media (max-width: 640px) {
   .tokens th:nth-child(3), .tokens td:nth-child(3) { display: none; }
 }
+.consent { display: flex; gap: 12px; margin-top: 20px; }
+button.secondary { background: transparent; color: var(--fg); border: 1px solid var(--line); }

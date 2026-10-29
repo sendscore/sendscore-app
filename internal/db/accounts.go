@@ -34,6 +34,9 @@ type User struct {
 	Email     string
 	Plan      string
 	CreatedAt time.Time
+	// Next is set only by ConsumeLoginToken: the path the sign-in link
+	// asked to open afterwards, or empty.
+	Next string
 }
 
 // APIToken is an API token as listed on the account page. The token itself
@@ -100,10 +103,16 @@ func match(ctx context.Context, q querier, query, token string, args ...any) (st
 // CreateLoginToken stores a single-use sign-in link for email and returns
 // the token that goes in the link.
 func (s *Store) CreateLoginToken(ctx context.Context, email string) (string, error) {
+	return s.CreateLoginTokenNext(ctx, email, "")
+}
+
+// CreateLoginTokenNext is CreateLoginToken with a local path to open after
+// signing in, which ConsumeLoginToken returns as User.Next.
+func (s *Store) CreateLoginTokenNext(ctx context.Context, email, next string) (string, error) {
 	token := NewToken(32)
 	now := s.Now()
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO login_tokens (selector, token_hash, email, created_at, expires_at) VALUES (?, ?, ?, ?, ?)`,
-		selector(token), HashToken(token), NormalizeEmail(email), now.Unix(), now.Add(LoginTokenTTL).Unix())
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO login_tokens (selector, token_hash, email, next, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		selector(token), HashToken(token), NormalizeEmail(email), next, now.Unix(), now.Add(LoginTokenTTL).Unix())
 	return token, err
 }
 
@@ -122,9 +131,9 @@ func (s *Store) ConsumeLoginToken(ctx context.Context, token string) (User, stri
 	if err != nil {
 		return User{}, "", err
 	}
-	var email string
+	var email, next string
 	// Claimed inside the transaction, so the same link cannot sign in twice.
-	err = tx.QueryRowContext(ctx, `UPDATE login_tokens SET used_at = ? WHERE token_hash = ? AND used_at = 0 RETURNING email`, now.Unix(), hash).Scan(&email)
+	err = tx.QueryRowContext(ctx, `UPDATE login_tokens SET used_at = ? WHERE token_hash = ? AND used_at = 0 RETURNING email, next`, now.Unix(), hash).Scan(&email, &next)
 	if errors.Is(err, sql.ErrNoRows) {
 		return User{}, "", ErrNotFound
 	}
@@ -139,6 +148,7 @@ func (s *Store) ConsumeLoginToken(ctx context.Context, token string) (User, stri
 	if err != nil {
 		return User{}, "", err
 	}
+	u.Next = next
 	session := NewToken(32)
 	if _, err := tx.ExecContext(ctx, `INSERT INTO sessions (selector, token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)`,
 		selector(session), HashToken(session), u.ID, now.Unix(), now.Add(SessionTTL).Unix()); err != nil {

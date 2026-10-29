@@ -59,6 +59,20 @@ Settings (environment, or `.env.local`):
 | `SENDSCORE_ANON_DAILY_TESTS` | `5` test addresses and uploads per UTC day for an anonymous IP |
 | `SENDSCORE_TRUST_PROXY` | unset. `1` behind a reverse proxy: the client IP for limits is the last `X-Forwarded-For` entry, the one the proxy added. Leave it unset when the app is reachable directly, or anyone could choose their IP. |
 
+## Connector (OAuth)
+
+To connect Claude or another MCP client, add `https://app.sendscore.ai/api/mcp` as a custom connector (locally, `http://127.0.0.1:3014/api/mcp`). You will be asked to sign in and allow access. Nothing needs pasting, because the client finds the sign-in on its own, as the MCP authorization spec describes (OAuth 2.1 with PKCE).
+
+1. An unauthenticated call to `/api/mcp` gets a 401 with `WWW-Authenticate: Bearer resource_metadata="<base>/.well-known/oauth-protected-resource/api/mcp"` (and `error="invalid_token"` when a token was sent but is no good).
+2. `/.well-known/oauth-protected-resource` (and its `/api/mcp` variant) is RFC 9728 metadata naming the app as the authorization server, and `/.well-known/oauth-authorization-server` is RFC 8414 metadata. There is also `/.well-known/mcp/server-card.json`.
+3. The client registers itself at `POST /oauth/register` (RFC 7591). Clients are public, so a request for a secret is registered without one, and the reply says `token_endpoint_auth_method` is `none`. A redirect URI must be https, http on 127.0.0.1 or localhost, or a native app's own scheme (such as `cursor://` or `vscode://`, which those editors use), with no fragment or wildcard; unusable ones are dropped, and a list with none left is refused. Each IP may register 20 clients an hour, and the oldest registrations that never connected are deleted past 2,000. A name that claims to be SendScore is not kept.
+4. `GET /oauth/authorize` sends a signed-out visitor through email sign-in and back, then shows a consent page naming the client and where it sends you, with Allow and Deny. It checks the client, an exact `redirect_uri`, PKCE with `S256`, and `resource` (RFC 8707), which must be `<base>/api/mcp` when given, and passes `state` through. Allow returns a single-use code that expires in 10 minutes, bound to the client, the redirect URI, the user, and the PKCE challenge, along with `iss` (RFC 9207).
+5. `POST /oauth/token` swaps the code and its `code_verifier` for an access token (an hour) and a refresh token (30 days). A refresh token is used once. Each refresh returns a new pair, and presenting an old one again revokes every token of that connection. A code used twice does the same.
+
+OAuth tokens (`ss_oat_...`) work only on `/api/mcp`, where an API token works too. They act for the user who allowed them, so ownership and the daily allowance apply as for API tokens. `/account` lists connected apps with a Disconnect button that revokes their tokens. All codes and tokens are stored only as SHA-256 hashes.
+
+To try it locally, run `npx @modelcontextprotocol/inspector`, choose Streamable HTTP with `http://127.0.0.1:3014/api/mcp`, and use its OAuth flow; the sign-in link is in the app's log when SES is off.
+
 ## API
 
 Every `/api/v1/` route and `/api/mcp` take an API token from the account page in the `Authorization` header:
@@ -83,7 +97,7 @@ On shutdown (SIGTERM), open waits answer `not_received` at once, and uploads and
 
 ## Not built yet
 
-OAuth for the MCP connector (claude.ai remote connectors expect it; today it takes a pasted token), monitored publications, the heartbeat, alerts (SES), a Docker image and self-hosting docs, Creem billing (hosted only), and deploy scripts. Nothing is deployed.
+Monitored publications, the heartbeat, alerts (SES), a Docker image and self-hosting docs, Creem billing (hosted only), and deploy scripts. Nothing is deployed.
 
 ## Develop
 

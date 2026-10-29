@@ -67,6 +67,8 @@ func migrate(d *sql.DB) error {
 	alters := []string{
 		// The account an address was made for; NULL for anonymous addresses.
 		`ALTER TABLE addresses ADD COLUMN user_id TEXT REFERENCES users(id) ON DELETE SET NULL`,
+		// Where to go after signing in, such as back to an OAuth consent page.
+		`ALTER TABLE login_tokens ADD COLUMN next TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, a := range alters {
 		if _, err := d.Exec(a); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -267,7 +269,7 @@ func (s *Store) Sweep(ctx context.Context) (int64, error) {
 	if err != nil {
 		return n, err
 	}
-	for _, table := range []string{"login_tokens", "sessions", "counters"} {
+	for _, table := range []string{"login_tokens", "sessions", "counters", "oauth_codes", "oauth_tokens"} {
 		if _, err := s.DB.ExecContext(ctx, `DELETE FROM `+table+` WHERE expires_at <= ?`, now.Unix()); err != nil {
 			return n, err
 		}

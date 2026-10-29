@@ -20,6 +20,7 @@
     {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
     <form method="post" action="/signin" class="form">
       <input type="hidden" name="csrf" value="{{.CSRF}}">
+      {{if .Next}}<input type="hidden" name="next" value="{{.Next}}">{{end}}
       <label>Email<input type="email" name="email" value="{{.Email}}" autocomplete="email" required></label>
       <button type="submit">Email me a sign-in link</button>
     </form>

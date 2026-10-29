@@ -81,3 +81,49 @@ CREATE TABLE IF NOT EXISTS counters (
 	PRIMARY KEY (name, bucket)
 );
 CREATE INDEX IF NOT EXISTS counters_expires ON counters(expires_at);
+
+-- OAuth for the MCP connector. Clients register themselves (RFC 7591) and
+-- are public: no secret, with PKCE doing the work. redirect_uris is a JSON
+-- array.
+CREATE TABLE IF NOT EXISTS oauth_clients (
+	id             TEXT PRIMARY KEY,
+	name           TEXT NOT NULL,
+	redirect_uris  TEXT NOT NULL,
+	created_at     INTEGER NOT NULL
+);
+
+-- Single-use authorization codes, bound to the client, the redirect URI,
+-- the user, and the PKCE challenge. family is the grant the code starts, so
+-- a code used twice revokes every token it led to.
+CREATE TABLE IF NOT EXISTS oauth_codes (
+	selector        TEXT NOT NULL,
+	token_hash      TEXT PRIMARY KEY,
+	client_id       TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
+	user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	redirect_uri    TEXT NOT NULL,
+	code_challenge  TEXT NOT NULL,
+	family          TEXT NOT NULL,
+	created_at      INTEGER NOT NULL,
+	expires_at      INTEGER NOT NULL,
+	used_at         INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS oauth_codes_selector ON oauth_codes(selector);
+
+-- Access and refresh tokens. A refresh token is used once: using it marks it
+-- used and issues a new pair in the same family, and presenting a used one
+-- again revokes the whole family.
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+	selector     TEXT NOT NULL,
+	token_hash   TEXT PRIMARY KEY,
+	kind         TEXT NOT NULL,            -- access or refresh
+	client_id    TEXT NOT NULL REFERENCES oauth_clients(id) ON DELETE CASCADE,
+	user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	family       TEXT NOT NULL,
+	created_at   INTEGER NOT NULL,
+	expires_at   INTEGER NOT NULL,
+	used_at      INTEGER NOT NULL DEFAULT 0,
+	revoked_at   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS oauth_tokens_selector ON oauth_tokens(selector);
+CREATE INDEX IF NOT EXISTS oauth_tokens_user ON oauth_tokens(user_id, client_id);
+CREATE INDEX IF NOT EXISTS oauth_tokens_family ON oauth_tokens(family);

@@ -17,6 +17,27 @@
 </section>
 {{end}}
 <section class="sheet">
+  <p class="label">Connected apps</p>
+  <div>
+    {{if .Apps}}
+    <table class="tokens">
+      <thead><tr><th>App</th><th>Connected</th><th></th></tr></thead>
+      <tbody>
+      {{range .Apps}}
+        <tr>
+          <td>{{if .Name}}{{.Name}}{{else}}An unnamed app{{end}}</td>
+          <td>{{day .Since}}</td>
+          <td><form method="post" action="/account/apps/{{.ClientID}}/disconnect" class="inline"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="link">Disconnect</button></form></td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+    {{else}}
+    <p class="muted">No apps are connected. To connect Claude or another MCP client, add <code>{{.BaseURL}}/api/mcp</code> as a custom connector, then sign in and allow access when it asks.</p>
+    {{end}}
+  </div>
+</section>
+<section class="sheet">
   <p class="label">API tokens</p>
   <div>
     <p>Tokens let an agent, the MCP connector at <code>{{.BaseURL}}/api/mcp</code>, or the API create test addresses and read their reports. Addresses and reports made with a token belong to this account.</p>

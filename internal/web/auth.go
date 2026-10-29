@@ -46,10 +46,12 @@ func withUser(ctx context.Context, u *db.User) context.Context {
 }
 
 // session loads the signed-in user from the session cookie and makes sure
-// the browser has a CSRF cookie, for every page outside /api/ and /assets/.
+// the browser has a CSRF cookie, for every page (not the API, the assets,
+// or the OAuth endpoints a client calls directly).
 func (a *App) session(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/assets/") {
+		if p := r.URL.Path; strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/assets/") || strings.HasPrefix(p, "/.well-known/") ||
+			p == "/oauth/token" || p == "/oauth/register" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -194,12 +196,30 @@ func limitError(limit int) string {
 
 // Sign-in by emailed link
 
+// safeNext keeps only a path on this site, so the page to open after
+// signing in cannot send anyone elsewhere.
+func safeNext(p string) string {
+	if len(p) > 2048 || !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") || strings.HasPrefix(p, "/\\") {
+		return ""
+	}
+	for _, r := range p {
+		if r < 0x21 || r == 0x7f {
+			return ""
+		}
+	}
+	return p
+}
+
 func (a *App) signinForm(w http.ResponseWriter, r *http.Request) {
+	next := safeNext(r.URL.Query().Get("next"))
 	if userFrom(r.Context()) != nil {
-		http.Redirect(w, r, "/account", http.StatusSeeOther)
+		if next == "" {
+			next = "/account"
+		}
+		http.Redirect(w, r, next, http.StatusSeeOther)
 		return
 	}
-	a.render(w, r, http.StatusOK, "signin", map[string]any{"Title": "Sign in"})
+	a.render(w, r, http.StatusOK, "signin", map[string]any{"Title": "Sign in", "Next": next})
 }
 
 func validEmail(s string) bool {
@@ -215,8 +235,9 @@ func validEmail(s string) bool {
 func (a *App) signin(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	email := db.NormalizeEmail(r.PostFormValue("email"))
+	next := safeNext(r.PostFormValue("next"))
 	if !validEmail(email) {
-		a.render(w, r, http.StatusBadRequest, "signin", map[string]any{"Title": "Sign in", "Email": email, "Error": "Enter a full email address, such as you@example.com."})
+		a.render(w, r, http.StatusBadRequest, "signin", map[string]any{"Title": "Sign in", "Email": email, "Next": next, "Error": "Enter a full email address, such as you@example.com."})
 		return
 	}
 	hour := db.Hour(a.store.Now())
@@ -230,7 +251,7 @@ func (a *App) signin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	token, err := a.store.CreateLoginToken(ctx, email)
+	token, err := a.store.CreateLoginTokenNext(ctx, email, next)
 	if err != nil {
 		a.log.Error("create login token", "err", err)
 		a.fail(w, r, http.StatusInternalServerError, "Could not start signing in. Try again in a minute.")
@@ -260,7 +281,7 @@ func (a *App) verifyForm(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) verify(w http.ResponseWriter, r *http.Request) {
-	_, session, err := a.store.ConsumeLoginToken(r.Context(), r.PostFormValue("t"))
+	u, session, err := a.store.ConsumeLoginToken(r.Context(), r.PostFormValue("t"))
 	if errors.Is(err, db.ErrNotFound) {
 		a.render(w, r, http.StatusBadRequest, "signin", map[string]any{"Title": "Sign in",
 			"Error": "That sign-in link has expired or was already used. Enter your email to get a new one."})
@@ -272,7 +293,11 @@ func (a *App) verify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.setCookie(w, sessionCookie, session, db.SessionTTL)
-	http.Redirect(w, r, "/account", http.StatusSeeOther)
+	next := safeNext(u.Next)
+	if next == "" {
+		next = "/account"
+	}
+	http.Redirect(w, r, next, http.StatusSeeOther)
 }
 
 func (a *App) signout(w http.ResponseWriter, r *http.Request) {
@@ -308,7 +333,11 @@ func (a *App) renderAccount(w http.ResponseWriter, r *http.Request, status int, 
 	if err != nil {
 		a.log.Error("usage", "err", err)
 	}
-	data := map[string]any{"Title": "Account", "Tokens": tokens, "Used": used, "Limit": a.dailyLimit(u), "BaseURL": a.cfg.BaseURL}
+	apps, err := a.store.ConnectedApps(ctx, u.ID)
+	if err != nil {
+		a.log.Error("connected apps", "err", err)
+	}
+	data := map[string]any{"Title": "Account", "Tokens": tokens, "Apps": apps, "Used": used, "Limit": a.dailyLimit(u), "BaseURL": a.cfg.BaseURL}
 	for k, v := range extra {
 		data[k] = v
 	}
@@ -365,14 +394,20 @@ func (a *App) revokeToken(w http.ResponseWriter, r *http.Request) {
 
 const unauthorized = `missing or invalid API token. Send "Authorization: Bearer <token>" with a token from `
 
-// bearer returns the owner of the request's API token. ok is false for a
+// bearer returns the owner of the request's API token, or of an OAuth
+// access token when oauth is set (the MCP connector). ok is false for a
 // missing or unknown token.
-func (a *App) bearer(r *http.Request) (u db.User, ok bool, err error) {
+func (a *App) bearer(r *http.Request, oauth bool) (u db.User, ok bool, err error) {
 	scheme, token, found := strings.Cut(r.Header.Get("Authorization"), " ")
 	if !found || !strings.EqualFold(scheme, "Bearer") {
 		return u, false, nil
 	}
-	u, err = a.store.UserByAPIToken(r.Context(), strings.TrimSpace(token))
+	token = strings.TrimSpace(token)
+	if oauth && strings.HasPrefix(token, db.OAuthAccessPrefix) {
+		u, err = a.store.UserByOAuthToken(r.Context(), token)
+	} else {
+		u, err = a.store.UserByAPIToken(r.Context(), token)
+	}
 	if errors.Is(err, db.ErrNotFound) {
 		return u, false, nil
 	}
@@ -382,7 +417,7 @@ func (a *App) bearer(r *http.Request) (u db.User, ok bool, err error) {
 // api requires an API token on a JSON route.
 func (a *App) api(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		u, ok, err := a.bearer(r)
+		u, ok, err := a.bearer(r, false)
 		if err != nil {
 			a.log.Error("api token lookup", "err", err)
 			apiError(w, http.StatusInternalServerError, "token lookup failed")
@@ -397,18 +432,23 @@ func (a *App) api(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// mcpAuth requires an API token on the MCP connector, answering a plain 401
-// as MCP clients expect.
+// mcpAuth requires an API token or an OAuth access token on the MCP
+// connector. The 401 names the protected resource metadata (RFC 9728), which
+// is how a client finds where to sign in.
 func (a *App) mcpAuth(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		u, ok, err := a.bearer(r)
+		u, ok, err := a.bearer(r, true)
 		if err != nil {
 			a.log.Error("mcp token lookup", "err", err)
 			http.Error(w, "token lookup failed", http.StatusInternalServerError)
 			return
 		}
 		if !ok {
-			w.Header().Set("WWW-Authenticate", `Bearer realm="sendscore"`)
+			challenge := `Bearer resource_metadata="` + a.resourceMetadataURL() + `"`
+			if r.Header.Get("Authorization") != "" {
+				challenge += `, error="invalid_token", error_description="The access token is missing, expired, or revoked."`
+			}
+			w.Header().Set("WWW-Authenticate", challenge)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}

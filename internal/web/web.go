@@ -109,7 +109,7 @@ func New(cfg Config, store *db.Store, log *slog.Logger) (*App, error) {
 			return string(b)
 		},
 	}
-	for _, page := range []string{"home", "address", "report", "upload", "error", "signin", "account"} {
+	for _, page := range []string{"home", "address", "report", "upload", "error", "signin", "account", "consent"} {
 		t, err := template.New("layout.html").Funcs(funcs).ParseFS(templateFS, "templates/layout.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, err
@@ -148,24 +148,49 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("GET /account", a.account)
 	mux.HandleFunc("POST /account/tokens", a.form(formLimit, a.createToken))
 	mux.HandleFunc("POST /account/tokens/{id}/revoke", a.form(formLimit, a.revokeToken))
+	mux.HandleFunc("POST /account/apps/{id}/disconnect", a.form(formLimit, a.disconnect))
+
+	// OAuth for the MCP connector (see oauth.go).
+	mux.Handle("/.well-known/oauth-protected-resource", cors(http.HandlerFunc(a.protectedResource)))
+	mux.Handle("/.well-known/oauth-protected-resource/api/mcp", cors(http.HandlerFunc(a.protectedResource)))
+	mux.Handle("/.well-known/oauth-authorization-server", cors(http.HandlerFunc(a.authorizationServer)))
+	mux.Handle("/.well-known/mcp/server-card.json", cors(http.HandlerFunc(a.serverCard)))
+	mux.Handle("/oauth/register", cors(onlyPost(a.register)))
+	mux.Handle("/oauth/token", cors(onlyPost(a.token)))
+	mux.HandleFunc("GET /oauth/authorize", a.authorize)
+	mux.HandleFunc("POST /oauth/authorize", a.form(formLimit, a.approve))
 
 	// The API and the MCP connector take an API token, not the session.
 	mux.HandleFunc("POST /api/v1/test-addresses", a.api(a.apiCreateAddress))
 	mux.HandleFunc("GET /api/v1/test-addresses/{token}/wait", a.api(a.apiWait))
 	mux.HandleFunc("GET /api/v1/reports/{id}", a.api(a.apiReport))
-	mux.Handle("/api/mcp", a.mcpAuth(a.mcpHandler()))
+	mux.Handle("/api/mcp", cors(a.mcpAuth(a.mcpHandler())))
 	return secure(a.session(mux))
 }
 
-// secure sets the headers every response carries. The CSP allows no inline
-// script or style, like Preflight.
+// csp allows no inline script or style, like Preflight.
+const csp = "default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+
+// secure sets the headers every response carries.
 func secure(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hd := w.Header()
-		hd.Set("Content-Security-Policy", "default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+		hd.Set("Content-Security-Policy", csp)
 		hd.Set("X-Content-Type-Options", "nosniff")
 		hd.Set("Referrer-Policy", "same-origin")
 		h.ServeHTTP(w, r)
+	})
+}
+
+// onlyPost answers 405 to anything but POST (OPTIONS is handled by cors).
+func onlyPost(h http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST, OPTIONS")
+			apiError(w, http.StatusMethodNotAllowed, "use POST")
+			return
+		}
+		h(w, r)
 	})
 }
 
