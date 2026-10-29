@@ -56,3 +56,21 @@ details pre { margin-left: 4.5em; }
   .sheet { grid-template-columns: 1fr; gap: 8px; }
   details p, details pre { margin-left: 0; }
 }
+/* Accounts */
+.bar nav { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.bar .who { margin-left: 20px; color: var(--fg); }
+form.inline { display: inline; margin: 0; }
+.bar form.inline { margin-left: 20px; }
+button.link { background: none; color: var(--muted); padding: 0; font-size: inherit; text-decoration: none; }
+button.link:hover, .bar nav a:hover { color: var(--fg); }
+input[type=email] { background: transparent; color: var(--fg); border: 1px solid var(--line); padding: 8px; font-size: 14px; }
+.error { color: var(--fail); }
+.new-token { border-left: 3px solid var(--pass); padding-left: 12px; }
+.new-token .address code { font-size: 15px; word-break: break-all; }
+.tokens { width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 14px; }
+.tokens th { text-align: left; color: var(--muted); font-family: var(--mono); font-weight: 400; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+.tokens th, .tokens td { padding: 6px 12px 6px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+.tokens td:last-child { text-align: right; padding-right: 0; }
+@media (max-width: 640px) {
+  .tokens th:nth-child(3), .tokens td:nth-child(3) { display: none; }
+}

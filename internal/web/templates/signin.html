@@ -1,0 +1,29 @@
+{{define "content"}}
+<section class="sheet">
+  <p class="label">Sign in</p>
+  <div>
+  {{if .Sent}}
+    <h1>Check your email</h1>
+    <p>If <strong>{{.Email}}</strong> can receive mail, a sign-in link is on its way. The link works once and expires in 15 minutes.</p>
+    <p class="muted">Nothing arrived? Check the spam folder, or <a href="/signin">send another link</a>.</p>
+  {{else if .Verify}}
+    <h1>Sign in to SendScore</h1>
+    <p>Press the button to finish signing in on this device.</p>
+    <form method="post" action="/signin/verify" class="form">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="t" value="{{.Verify}}">
+      <button type="submit">Sign in</button>
+    </form>
+  {{else}}
+    <h1>Sign in with your email</h1>
+    <p>There is no password. Enter your email and SendScore sends you a link that signs you in, and creates your account the first time.</p>
+    {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+    <form method="post" action="/signin" class="form">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <label>Email<input type="email" name="email" value="{{.Email}}" autocomplete="email" required></label>
+      <button type="submit">Email me a sign-in link</button>
+    </form>
+  {{end}}
+  </div>
+</section>
+{{end}}

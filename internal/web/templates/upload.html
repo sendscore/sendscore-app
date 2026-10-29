@@ -5,6 +5,7 @@
     <h1>Check a saved email</h1>
     <p>A saved file does not record which server delivered it, so SPF, reverse DNS, and TLS are skipped unless you fill in the sending IP.</p>
     <form method="post" action="/upload" enctype="multipart/form-data" class="form">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
       <label>Message (.eml)<input type="file" name="message" accept=".eml,message/rfc822" required></label>
       <label>Sending IP (optional)<input type="text" name="ip" placeholder="203.0.113.10"></label>
       <label>Envelope sender (optional)<input type="text" name="mail_from" placeholder="bounce@mail.example.com"></label>

@@ -1,0 +1,49 @@
+{{define "content"}}
+<section class="sheet">
+  <p class="label">Account</p>
+  <div>
+    <h1>{{.User.Email}}</h1>
+    <p>Today you have used {{.Used}} of your {{.Limit}} test addresses. The allowance starts again at midnight UTC.</p>
+  </div>
+</section>
+{{if .NewToken}}
+<section class="sheet">
+  <p class="label">New token</p>
+  <div class="new-token">
+    <p>Here is the token named <strong>{{.NewTokenName}}</strong>. Copy it now, because SendScore keeps only a fingerprint of it and cannot show it again.</p>
+    <p class="address"><code>{{.NewToken}}</code></p>
+    <p class="muted">Send it as <code>Authorization: Bearer {{.NewToken}}</code>, or set <code>SENDSCORE_TOKEN</code> for <code>sendscore mcp</code>.</p>
+  </div>
+</section>
+{{end}}
+<section class="sheet">
+  <p class="label">API tokens</p>
+  <div>
+    <p>Tokens let an agent, the MCP connector at <code>{{.BaseURL}}/api/mcp</code>, or the API create test addresses and read their reports. Addresses and reports made with a token belong to this account.</p>
+    {{if .Tokens}}
+    <table class="tokens">
+      <thead><tr><th>Name</th><th>Token</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+      <tbody>
+      {{range .Tokens}}
+        <tr>
+          <td>{{.Name}}</td>
+          <td><code>{{.Prefix}}...</code></td>
+          <td>{{day .CreatedAt}}</td>
+          <td>{{if .LastUsedAt.IsZero}}<span class="muted">Never</span>{{else}}{{when .LastUsedAt}}{{end}}</td>
+          <td><form method="post" action="/account/tokens/{{.ID}}/revoke" class="inline"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="link">Revoke</button></form></td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table>
+    {{else}}
+    <p class="muted">You have no tokens yet.</p>
+    {{end}}
+    {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+    <form method="post" action="/account/tokens" class="form">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <label>Token name<input type="text" name="name" value="{{.Name}}" maxlength="60" placeholder="Claude Code on my laptop" required></label>
+      <button type="submit">Create a token</button>
+    </form>
+  </div>
+</section>
+{{end}}

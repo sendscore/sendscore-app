@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/sendscore/sendscore-app/internal/db"
+	"github.com/sendscore/sendscore-app/internal/mail"
 	"github.com/sendscore/sendscore/engine"
 	"github.com/sendscore/sendscore/verdict"
 )
@@ -47,6 +48,16 @@ type Config struct {
 	// BehindProxy is set when a reverse proxy on the same machine forwards
 	// public requests, so loopback connections carry a public Host header.
 	BehindProxy bool
+	// TrustProxy takes the client IP for limits from X-Forwarded-For.
+	TrustProxy bool
+	// SecureCookies marks cookies Secure, for a site served over HTTPS.
+	SecureCookies bool
+	// Mailer sends sign-in links. It defaults to logging them.
+	Mailer mail.Sender
+	// FreeDailyTests and AnonDailyTests are the test addresses (and
+	// uploads) per UTC day for a free account and for an anonymous IP.
+	FreeDailyTests int
+	AnonDailyTests int
 }
 
 // MaxUploadBytes is the largest upload checked, the same as the largest
@@ -77,12 +88,16 @@ func New(cfg Config, store *db.Store, log *slog.Logger) (*App, error) {
 	if cfg.MaxWait == 0 {
 		cfg.MaxWait = 50 * time.Second
 	}
+	if cfg.Mailer == nil {
+		cfg.Mailer = mail.Log{Logger: log}
+	}
 	a := &App{cfg: cfg, store: store, log: log, tmpl: map[string]*template.Template{}, quit: make(chan struct{})}
 	funcs := template.FuncMap{
 		"lower":  strings.ToLower,
 		"status": func(s verdict.Status) string { return string(s) },
 		"kb":     func(n int) string { return strconv.Itoa((n+1023)/1024) + " KB" },
 		"when":   func(t time.Time) string { return t.UTC().Format("2 Jan 2006, 15:04 UTC") },
+		"day":    func(t time.Time) string { return t.UTC().Format("2 Jan 2006") },
 		"who": func(w string) string {
 			if w == verdict.FixedByProvider {
 				return "your email platform"
@@ -94,7 +109,7 @@ func New(cfg Config, store *db.Store, log *slog.Logger) (*App, error) {
 			return string(b)
 		},
 	}
-	for _, page := range []string{"home", "address", "report", "upload", "error"} {
+	for _, page := range []string{"home", "address", "report", "upload", "error", "signin", "account"} {
 		t, err := template.New("layout.html").Funcs(funcs).ParseFS(templateFS, "templates/layout.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, err
@@ -113,19 +128,33 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/assets/images/favicon.ico", http.StatusMovedPermanently)
 	})
+	// Every POST form goes through a.form, which checks the CSRF token.
+	const formLimit = 64 << 10
 	mux.HandleFunc("GET /{$}", a.home)
-	mux.HandleFunc("POST /test", a.createAddressPage)
+	mux.HandleFunc("POST /test", a.form(formLimit, a.createAddressPage))
 	mux.HandleFunc("GET /t/{token}", a.addressPage)
 	mux.HandleFunc("GET /upload", a.uploadForm)
-	mux.HandleFunc("POST /upload", a.upload)
+	// The body may be a little larger than the file, for the form fields.
+	mux.HandleFunc("POST /upload", a.form(MaxUploadBytes+1<<20, a.upload))
 	mux.HandleFunc("GET /r/{id}", a.reportPage)
 	mux.HandleFunc("GET /r/{id}/raw", a.rawMessage)
+	mux.HandleFunc("GET /r/{id}/json", a.reportJSON)
 
-	mux.HandleFunc("POST /api/v1/test-addresses", a.apiCreateAddress)
-	mux.HandleFunc("GET /api/v1/test-addresses/{token}/wait", a.apiWait)
-	mux.HandleFunc("GET /api/v1/reports/{id}", a.apiReport)
-	mux.Handle("/api/mcp", a.mcpHandler())
-	return secure(mux)
+	mux.HandleFunc("GET /signin", a.signinForm)
+	mux.HandleFunc("POST /signin", a.form(formLimit, a.signin))
+	mux.HandleFunc("GET /signin/verify", a.verifyForm)
+	mux.HandleFunc("POST /signin/verify", a.form(formLimit, a.verify))
+	mux.HandleFunc("POST /signout", a.form(formLimit, a.signout))
+	mux.HandleFunc("GET /account", a.account)
+	mux.HandleFunc("POST /account/tokens", a.form(formLimit, a.createToken))
+	mux.HandleFunc("POST /account/tokens/{id}/revoke", a.form(formLimit, a.revokeToken))
+
+	// The API and the MCP connector take an API token, not the session.
+	mux.HandleFunc("POST /api/v1/test-addresses", a.api(a.apiCreateAddress))
+	mux.HandleFunc("GET /api/v1/test-addresses/{token}/wait", a.api(a.apiWait))
+	mux.HandleFunc("GET /api/v1/reports/{id}", a.api(a.apiReport))
+	mux.Handle("/api/mcp", a.mcpAuth(a.mcpHandler()))
+	return secure(a.session(mux))
 }
 
 // secure sets the headers every response carries. The CSP allows no inline
@@ -140,11 +169,13 @@ func secure(h http.Handler) http.Handler {
 	})
 }
 
-func (a *App) render(w http.ResponseWriter, status int, page string, data map[string]any) {
+func (a *App) render(w http.ResponseWriter, r *http.Request, status int, page string, data map[string]any) {
 	if data == nil {
 		data = map[string]any{}
 	}
 	data["MailDomain"] = a.cfg.MailDomain
+	data["User"] = userFrom(r.Context())
+	data["CSRF"], _ = r.Context().Value(csrfKey).(string)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	if err := a.tmpl[page].Execute(w, data); err != nil {
@@ -152,8 +183,8 @@ func (a *App) render(w http.ResponseWriter, status int, page string, data map[st
 	}
 }
 
-func (a *App) fail(w http.ResponseWriter, status int, msg string) {
-	a.render(w, status, "error", map[string]any{"Title": http.StatusText(status), "Message": msg})
+func (a *App) fail(w http.ResponseWriter, r *http.Request, status int, msg string) {
+	a.render(w, r, status, "error", map[string]any{"Title": http.StatusText(status), "Message": msg})
 }
 
 func (a *App) address(token string) string {
@@ -161,14 +192,26 @@ func (a *App) address(token string) string {
 }
 
 func (a *App) home(w http.ResponseWriter, r *http.Request) {
-	a.render(w, http.StatusOK, "home", map[string]any{"Title": "Check a newsletter"})
+	a.render(w, r, http.StatusOK, "home", map[string]any{"Title": "Check a newsletter"})
 }
 
 func (a *App) createAddressPage(w http.ResponseWriter, r *http.Request) {
-	addr, err := a.store.CreateAddress(r.Context(), a.cfg.AddressTTL)
+	u := userFrom(r.Context())
+	if limit, err := a.takeTest(r.Context(), u, a.clientIP(r)); err != nil {
+		if !errors.Is(err, db.ErrLimit) {
+			a.log.Error("count test", "err", err)
+		}
+		a.limitPage(w, r, limit)
+		return
+	}
+	uid := ""
+	if u != nil {
+		uid = u.ID
+	}
+	addr, err := a.store.CreateAddressFor(r.Context(), a.cfg.AddressTTL, uid)
 	if err != nil {
 		a.log.Error("create address", "err", err)
-		a.fail(w, http.StatusInternalServerError, "Could not create a test address.")
+		a.fail(w, r, http.StatusInternalServerError, "Could not create a test address.")
 		return
 	}
 	http.Redirect(w, r, "/t/"+addr.Token, http.StatusSeeOther)
@@ -178,7 +221,7 @@ func (a *App) addressPage(w http.ResponseWriter, r *http.Request) {
 	token := r.PathValue("token")
 	addr, err := a.store.AddressByToken(r.Context(), token)
 	if err != nil {
-		a.fail(w, http.StatusNotFound, "This test address does not exist, or it has expired.")
+		a.fail(w, r, http.StatusNotFound, "This test address does not exist, or it has expired.")
 		return
 	}
 	// After a report, the page waits for the next message instead.
@@ -188,46 +231,52 @@ func (a *App) addressPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if errors.Is(err, db.ErrUnknownAfter) {
-		a.fail(w, http.StatusNotFound, "That report did not come from this test address.")
+		a.fail(w, r, http.StatusNotFound, "That report did not come from this test address.")
 		return
 	}
-	a.render(w, http.StatusOK, "address", map[string]any{
+	a.render(w, r, http.StatusOK, "address", map[string]any{
 		"Title": "Waiting for your email", "Address": a.address(addr.Token), "Expires": addr.ExpiresAt,
 		"Refresh": true,
 	})
 }
 
 func (a *App) uploadForm(w http.ResponseWriter, r *http.Request) {
-	a.render(w, http.StatusOK, "upload", map[string]any{"Title": "Check a saved email"})
+	a.render(w, r, http.StatusOK, "upload", map[string]any{"Title": "Check a saved email"})
 }
 
 func (a *App) upload(w http.ResponseWriter, r *http.Request) {
-	// The body may be a little larger than the file, for the form fields.
-	r.Body = http.MaxBytesReader(w, r.Body, MaxUploadBytes+1<<20)
+	// a.form has parsed the body, within the size limit.
 	file, _, err := r.FormFile("message")
 	if err != nil {
 		if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {
-			a.fail(w, http.StatusRequestEntityTooLarge, tooLargeMessage)
+			a.fail(w, r, http.StatusRequestEntityTooLarge, tooLargeMessage)
 			return
 		}
-		a.fail(w, http.StatusBadRequest, "Choose an .eml file to check.")
+		a.fail(w, r, http.StatusBadRequest, "Choose an .eml file to check.")
 		return
 	}
 	defer file.Close()
 	raw, err := io.ReadAll(io.LimitReader(file, MaxUploadBytes+1))
 	if err != nil {
-		a.fail(w, http.StatusBadRequest, "Could not read the file.")
+		a.fail(w, r, http.StatusBadRequest, "Could not read the file.")
 		return
 	}
 	if len(raw) > MaxUploadBytes {
-		a.fail(w, http.StatusRequestEntityTooLarge, tooLargeMessage)
+		a.fail(w, r, http.StatusRequestEntityTooLarge, tooLargeMessage)
+		return
+	}
+	if limit, err := a.takeTest(r.Context(), userFrom(r.Context()), a.clientIP(r)); err != nil {
+		if !errors.Is(err, db.ErrLimit) {
+			a.log.Error("count test", "err", err)
+		}
+		a.limitPage(w, r, limit)
 		return
 	}
 	env := engine.Envelope{MailFrom: strings.TrimSpace(r.FormValue("mail_from"))}
 	if ip := strings.TrimSpace(r.FormValue("ip")); ip != "" {
 		env.RemoteIP = net.ParseIP(ip)
 		if env.RemoteIP == nil {
-			a.fail(w, http.StatusBadRequest, "The sending IP is not an IP address.")
+			a.fail(w, r, http.StatusBadRequest, "The sending IP is not an IP address.")
 			return
 		}
 	}
@@ -240,14 +289,14 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 		Blocklists: a.cfg.Blocklists, ReceivedAt: now,
 	})
 	if err != nil {
-		a.fail(w, http.StatusBadRequest, "That file is not an email message: "+err.Error())
+		a.fail(w, r, http.StatusBadRequest, "That file is not an email message: "+err.Error())
 		return
 	}
 	m := &db.Message{Source: "upload", ReceivedAt: now, ExpiresAt: now.Add(a.cfg.ReportTTL),
 		RemoteIP: r.FormValue("ip"), MailFrom: env.MailFrom, Raw: raw, Verdict: v}
 	if err := a.store.SaveMessage(r.Context(), m); err != nil {
 		a.log.Error("save upload", "err", err)
-		a.fail(w, http.StatusInternalServerError, "Could not save the report.")
+		a.fail(w, r, http.StatusInternalServerError, "Could not save the report.")
 		return
 	}
 	http.Redirect(w, r, "/r/"+m.ID, http.StatusSeeOther)
@@ -273,7 +322,7 @@ var sections = []struct {
 func (a *App) reportPage(w http.ResponseWriter, r *http.Request) {
 	m, err := a.store.MessageByID(r.Context(), r.PathValue("id"))
 	if err != nil {
-		a.fail(w, http.StatusNotFound, "This report does not exist, or it has expired.")
+		a.fail(w, r, http.StatusNotFound, "This report does not exist, or it has expired.")
 		return
 	}
 	var secs []section
@@ -288,7 +337,7 @@ func (a *App) reportPage(w http.ResponseWriter, r *http.Request) {
 			secs = append(secs, section{Name: s.name, Checks: cs})
 		}
 	}
-	a.render(w, http.StatusOK, "report", map[string]any{
+	a.render(w, r, http.StatusOK, "report", map[string]any{
 		"Title": m.Verdict.Message.Subject, "M": m, "V": m.Verdict, "Sections": secs,
 	})
 }
@@ -312,6 +361,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
+	// Served as JSON with nosniff, so < and > need no escaping.
+	enc.SetEscapeHTML(false)
 	enc.Encode(v)
 }
 
@@ -320,7 +371,17 @@ func apiError(w http.ResponseWriter, status int, msg string) {
 }
 
 func (a *App) apiCreateAddress(w http.ResponseWriter, r *http.Request) {
-	addr, err := a.store.CreateAddress(r.Context(), a.cfg.AddressTTL)
+	u := userFrom(r.Context())
+	if limit, err := a.takeTest(r.Context(), u, ""); err != nil {
+		if !errors.Is(err, db.ErrLimit) {
+			a.log.Error("count test", "err", err)
+			apiError(w, http.StatusInternalServerError, "could not count the test")
+			return
+		}
+		apiError(w, http.StatusTooManyRequests, limitError(limit))
+		return
+	}
+	addr, err := a.store.CreateAddressFor(r.Context(), a.cfg.AddressTTL, u.ID)
 	if err != nil {
 		a.log.Error("create address", "err", err)
 		apiError(w, http.StatusInternalServerError, "could not create a test address")
@@ -340,7 +401,8 @@ func (a *App) apiCreateAddress(w http.ResponseWriter, r *http.Request) {
 // id>, only a message received after that report counts.
 func (a *App) apiWait(w http.ResponseWriter, r *http.Request) {
 	token := r.PathValue("token")
-	if _, err := a.store.AddressByToken(r.Context(), token); err != nil {
+	// Another account's address is answered as if it did not exist.
+	if addr, err := a.store.AddressByToken(r.Context(), token); err != nil || addr.UserID != userFrom(r.Context()).ID {
 		apiError(w, http.StatusNotFound, "no such test address, or it has expired")
 		return
 	}
@@ -400,7 +462,19 @@ func (a *App) wait(ctx context.Context, token, after string, timeout time.Durati
 	}
 }
 
+// apiReport returns a report from one of the token owner's test addresses.
 func (a *App) apiReport(w http.ResponseWriter, r *http.Request) {
+	m, err := a.store.MessageForUser(r.Context(), r.PathValue("id"), userFrom(r.Context()).ID)
+	if err != nil {
+		apiError(w, http.StatusNotFound, "no such report, or it has expired")
+		return
+	}
+	writeJSON(w, http.StatusOK, m.Verdict)
+}
+
+// reportJSON is the verdict behind the report page, viewable by its link
+// like the page itself.
+func (a *App) reportJSON(w http.ResponseWriter, r *http.Request) {
 	m, err := a.store.MessageByID(r.Context(), r.PathValue("id"))
 	if err != nil {
 		apiError(w, http.StatusNotFound, "no such report, or it has expired")

@@ -3,7 +3,9 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,18 +16,62 @@ import (
 	"github.com/sendscore/sendscore/mcpserver"
 )
 
+// bearerTransport adds an API token to every request, as a connector does.
+type bearerTransport struct{ token string }
+
+func (b bearerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	r = r.Clone(r.Context())
+	r.Header.Set("Authorization", "Bearer "+b.token)
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// connectMCP opens a session on the remote connector with token (none when
+// empty).
+func connectMCP(t *testing.T, url, token string) (*mcp.ClientSession, error) {
+	t.Helper()
+	tr := &mcp.StreamableClientTransport{Endpoint: url + "/api/mcp"}
+	if token != "" {
+		tr.HTTPClient = &http.Client{Transport: bearerTransport{token}}
+	}
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test"}, nil).Connect(context.Background(), tr, nil)
+	if err == nil {
+		t.Cleanup(func() { cs.Close() })
+	}
+	return cs, err
+}
+
+func TestRemoteMCPRequiresToken(t *testing.T) {
+	_, _, h := newApp(t)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	if _, err := connectMCP(t, srv.URL, ""); err == nil {
+		t.Error("connected without a token")
+	}
+	if _, err := connectMCP(t, srv.URL, "ss_live_notarealtoken"); err == nil {
+		t.Error("connected with an unknown token")
+	}
+	req, _ := http.NewRequest("POST", srv.URL+"/api/mcp", strings.NewReader(`{}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 401 || !strings.HasPrefix(resp.Header.Get("WWW-Authenticate"), "Bearer") {
+		t.Errorf("no token = %d, WWW-Authenticate %q", resp.StatusCode, resp.Header.Get("WWW-Authenticate"))
+	}
+}
+
 func TestRemoteMCP(t *testing.T) {
 	_, store, h := newApp(t)
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
 	ctx := context.Background()
-	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test"}, nil).
-		Connect(ctx, &mcp.StreamableClientTransport{Endpoint: srv.URL + "/api/mcp"}, nil)
+	owner, _, tok := newUser(t, store, "mcp@example.com")
+	cs, err := connectMCP(t, srv.URL, tok)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cs.Close()
 
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "get_test_address", Arguments: map[string]any{}})
 	if err != nil || res.IsError {
@@ -36,6 +82,9 @@ func TestRemoteMCP(t *testing.T) {
 	json.Unmarshal(b, &addr)
 	if addr.Address != "t-"+addr.Token+"@in.test" {
 		t.Fatalf("address = %+v", addr)
+	}
+	if a, err := store.AddressByToken(ctx, addr.Token); err != nil || a.UserID != owner.ID {
+		t.Fatalf("address owner = %q %v, want %s", a.UserID, err, owner.ID)
 	}
 
 	// Deliver a message the way the receiver stores one.
@@ -70,5 +119,47 @@ func TestRemoteMCP(t *testing.T) {
 	json.Unmarshal(b, &got)
 	if got.Status != "not_received" {
 		t.Errorf("wait after %s = %+v, want not_received", m.ID, got)
+	}
+
+	// Another account sees neither the address nor the report.
+	_, _, otherTok := newUser(t, store, "other@example.com")
+	other, err := connectMCP(t, srv.URL, otherTok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err = other.CallTool(ctx, &mcp.CallToolParams{Name: "get_report", Arguments: map[string]any{"report_id": m.ID}})
+	if err != nil || !res.IsError {
+		t.Errorf("another account's get_report: %v %+v", err, res)
+	}
+	res, err = other.CallTool(ctx, &mcp.CallToolParams{Name: "wait_for_message", Arguments: map[string]any{"token": addr.Token, "timeout_seconds": 1}})
+	if err != nil || !res.IsError {
+		t.Errorf("another account's wait_for_message: %v %+v", err, res)
+	}
+	res, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "get_report", Arguments: map[string]any{"report_id": m.ID}})
+	if err != nil || res.IsError {
+		t.Errorf("owner's get_report: %v %+v", err, res)
+	}
+}
+
+func TestRemoteMCPDailyLimit(t *testing.T) {
+	_, store, h := newApp(t, func(c *Config) { c.FreeDailyTests = 1 })
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	_, _, tok := newUser(t, store, "limit@example.com")
+	cs, err := connectMCP(t, srv.URL, tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "get_test_address", Arguments: map[string]any{}}); err != nil || res.IsError {
+		t.Fatalf("first get_test_address: %v %+v", err, res)
+	}
+	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "get_test_address", Arguments: map[string]any{}})
+	if err != nil || !res.IsError {
+		t.Fatalf("second get_test_address = %v %+v, want the limit", err, res)
+	}
+	b, _ := json.Marshal(res.Content)
+	if !strings.Contains(string(b), "daily limit of 1") {
+		t.Errorf("limit error = %s", b)
 	}
 }

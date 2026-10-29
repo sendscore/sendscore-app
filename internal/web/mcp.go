@@ -14,11 +14,22 @@ import (
 )
 
 // storeBackend serves the MCP tools straight from the database, so the
-// remote connector needs no HTTP round trip to itself.
-type storeBackend struct{ a *App }
+// remote connector needs no HTTP round trip to itself. It acts for the
+// token's owner: new addresses are theirs and count against their daily
+// allowance, and only their addresses and reports can be read.
+type storeBackend struct {
+	a    *App
+	user *db.User
+}
 
 func (b storeBackend) CreateTestAddress(ctx context.Context) (mcpserver.TestAddress, error) {
-	addr, err := b.a.store.CreateAddress(ctx, b.a.cfg.AddressTTL)
+	if limit, err := b.a.takeTest(ctx, b.user, ""); err != nil {
+		if errors.Is(err, db.ErrLimit) {
+			return mcpserver.TestAddress{}, errors.New(limitError(limit))
+		}
+		return mcpserver.TestAddress{}, err
+	}
+	addr, err := b.a.store.CreateAddressFor(ctx, b.a.cfg.AddressTTL, b.user.ID)
 	if err != nil {
 		return mcpserver.TestAddress{}, err
 	}
@@ -29,8 +40,12 @@ func (b storeBackend) CreateTestAddress(ctx context.Context) (mcpserver.TestAddr
 }
 
 func (b storeBackend) Wait(ctx context.Context, token, after string, timeout time.Duration) (*verdict.Verdict, error) {
-	if _, err := b.a.store.AddressByToken(ctx, token); err != nil {
+	addr, err := b.a.store.AddressByToken(ctx, token)
+	if err != nil {
 		return nil, translate(err)
+	}
+	if addr.UserID != b.user.ID {
+		return nil, mcpserver.ErrNotFound
 	}
 	m, err := b.a.wait(ctx, token, after, timeout)
 	switch {
@@ -45,7 +60,7 @@ func (b storeBackend) Wait(ctx context.Context, token, after string, timeout tim
 }
 
 func (b storeBackend) Report(ctx context.Context, id string) (*verdict.Verdict, error) {
-	m, err := b.a.store.MessageByID(ctx, id)
+	m, err := b.a.store.MessageForUser(ctx, id, b.user.ID)
 	if err != nil {
 		return nil, translate(err)
 	}
@@ -59,10 +74,16 @@ func translate(err error) error {
 	return err
 }
 
-// mcpHandler is the remote connector at /api/mcp (streamable HTTP).
+// mcpHandler is the remote connector at /api/mcp (streamable HTTP). It is
+// stateless, so each request gets a server for the user mcpAuth found.
 func (a *App) mcpHandler() http.Handler {
-	srv := mcpserver.New(storeBackend{a}, "app")
-	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{
+	return mcp.NewStreamableHTTPHandler(func(r *http.Request) *mcp.Server {
+		u := userFrom(r.Context())
+		if u == nil {
+			return nil
+		}
+		return mcpserver.New(storeBackend{a: a, user: u}, "app")
+	}, &mcp.StreamableHTTPOptions{
 		Stateless: true, JSONResponse: true, Logger: a.log,
 		// The SDK refuses loopback requests with a public Host header, which
 		// guards a laptop against DNS rebinding but is exactly what nginx

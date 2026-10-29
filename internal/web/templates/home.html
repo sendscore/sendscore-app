@@ -4,7 +4,7 @@
   <div>
     <h1>Check a newsletter before it goes out</h1>
     <p>Get a test address, send a preview to it from your email platform, and get a report on authentication, unsubscribe headers, structure, and content.</p>
-    <form method="post" action="/test"><button type="submit">Get a test address</button></form>
+    <form method="post" action="/test"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Get a test address</button></form>
     <p class="muted">Or <a href="/upload">upload a saved .eml file</a>.</p>
   </div>
 </section>

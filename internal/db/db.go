@@ -55,7 +55,26 @@ func Open(path string) (*Store, error) {
 	if _, err := d.Exec(schema); err != nil {
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	if err := migrate(d); err != nil {
+		return nil, fmt.Errorf("migrate: %w", err)
+	}
 	return &Store{DB: d, Now: time.Now}, nil
+}
+
+// migrate adds the columns that came after a table was first created. Each
+// change is additive, and a column that is already there is left alone.
+func migrate(d *sql.DB) error {
+	alters := []string{
+		// The account an address was made for; NULL for anonymous addresses.
+		`ALTER TABLE addresses ADD COLUMN user_id TEXT REFERENCES users(id) ON DELETE SET NULL`,
+	}
+	for _, a := range alters {
+		if _, err := d.Exec(a); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			return err
+		}
+	}
+	_, err := d.Exec(`CREATE INDEX IF NOT EXISTS addresses_user ON addresses(user_id)`)
+	return err
 }
 
 // Close closes the database.
@@ -76,16 +95,26 @@ func NewToken(n int) string {
 // Address is a test address.
 type Address struct {
 	Token     string
+	UserID    string // empty for an anonymous address
 	CreatedAt time.Time
 	ExpiresAt time.Time
 }
 
-// CreateAddress makes a test address that accepts mail for ttl.
+// CreateAddress makes an anonymous test address that accepts mail for ttl.
 func (s *Store) CreateAddress(ctx context.Context, ttl time.Duration) (Address, error) {
+	return s.CreateAddressFor(ctx, ttl, "")
+}
+
+// CreateAddressFor makes a test address owned by userID (none when empty).
+func (s *Store) CreateAddressFor(ctx context.Context, ttl time.Duration, userID string) (Address, error) {
 	now := s.Now().UTC()
-	a := Address{Token: NewToken(10), CreatedAt: now, ExpiresAt: now.Add(ttl)}
-	_, err := s.DB.ExecContext(ctx, `INSERT INTO addresses (token, created_at, expires_at) VALUES (?, ?, ?)`,
-		a.Token, a.CreatedAt.Unix(), a.ExpiresAt.Unix())
+	a := Address{Token: NewToken(10), UserID: userID, CreatedAt: now, ExpiresAt: now.Add(ttl)}
+	var uid any
+	if userID != "" {
+		uid = userID
+	}
+	_, err := s.DB.ExecContext(ctx, `INSERT INTO addresses (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`,
+		a.Token, uid, a.CreatedAt.Unix(), a.ExpiresAt.Unix())
 	return a, err
 }
 
@@ -93,8 +122,8 @@ func (s *Store) CreateAddress(ctx context.Context, ttl time.Duration) (Address, 
 func (s *Store) AddressByToken(ctx context.Context, token string) (Address, error) {
 	var a Address
 	var created, expires int64
-	err := s.DB.QueryRowContext(ctx, `SELECT token, created_at, expires_at FROM addresses WHERE token = ? AND expires_at > ?`,
-		strings.ToLower(token), s.Now().Unix()).Scan(&a.Token, &created, &expires)
+	err := s.DB.QueryRowContext(ctx, `SELECT token, COALESCE(user_id, ''), created_at, expires_at FROM addresses WHERE token = ? AND expires_at > ?`,
+		strings.ToLower(token), s.Now().Unix()).Scan(&a.Token, &a.UserID, &created, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
 		return a, ErrNotFound
 	}
@@ -173,6 +202,18 @@ func (s *Store) MessageByID(ctx context.Context, id string) (*Message, error) {
 		`SELECT `+messageCols+` FROM messages WHERE id = ? AND expires_at > ?`, id, s.Now().Unix()))
 }
 
+// MessageForUser returns a report that has not expired, only when it was
+// received at a test address the user owns. Uploads belong to no address,
+// so they are never returned.
+func (s *Store) MessageForUser(ctx context.Context, id, userID string) (*Message, error) {
+	if userID == "" {
+		return nil, ErrNotFound
+	}
+	return scanMessage(s.DB.QueryRowContext(ctx,
+		`SELECT `+messageCols+` FROM messages WHERE id = ? AND expires_at > ?
+		AND token IN (SELECT token FROM addresses WHERE user_id = ?)`, id, s.Now().Unix(), userID))
+}
+
 // RawByID returns the raw message of a report that has not expired.
 func (s *Store) RawByID(ctx context.Context, id string) ([]byte, error) {
 	var raw []byte
@@ -211,8 +252,9 @@ func (s *Store) LatestForToken(ctx context.Context, token, after string) (*Messa
 // checks finish.
 const AddressGrace = time.Hour
 
-// Sweep deletes expired messages, and addresses that expired more than
-// AddressGrace ago and have no messages left.
+// Sweep deletes expired messages, addresses that expired more than
+// AddressGrace ago and have no messages left, and expired sign-in links,
+// sessions, and usage counters.
 func (s *Store) Sweep(ctx context.Context) (int64, error) {
 	now := s.Now()
 	res, err := s.DB.ExecContext(ctx, `DELETE FROM messages WHERE expires_at <= ?`, now.Unix())
@@ -222,5 +264,13 @@ func (s *Store) Sweep(ctx context.Context) (int64, error) {
 	n, _ := res.RowsAffected()
 	_, err = s.DB.ExecContext(ctx, `DELETE FROM addresses WHERE expires_at <= ?
 		AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.token = addresses.token)`, now.Add(-AddressGrace).Unix())
-	return n, err
+	if err != nil {
+		return n, err
+	}
+	for _, table := range []string{"login_tokens", "sessions", "counters"} {
+		if _, err := s.DB.ExecContext(ctx, `DELETE FROM `+table+` WHERE expires_at <= ?`, now.Unix()); err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }

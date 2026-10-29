@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,6 +20,7 @@ import (
 	"github.com/emersion/go-smtp"
 
 	"github.com/sendscore/sendscore-app/internal/db"
+	"github.com/sendscore/sendscore-app/internal/mail"
 	"github.com/sendscore/sendscore-app/internal/receiver"
 	"github.com/sendscore/sendscore-app/internal/web"
 	"github.com/sendscore/sendscore/engine"
@@ -41,19 +43,49 @@ func main() {
 	smtpAddr := getenv("SENDSCORE_SMTP_ADDR", "127.0.0.1:2525")
 	mailDomain := getenv("SENDSCORE_MAIL_DOMAIN", "localhost")
 	baseURL := strings.TrimRight(getenv("SENDSCORE_BASE_URL", "http://"+httpAddr), "/")
+	// Secure cookies are the production switch. Sign-in links are built
+	// from SENDSCORE_BASE_URL, never the Host header, so production must set
+	// it.
+	secureCookies := os.Getenv("SENDSCORE_SECURE_COOKIES") == "true"
+	if secureCookies && os.Getenv("SENDSCORE_BASE_URL") == "" {
+		log.Error("SENDSCORE_BASE_URL is required when SENDSCORE_SECURE_COOKIES=true")
+		os.Exit(1)
+	}
+
+	var mailer mail.Sender = mail.Log{Logger: log}
+	ses, ok, err := mail.FromEnv(context.Background())
+	switch {
+	case err != nil:
+		log.Error("ses config", "err", err)
+		os.Exit(1)
+	case ok:
+		mailer = ses
+		log.Info("sign-in email via SES", "from", ses.From())
+	case secureCookies:
+		// A production log must never hold working sign-in links.
+		log.Error("SES_ACCESS_KEY_ID and SES_SECRET_ACCESS_KEY are required when SENDSCORE_SECURE_COOKIES=true")
+		os.Exit(1)
+	default:
+		log.Warn("SES is not configured, so sign-in links are logged here instead of emailed")
+	}
 
 	lists := blocklists()
 	// Links are fetched with the engine's safe client, which refuses
 	// non-public addresses and never follows unsubscribe or confirm links.
 	checkLinks := os.Getenv("SENDSCORE_CHECK_LINKS") != "0"
 	app, err := web.New(web.Config{
-		Blocklists:  lists,
-		CheckLinks:  checkLinks,
-		BehindProxy: !isLocal(baseURL),
-		BaseURL:     baseURL,
-		MailDomain:  mailDomain,
-		AddressTTL:  24 * time.Hour,
-		ReportTTL:   7 * 24 * time.Hour,
+		Blocklists:     lists,
+		CheckLinks:     checkLinks,
+		BehindProxy:    !isLocal(baseURL),
+		TrustProxy:     os.Getenv("SENDSCORE_TRUST_PROXY") == "1",
+		SecureCookies:  secureCookies,
+		Mailer:         mailer,
+		FreeDailyTests: getint(log, "SENDSCORE_FREE_DAILY_TESTS", 25),
+		AnonDailyTests: getint(log, "SENDSCORE_ANON_DAILY_TESTS", 5),
+		BaseURL:        baseURL,
+		MailDomain:     mailDomain,
+		AddressTTL:     24 * time.Hour,
+		ReportTTL:      7 * 24 * time.Hour,
 	}, store, log)
 	if err != nil {
 		log.Error("templates", "err", err)
@@ -178,6 +210,20 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// getint reads a whole number setting, exiting on a value that is not one.
+func getint(log *slog.Logger, key string, fallback int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		log.Error("setting must be a whole number", "key", key, "value", v)
+		os.Exit(1)
+	}
+	return n
 }
 
 // loadDotEnv fills variables that are not already set from a KEY=value file.

@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -79,4 +80,51 @@ func TestSweepKeepsRecentlyExpiredAddresses(t *testing.T) {
 	}
 	// A message whose RCPT was accepted just before expiry can still be saved.
 	save(t, s, recent.Token)
+}
+
+func TestMigrateAddsUserID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	old, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(`CREATE TABLE addresses (token TEXT PRIMARY KEY, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+		INSERT INTO addresses VALUES ('oldtoken', 1, 9999999999)`); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	a, err := s.AddressByToken(context.Background(), "oldtoken")
+	if err != nil || a.UserID != "" {
+		t.Errorf("old address = %+v %v", a, err)
+	}
+	if _, err := Open(path); err != nil {
+		t.Errorf("second open: %v", err)
+	}
+}
+
+func TestTake(t *testing.T) {
+	s := open(t)
+	ctx := context.Background()
+	for i := 1; i <= 3; i++ {
+		if n, err := s.Take(ctx, "x", "day", 3, time.Hour); err != nil || n != i {
+			t.Fatalf("take %d = %d %v", i, n, err)
+		}
+	}
+	if _, err := s.Take(ctx, "x", "day", 3, time.Hour); !errors.Is(err, ErrLimit) {
+		t.Errorf("over the limit: err = %v", err)
+	}
+	if n, _ := s.Count(ctx, "x", "day"); n != 3 {
+		t.Errorf("count = %d, want 3 (a refused take counts nothing)", n)
+	}
+	if n, err := s.Take(ctx, "x", "next day", 3, time.Hour); err != nil || n != 1 {
+		t.Errorf("new bucket = %d %v", n, err)
+	}
+	if _, err := s.Take(ctx, "y", "day", 0, time.Hour); !errors.Is(err, ErrLimit) {
+		t.Errorf("zero limit: err = %v", err)
+	}
 }

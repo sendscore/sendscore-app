@@ -15,7 +15,7 @@
 <body>
 <header class="bar">
   <a class="brand" href="/"><svg class="logo" viewBox="0 0 28 28" width="22" height="22" aria-hidden="true" focusable="false"><circle cx="14" cy="14" r="11.25" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="14" cy="14" r="8" fill="none" stroke="currentColor" stroke-width="1" stroke-dasharray="1.6 1.55"/><path d="M10 14.25l2.85 2.7 5.4-5.6" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="square"/></svg>SendScore</a>
-  <nav><a href="/">New test</a><a href="/upload">Check a saved email</a></nav>
+  <nav><a href="/">New test</a><a href="/upload">Check a saved email</a>{{if .User}}<span class="who">{{.User.Email}}</span><a href="/account">Account</a><form method="post" action="/signout" class="inline"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit" class="link">Sign out</button></form>{{else}}<a href="/signin">Sign in</a>{{end}}</nav>
 </header>
 <main>
 {{template "content" .}}
