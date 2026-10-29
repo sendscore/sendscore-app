@@ -21,7 +21,6 @@ import (
 
 	"github.com/sendscore/sendscore-app/internal/db"
 	"github.com/sendscore/sendscore/engine"
-	"github.com/sendscore/sendscore/verdict"
 )
 
 // MaxMessageBytes is the largest message accepted.
@@ -66,6 +65,8 @@ func New(cfg Config, store *db.Store, log *slog.Logger) *Receiver {
 	s.Addr = cfg.Addr
 	s.Domain = cfg.MailDomain
 	s.MaxMessageBytes = MaxMessageBytes
+	// A transaction is for one test address (see Rcpt); the cap only bounds
+	// how often a sender may repeat that address.
 	s.MaxRecipients = 10
 	s.ReadTimeout = 60 * time.Second
 	s.WriteTimeout = 60 * time.Second
@@ -80,8 +81,12 @@ func (r *Receiver) ListenAndServe() error { return r.server.ListenAndServe() }
 // Serve serves on an existing listener (tests).
 func (r *Receiver) Serve(l net.Listener) error { return r.server.Serve(l) }
 
-// Close stops the server.
+// Close stops the server, dropping open sessions.
 func (r *Receiver) Close() error { return r.server.Close() }
+
+// Shutdown stops accepting connections and waits until open sessions end or
+// ctx is done, so a message in DATA can finish its checks and be saved.
+func (r *Receiver) Shutdown(ctx context.Context) error { return r.server.Shutdown(ctx) }
 
 // NewSession implements smtp.Backend.
 func (r *Receiver) NewSession(c *smtp.Conn) (smtp.Session, error) {
@@ -93,21 +98,32 @@ func (r *Receiver) NewSession(c *smtp.Conn) (smtp.Session, error) {
 }
 
 type session struct {
-	r      *Receiver
-	conn   *smtp.Conn
-	ip     net.IP
-	from   string
-	tokens []string
-	rcpts  []string
+	r     *Receiver
+	conn  *smtp.Conn
+	ip    net.IP
+	from  string
+	token string
+	rcpt  string
 }
 
 func (s *session) Reset() {
-	s.from, s.tokens, s.rcpts = "", nil, nil
+	s.from, s.token, s.rcpt = "", "", ""
 }
 
 func (s *session) Logout() error { return nil }
 
+var errBadSender = &smtp.SMTPError{Code: 501, EnhancedCode: smtp.EnhancedCode{5, 1, 7}, Message: "Invalid sender address"}
+
 func (s *session) Mail(from string, _ *smtp.MailOptions) error {
+	// The sender is written into Return-Path, so refuse anything that could
+	// break that header. go-smtp lets a bare CR through, and unquotes a
+	// quoted local part that may hold angle brackets.
+	for _, c := range from {
+		if c < 0x20 || c == 0x7f || c == '<' || c == '>' {
+			s.from = ""
+			return errBadSender
+		}
+	}
 	s.from = from
 	return nil
 }
@@ -127,8 +143,14 @@ func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 		s.r.log.Error("address lookup", "err", err)
 		return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0}, Message: "Temporary failure, try again"}
 	}
-	s.tokens = append(s.tokens, token)
-	s.rcpts = append(s.rcpts, to)
+	switch {
+	case s.token == "":
+		s.token, s.rcpt = token, to
+	case s.token != token:
+		// One test address per transaction, so a message is stored once.
+		// RFC 5321 has the client send the rest in another transaction.
+		return &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 5, 3}, Message: "One test address per message, send to the others separately"}
+	}
 	return nil
 }
 
@@ -160,26 +182,17 @@ func (s *session) Data(rd io.Reader) error {
 	if err != nil {
 		return &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 6, 0}, Message: "Could not read the message: " + err.Error()}
 	}
-	for i, token := range s.tokens {
-		m := &db.Message{
-			Token: token, Source: "smtp", ReceivedAt: now, ExpiresAt: now.Add(s.r.cfg.ReportTTL),
-			RemoteIP: ipString(s.ip), Helo: env.Helo, MailFrom: s.from, RcptTo: s.rcpts[i],
-			TLS: &isTLS, Raw: stamped, Verdict: copyVerdict(v),
-		}
-		if err := s.r.store.SaveMessage(ctx, m); err != nil {
-			s.r.log.Error("save message", "err", err)
-			return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0}, Message: "Temporary failure, try again"}
-		}
-		s.r.log.Info("received", "report", m.ID, "from", s.from, "ip", m.RemoteIP, "verdict", v.Verdict)
+	m := &db.Message{
+		Token: s.token, Source: "smtp", ReceivedAt: now, ExpiresAt: now.Add(s.r.cfg.ReportTTL),
+		RemoteIP: ipString(s.ip), Helo: env.Helo, MailFrom: s.from, RcptTo: s.rcpt,
+		TLS: &isTLS, Raw: stamped, Verdict: v,
 	}
+	if err := s.r.store.SaveMessage(ctx, m); err != nil {
+		s.r.log.Error("save message", "err", err)
+		return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0}, Message: "Temporary failure, try again"}
+	}
+	s.r.log.Info("received", "report", m.ID, "from", s.from, "ip", m.RemoteIP, "verdict", v.Verdict)
 	return nil
-}
-
-// copyVerdict gives each recipient its own verdict, since saving one writes
-// its report ID into it.
-func copyVerdict(v *verdict.Verdict) *verdict.Verdict {
-	c := *v
-	return &c
 }
 
 // stripReturnPath drops any Return-Path the sender put in the message; only

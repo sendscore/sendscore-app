@@ -59,4 +59,16 @@ func TestRemoteMCP(t *testing.T) {
 	if got.Status != "received" || got.ReportID != m.ID {
 		t.Errorf("wait = %+v, want report %s", got, m.ID)
 	}
+
+	// With after_report_id, the report already seen does not answer again.
+	res, err = cs.CallTool(ctx, &mcp.CallToolParams{Name: "wait_for_message", Arguments: map[string]any{"token": addr.Token, "timeout_seconds": 1, "after_report_id": m.ID}})
+	if err != nil || res.IsError {
+		t.Fatalf("wait_for_message after: %v %+v", err, res)
+	}
+	got = mcpserver.WaitOut{}
+	b, _ = json.Marshal(res.StructuredContent)
+	json.Unmarshal(b, &got)
+	if got.Status != "not_received" {
+		t.Errorf("wait after %s = %+v, want not_received", m.ID, got)
+	}
 }

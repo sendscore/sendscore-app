@@ -28,28 +28,20 @@ func (b storeBackend) CreateTestAddress(ctx context.Context) (mcpserver.TestAddr
 	}, nil
 }
 
-func (b storeBackend) Wait(ctx context.Context, token string, timeout time.Duration) (*verdict.Verdict, error) {
+func (b storeBackend) Wait(ctx context.Context, token, after string, timeout time.Duration) (*verdict.Verdict, error) {
 	if _, err := b.a.store.AddressByToken(ctx, token); err != nil {
 		return nil, translate(err)
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	tick := time.NewTicker(time.Second)
-	defer tick.Stop()
-	for {
-		m, err := b.a.store.LatestForToken(ctx, token)
-		if err == nil {
-			return m.Verdict, nil
-		}
-		if !errors.Is(err, db.ErrNotFound) && ctx.Err() == nil {
-			return nil, err
-		}
-		select {
-		case <-ctx.Done():
-			return nil, mcpserver.ErrNotReceived
-		case <-tick.C:
-		}
+	m, err := b.a.wait(ctx, token, after, timeout)
+	switch {
+	case err == nil:
+		return m.Verdict, nil
+	case errors.Is(err, errNotReceived):
+		return nil, mcpserver.ErrNotReceived
+	case errors.Is(err, db.ErrUnknownAfter):
+		return nil, errors.New("after_report_id is not a report from this test address")
 	}
+	return nil, err
 }
 
 func (b storeBackend) Report(ctx context.Context, id string) (*verdict.Verdict, error) {

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -42,8 +43,12 @@ func main() {
 	baseURL := strings.TrimRight(getenv("SENDSCORE_BASE_URL", "http://"+httpAddr), "/")
 
 	lists := blocklists()
+	// Links are fetched with the engine's safe client, which refuses
+	// non-public addresses and never follows unsubscribe or confirm links.
+	checkLinks := os.Getenv("SENDSCORE_CHECK_LINKS") != "0"
 	app, err := web.New(web.Config{
 		Blocklists:  lists,
+		CheckLinks:  checkLinks,
 		BehindProxy: !isLocal(baseURL),
 		BaseURL:     baseURL,
 		MailDomain:  mailDomain,
@@ -71,6 +76,7 @@ func main() {
 		ReportTTL:  7 * 24 * time.Hour,
 		TLS:        tlsConfig,
 		Blocklists: lists,
+		CheckLinks: checkLinks,
 	}, store, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -101,9 +107,20 @@ func main() {
 	go sweep(ctx, store, log)
 
 	<-ctx.Done()
-	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Open long polls answer not_received at once, so agents call again
+	// instead of seeing a reset. Uploads and SMTP sessions in DATA get up to
+	// a minute to finish their checks (45 seconds) and save; a session
+	// still open after that, such as an idle one, is dropped, and the sender
+	// retries. A process manager's stop timeout must allow for that minute.
+	log.Info("shutting down")
+	app.StopWaits()
+	shutdown, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	_ = srv.Shutdown(shutdown)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); _ = srv.Shutdown(shutdown) }()
+	go func() { defer wg.Done(); _ = rcv.Shutdown(shutdown) }()
+	wg.Wait()
 	_ = rcv.Close()
 }
 

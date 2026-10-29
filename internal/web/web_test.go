@@ -154,3 +154,110 @@ func TestUpload(t *testing.T) {
 		t.Errorf("junk upload = %d", w.Code)
 	}
 }
+
+func saveMessage(t *testing.T, store *db.Store, token, source string) *db.Message {
+	t.Helper()
+	v, err := engine.Analyze(context.Background(), sample(t), engine.Options{Resolver: engine.OfflineResolver{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := store.Now()
+	m := &db.Message{Token: token, Source: source, ReceivedAt: now, ExpiresAt: now.Add(time.Hour), Raw: sample(t), Verdict: v}
+	if err := store.SaveMessage(context.Background(), m); err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+func TestWaitAfter(t *testing.T) {
+	_, store, h := newApp(t)
+	addr, _ := store.CreateAddress(context.Background(), time.Hour)
+	first := saveMessage(t, store, addr.Token, "smtp")
+	wait := "/api/v1/test-addresses/" + addr.Token + "/wait?timeout=1"
+
+	// Without after, the newest message counts, even one already there.
+	if w := do(h, "GET", wait, nil, ""); !strings.Contains(w.Body.String(), first.ID) {
+		t.Errorf("wait = %s, want %s", w.Body, first.ID)
+	}
+	// After the first report, the old one no longer answers.
+	if w := do(h, "GET", wait+"&after="+first.ID, nil, ""); !strings.Contains(w.Body.String(), `"not_received"`) {
+		t.Errorf("wait after first = %s", w.Body)
+	}
+	if w := do(h, "GET", "/t/"+addr.Token+"?after="+first.ID, nil, ""); w.Code != 200 {
+		t.Errorf("address page after first = %d", w.Code)
+	}
+	second := saveMessage(t, store, addr.Token, "smtp")
+	if w := do(h, "GET", wait+"&after="+first.ID, nil, ""); !strings.Contains(w.Body.String(), second.ID) {
+		t.Errorf("wait after first = %s, want %s", w.Body, second.ID)
+	}
+	if w := do(h, "GET", "/t/"+addr.Token+"?after="+first.ID, nil, ""); w.Header().Get("Location") != "/r/"+second.ID {
+		t.Errorf("address page after first = %d %s", w.Code, w.Header().Get("Location"))
+	}
+	if w := do(h, "GET", wait+"&after=rpt_other", nil, ""); w.Code != 400 {
+		t.Errorf("wait after an unknown report = %d %s", w.Code, w.Body)
+	}
+	if w := do(h, "GET", "/r/"+second.ID+"/raw", nil, ""); w.Code != 200 || !strings.Contains(w.Body.String(), "Shooting into the sun") {
+		t.Errorf("raw = %d", w.Code)
+	}
+	// The report page offers to wait for the next send.
+	if w := do(h, "GET", "/r/"+second.ID, nil, ""); !strings.Contains(w.Body.String(), "/t/"+addr.Token+"?after="+second.ID) {
+		t.Error("report page has no link to wait for the next send")
+	}
+}
+
+func TestStopWaitsAnswersOpenPolls(t *testing.T) {
+	a, store, h := newApp(t)
+	a.cfg.MaxWait = time.Minute
+	addr, _ := store.CreateAddress(context.Background(), time.Hour)
+	done := make(chan *httptest.ResponseRecorder)
+	go func() { done <- do(h, "GET", "/api/v1/test-addresses/"+addr.Token+"/wait?timeout=50", nil, "") }()
+	time.Sleep(100 * time.Millisecond)
+	a.StopWaits()
+	select {
+	case w := <-done:
+		if w.Code != 200 || !strings.Contains(w.Body.String(), `"not_received"`) {
+			t.Errorf("wait at shutdown = %d %s", w.Code, w.Body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("StopWaits did not end the long poll")
+	}
+}
+
+func TestUploadTooLarge(t *testing.T) {
+	_, _, h := newApp(t)
+	for _, size := range []int{MaxUploadBytes + 1, MaxUploadBytes + 2<<20} {
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		fw, _ := mw.CreateFormFile("message", "big.eml")
+		fw.Write(bytes.Repeat([]byte("a"), size))
+		mw.Close()
+		w := do(h, "POST", "/upload", &body, mw.FormDataContentType())
+		if w.Code != http.StatusRequestEntityTooLarge || !strings.Contains(w.Body.String(), "larger than 25 MB") {
+			t.Errorf("%d byte upload = %d", size, w.Code)
+		}
+	}
+}
+
+func TestUploadReportSaysSupplied(t *testing.T) {
+	_, _, h := newApp(t)
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	fw, _ := mw.CreateFormFile("message", "issue.eml")
+	fw.Write(sample(t))
+	mw.WriteField("ip", "203.0.113.10")
+	mw.WriteField("mail_from", "bounce@example.com")
+	mw.Close()
+	w := do(h, "POST", "/upload", &body, mw.FormDataContentType())
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("upload = %d %s", w.Code, w.Body)
+	}
+	page := do(h, "GET", w.Header().Get("Location"), nil, "").Body.String()
+	for _, want := range []string{"uploaded file, not a message SendScore received", "203.0.113.10 (supplied)", "bounce@example.com (supplied)"} {
+		if !strings.Contains(page, want) {
+			t.Errorf("upload report lacks %q", want)
+		}
+	}
+	if strings.Contains(page, "Fixed something?") {
+		t.Error("upload report offers to wait at a test address")
+	}
+}

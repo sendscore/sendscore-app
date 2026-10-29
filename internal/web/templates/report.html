@@ -3,9 +3,15 @@
   <p class="label">Report</p>
   <div>
     <h1>{{.V.Message.Subject}}</h1>
+    {{if eq .M.Source "upload"}}
+    <p class="muted">From {{.V.Message.From}} · uploaded {{when .V.Message.ReceivedAt}} · {{kb .V.Message.SizeBytes}}{{if .M.RemoteIP}} · sending IP {{.M.RemoteIP}} (supplied){{end}}{{if .M.MailFrom}} · envelope sender {{.M.MailFrom}} (supplied){{end}}</p>
+    <p class="upload-note">This report is for an uploaded file, not a message SendScore received. {{if or .M.RemoteIP .M.MailFrom}}The sending IP and envelope sender were entered by whoever uploaded it, so SPF and reverse DNS reflect what they entered, not a delivery SendScore saw.{{else}}No sending IP was given, so SPF, reverse DNS, and TLS were not checked.{{end}}</p>
+    {{else}}
     <p class="muted">From {{.V.Message.From}} · received {{when .V.Message.ReceivedAt}} · {{kb .V.Message.SizeBytes}}{{if .M.RemoteIP}} · from {{.M.RemoteIP}}{{end}}</p>
+    {{end}}
     <p class="verdict s-{{status .V.Verdict}}"><span class="mark">{{status .V.Verdict}}</span> {{.V.Summary}}</p>
     <p>Ready to send: <strong>{{if .V.ReadyToSend}}yes{{else}}no{{end}}</strong></p>
+    {{if .M.Token}}<p class="muted">Fixed something? Send it again to <code>t-{{.M.Token}}@{{.MailDomain}}</code> and <a href="/t/{{.M.Token}}?after={{.M.ID}}">wait for the new report</a>.</p>{{end}}
   </div>
 </section>
 

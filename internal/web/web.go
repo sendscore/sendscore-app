@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sendscore/sendscore-app/internal/db"
@@ -34,8 +35,11 @@ type Config struct {
 	MailDomain string
 	AddressTTL time.Duration
 	ReportTTL  time.Duration
-	// MaxWait bounds the long poll behind wait_for_message.
+	// MaxWait bounds the long poll behind wait_for_message. It defaults to
+	// 50 seconds, below the 60 second idle timeouts of common proxies.
 	MaxWait time.Duration
+	// CheckLinks fetches the links and images in uploaded messages.
+	CheckLinks bool
 	// Resolver overrides DNS for uploads (tests).
 	Resolver engine.Resolver
 	// Blocklists are the domain blocklists uploads are checked against.
@@ -45,20 +49,35 @@ type Config struct {
 	BehindProxy bool
 }
 
+// MaxUploadBytes is the largest upload checked, the same as the largest
+// message the receiver accepts.
+const MaxUploadBytes = 25 << 20
+
+const tooLargeMessage = "This file is larger than 25 MB, which is the largest message SendScore checks."
+
 // App is the web application.
 type App struct {
 	cfg   Config
 	store *db.Store
 	log   *slog.Logger
 	tmpl  map[string]*template.Template
+
+	// quit is closed by StopWaits, so long polls answer before shutdown.
+	quit     chan struct{}
+	quitOnce sync.Once
 }
+
+// StopWaits makes every open and future long poll answer at once, as if its
+// timeout had passed. Call it before shutting the HTTP server down, which
+// waits for handlers but never cancels them.
+func (a *App) StopWaits() { a.quitOnce.Do(func() { close(a.quit) }) }
 
 // New builds the app.
 func New(cfg Config, store *db.Store, log *slog.Logger) (*App, error) {
 	if cfg.MaxWait == 0 {
-		cfg.MaxWait = 60 * time.Second
+		cfg.MaxWait = 50 * time.Second
 	}
-	a := &App{cfg: cfg, store: store, log: log, tmpl: map[string]*template.Template{}}
+	a := &App{cfg: cfg, store: store, log: log, tmpl: map[string]*template.Template{}, quit: make(chan struct{})}
 	funcs := template.FuncMap{
 		"lower":  strings.ToLower,
 		"status": func(s verdict.Status) string { return string(s) },
@@ -162,9 +181,14 @@ func (a *App) addressPage(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, http.StatusNotFound, "This test address does not exist, or it has expired.")
 		return
 	}
-	m, err := a.store.LatestForToken(r.Context(), token)
+	// After a report, the page waits for the next message instead.
+	m, err := a.store.LatestForToken(r.Context(), token, r.URL.Query().Get("after"))
 	if err == nil {
 		http.Redirect(w, r, "/r/"+m.ID, http.StatusSeeOther)
+		return
+	}
+	if errors.Is(err, db.ErrUnknownAfter) {
+		a.fail(w, http.StatusNotFound, "That report did not come from this test address.")
 		return
 	}
 	a.render(w, http.StatusOK, "address", map[string]any{
@@ -178,16 +202,25 @@ func (a *App) uploadForm(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) upload(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 26<<20)
+	// The body may be a little larger than the file, for the form fields.
+	r.Body = http.MaxBytesReader(w, r.Body, MaxUploadBytes+1<<20)
 	file, _, err := r.FormFile("message")
 	if err != nil {
+		if tooLarge := (*http.MaxBytesError)(nil); errors.As(err, &tooLarge) {
+			a.fail(w, http.StatusRequestEntityTooLarge, tooLargeMessage)
+			return
+		}
 		a.fail(w, http.StatusBadRequest, "Choose an .eml file to check.")
 		return
 	}
 	defer file.Close()
-	raw, err := io.ReadAll(io.LimitReader(file, 25<<20))
+	raw, err := io.ReadAll(io.LimitReader(file, MaxUploadBytes+1))
 	if err != nil {
 		a.fail(w, http.StatusBadRequest, "Could not read the file.")
+		return
+	}
+	if len(raw) > MaxUploadBytes {
+		a.fail(w, http.StatusRequestEntityTooLarge, tooLargeMessage)
 		return
 	}
 	env := engine.Envelope{MailFrom: strings.TrimSpace(r.FormValue("mail_from"))}
@@ -202,7 +235,10 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 	// Bounded well inside the server's write timeout.
 	actx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
-	v, err := engine.Analyze(actx, raw, engine.Options{Envelope: env, Resolver: a.cfg.Resolver, Blocklists: a.cfg.Blocklists, ReceivedAt: now})
+	v, err := engine.Analyze(actx, raw, engine.Options{
+		Envelope: env, Resolver: a.cfg.Resolver, CheckLinks: a.cfg.CheckLinks,
+		Blocklists: a.cfg.Blocklists, ReceivedAt: now,
+	})
 	if err != nil {
 		a.fail(w, http.StatusBadRequest, "That file is not an email message: "+err.Error())
 		return
@@ -258,14 +294,15 @@ func (a *App) reportPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) rawMessage(w http.ResponseWriter, r *http.Request) {
-	m, err := a.store.MessageByID(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	raw, err := a.store.RawByID(r.Context(), id)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Content-Disposition", `inline; filename="`+m.ID+`.eml"`)
-	w.Write(m.Raw)
+	w.Header().Set("Content-Disposition", `inline; filename="`+id+`.eml"`)
+	w.Write(raw)
 }
 
 // API
@@ -299,7 +336,8 @@ func (a *App) apiCreateAddress(w http.ResponseWriter, r *http.Request) {
 }
 
 // apiWait long-polls until a message arrives at the address or the timeout
-// passes. It answers 200 either way; status says which.
+// passes. It answers 200 either way; status says which. With ?after=<report
+// id>, only a message received after that report counts.
 func (a *App) apiWait(w http.ResponseWriter, r *http.Request) {
 	token := r.PathValue("token")
 	if _, err := a.store.AddressByToken(r.Context(), token); err != nil {
@@ -315,31 +353,48 @@ func (a *App) apiWait(w http.ResponseWriter, r *http.Request) {
 		}
 		timeout = time.Duration(n) * time.Second
 	}
-	timeout = min(timeout, a.cfg.MaxWait)
+	m, err := a.wait(r.Context(), token, r.URL.Query().Get("after"), timeout)
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status": "received", "report_id": m.ID,
+			"report_url": a.cfg.BaseURL + "/r/" + m.ID,
+			"verdict":    m.Verdict,
+		})
+	case errors.Is(err, errNotReceived):
+		writeJSON(w, http.StatusOK, map[string]any{"status": "not_received"})
+	case errors.Is(err, db.ErrUnknownAfter):
+		apiError(w, http.StatusBadRequest, "after must be a report_id from this test address")
+	default:
+		a.log.Error("wait", "err", err)
+		apiError(w, http.StatusInternalServerError, "lookup failed")
+	}
+}
 
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
+var errNotReceived = errors.New("not received")
+
+// wait polls for a message at the address, newer than the after report when
+// one is given, for up to timeout (capped at MaxWait). It returns
+// errNotReceived when the timeout passes, the request ends, or StopWaits is
+// called.
+func (a *App) wait(ctx context.Context, token, after string, timeout time.Duration) (*db.Message, error) {
+	ctx, cancel := context.WithTimeout(ctx, min(timeout, a.cfg.MaxWait))
 	defer cancel()
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
-		m, err := a.store.LatestForToken(ctx, token)
-		if err == nil {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"status": "received", "report_id": m.ID,
-				"report_url": a.cfg.BaseURL + "/r/" + m.ID,
-				"verdict":    m.Verdict,
-			})
-			return
+		m, err := a.store.LatestForToken(ctx, token, after)
+		if err == nil || errors.Is(err, db.ErrUnknownAfter) {
+			return m, err
 		}
 		if !errors.Is(err, db.ErrNotFound) && ctx.Err() == nil {
-			a.log.Error("wait", "err", err)
-			apiError(w, http.StatusInternalServerError, "lookup failed")
-			return
+			return nil, err
 		}
 		select {
 		case <-ctx.Done():
-			writeJSON(w, http.StatusOK, map[string]any{"status": "not_received"})
-			return
+			return nil, errNotReceived
+		case <-a.quit:
+			return nil, errNotReceived
 		case <-tick.C:
 		}
 	}

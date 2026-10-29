@@ -39,17 +39,22 @@ Settings (environment, or `.env.local`):
 | `SENDSCORE_SPAMHAUS_DQS_KEY` | unset: no Spamhaus lookups. A Spamhaus DQS key, which allows commercial use. The hosted service must use this. |
 | `SENDSCORE_SURBL_ZONE` | unset: no SURBL lookups. A SURBL data feed zone, for subscribers. |
 | `SENDSCORE_PUBLIC_BLOCKLISTS` | unset. `1` uses the free public Spamhaus and SURBL zones, which are for non-commercial use only (a personal self-hosted instance). |
+| `SENDSCORE_CHECK_LINKS` | on. Fetches every link and image in received and uploaded messages, with a client that refuses private and loopback addresses and never fetches unsubscribe, confirm, or preference links. `0` turns it off, and `content.links` and `content.images` are skipped. |
 | `SENDSCORE_TLS_CERT`, `SENDSCORE_TLS_KEY` | unset: STARTTLS off. Production must set them (a certificate for the mail domain), or every message fails `auth.tls`. |
 
 ## API
 
 - `POST /api/v1/test-addresses` returns `address`, `token`, `expires_at`, `wait_url`, and `page_url`.
-- `GET /api/v1/test-addresses/{token}/wait?timeout=30` long-polls (at most 60 seconds) and returns `{"status": "received", "report_id", "verdict"}` or `{"status": "not_received"}`.
+- `GET /api/v1/test-addresses/{token}/wait?timeout=30` long-polls (at most 50 seconds, below common proxy timeouts) and returns `{"status": "received", "report_id", "report_url", "verdict"}` or `{"status": "not_received"}`. It returns the newest message at the address, even one that arrived before the call. To check a second send to the same address, add `&after=<report_id>` with the earlier report, and only a newer message counts; an `after` that is not a report from this address is a 400. The page `/t/{token}?after=<report_id>` waits the same way.
 - `GET /api/v1/reports/{id}` returns the verdict JSON.
 
-- `/api/mcp` is the remote MCP connector (streamable HTTP) with `get_test_address`, `wait_for_message`, `get_report`, and `compare_to_previous`. The tools live in the engine repository's `mcpserver` package; here they read the database directly.
+- `/api/mcp` is the remote MCP connector (streamable HTTP) with `get_test_address`, `wait_for_message` (with an optional `after_report_id`, as `after` above), `get_report`, and `compare_to_previous`. The tools live in the engine repository's `mcpserver` package; here they read the database directly.
 
-Addresses accept mail for 24 hours; reports are kept for 7 days.
+Addresses accept mail for 24 hours; reports are kept for 7 days. A message is checked once per transaction and for one test address: a repeated `RCPT` for the same address is accepted once, and a second address gets a 452, so the sender delivers it separately. A `MAIL FROM` with control characters or angle brackets gets a 501. Uploads and messages are limited to 25 MB, and a larger upload is refused, never cut short.
+
+Upload reports say they came from an upload, and mark the sending IP and envelope sender as supplied by the uploader, since SendScore did not see the delivery.
+
+On shutdown (SIGTERM), open waits answer `not_received` at once, and uploads and SMTP sessions get up to a minute to finish their checks and save; anything still open after that is dropped and retried by the sender. Give the process manager a stop timeout of more than a minute (systemd's default is 90 seconds).
 
 ## Not built yet
 

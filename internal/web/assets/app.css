@@ -47,6 +47,7 @@ summary::-webkit-details-marker { display: none; }
 .s-info .mark { color: var(--info); }
 .s-skipped .mark { color: var(--skipped); }
 .verdict { font-size: 18px; }
+.upload-note { border-left: 3px solid var(--warn); padding-left: 12px; }
 pre { background: #181818; border: 1px solid var(--line); padding: 12px; overflow-x: auto; font-size: 13px; }
 details p { margin: 8px 0 8px 4.5em; font-size: 15px; }
 details pre { margin-left: 4.5em; }

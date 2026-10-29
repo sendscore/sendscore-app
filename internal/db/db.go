@@ -25,6 +25,10 @@ var schema string
 // ErrNotFound is returned when a row does not exist or has expired.
 var ErrNotFound = errors.New("not found")
 
+// ErrUnknownAfter is returned when a wait names an after report that is not
+// one of the address's reports.
+var ErrUnknownAfter = errors.New("unknown after report")
+
 // Store wraps the database.
 type Store struct {
 	DB  *sql.DB
@@ -110,8 +114,10 @@ type Message struct {
 	MailFrom   string
 	RcptTo     string
 	TLS        *bool
-	Raw        []byte
-	Verdict    *verdict.Verdict
+	// Raw is written by SaveMessage but never loaded by the queries that
+	// read a message, since it can be 25 MB; RawByID loads it.
+	Raw     []byte
+	Verdict *verdict.Verdict
 }
 
 // SaveMessage stores a message. ID is assigned and written into the verdict.
@@ -136,14 +142,14 @@ func (s *Store) SaveMessage(ctx context.Context, m *Message) error {
 	return err
 }
 
-const messageCols = `id, COALESCE(token, ''), source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, raw, verdict`
+const messageCols = `id, COALESCE(token, ''), source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, verdict`
 
 func scanMessage(row interface{ Scan(...any) error }) (*Message, error) {
 	m := &Message{}
 	var received, expires int64
 	var tls sql.NullBool
 	var vj string
-	if err := row.Scan(&m.ID, &m.Token, &m.Source, &received, &expires, &m.RemoteIP, &m.Helo, &m.MailFrom, &m.RcptTo, &tls, &m.Raw, &vj); err != nil {
+	if err := row.Scan(&m.ID, &m.Token, &m.Source, &received, &expires, &m.RemoteIP, &m.Helo, &m.MailFrom, &m.RcptTo, &tls, &vj); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -167,22 +173,54 @@ func (s *Store) MessageByID(ctx context.Context, id string) (*Message, error) {
 		`SELECT `+messageCols+` FROM messages WHERE id = ? AND expires_at > ?`, id, s.Now().Unix()))
 }
 
-// LatestForToken returns the newest message received at a test address.
-func (s *Store) LatestForToken(ctx context.Context, token string) (*Message, error) {
-	return scanMessage(s.DB.QueryRowContext(ctx,
-		`SELECT `+messageCols+` FROM messages WHERE token = ? AND expires_at > ? ORDER BY received_at DESC, rowid DESC LIMIT 1`,
-		strings.ToLower(token), s.Now().Unix()))
+// RawByID returns the raw message of a report that has not expired.
+func (s *Store) RawByID(ctx context.Context, id string) ([]byte, error) {
+	var raw []byte
+	err := s.DB.QueryRowContext(ctx, `SELECT raw FROM messages WHERE id = ? AND expires_at > ?`, id, s.Now().Unix()).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return raw, err
 }
 
-// Sweep deletes expired messages and addresses with no messages left.
+// LatestForToken returns the newest message received at a test address.
+// With after set to one of the address's report IDs, it returns only a
+// message saved after that report, so a second send to the same address is
+// never answered with the first one's report. It returns ErrNotFound when
+// there is no such message yet, and ErrUnknownAfter when after is not a
+// report from this address.
+func (s *Store) LatestForToken(ctx context.Context, token, after string) (*Message, error) {
+	token = strings.ToLower(token)
+	var since int64
+	if after != "" {
+		err := s.DB.QueryRowContext(ctx, `SELECT rowid FROM messages WHERE id = ? AND token = ?`, after, token).Scan(&since)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrUnknownAfter
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return scanMessage(s.DB.QueryRowContext(ctx,
+		`SELECT `+messageCols+` FROM messages WHERE token = ? AND expires_at > ? AND rowid > ? ORDER BY rowid DESC LIMIT 1`,
+		token, s.Now().Unix(), since))
+}
+
+// AddressGrace is how long past expiry Sweep keeps an address, so a message
+// whose RCPT was accepted just before expiry can still be saved after its
+// checks finish.
+const AddressGrace = time.Hour
+
+// Sweep deletes expired messages, and addresses that expired more than
+// AddressGrace ago and have no messages left.
 func (s *Store) Sweep(ctx context.Context) (int64, error) {
-	now := s.Now().Unix()
-	res, err := s.DB.ExecContext(ctx, `DELETE FROM messages WHERE expires_at <= ?`, now)
+	now := s.Now()
+	res, err := s.DB.ExecContext(ctx, `DELETE FROM messages WHERE expires_at <= ?`, now.Unix())
 	if err != nil {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
 	_, err = s.DB.ExecContext(ctx, `DELETE FROM addresses WHERE expires_at <= ?
-		AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.token = addresses.token)`, now)
+		AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.token = addresses.token)`, now.Add(-AddressGrace).Unix())
 	return n, err
 }

@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"math/big"
 	"net"
+	"net/textproto"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,15 +86,22 @@ func TestReceivesAndStoresVerdict(t *testing.T) {
 	if err := deliver(addr, "bounce@real.test", "t-"+a.Token+"@in.test", raw); err != nil {
 		t.Fatal(err)
 	}
-	m, err := store.LatestForToken(context.Background(), a.Token)
+	m, err := store.LatestForToken(context.Background(), a.Token, "")
 	if err != nil {
 		t.Fatal(err)
+	}
+	raw, err = store.RawByID(context.Background(), m.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Raw != nil {
+		t.Error("LatestForToken loaded the raw message")
 	}
 	if m.RemoteIP != "127.0.0.1" || m.Helo != "mail.sender.test" || m.MailFrom != "bounce@real.test" {
 		t.Errorf("envelope = %q %q %q", m.RemoteIP, m.Helo, m.MailFrom)
 	}
-	if strings.Contains(string(m.Raw), "forged@evil.test") || !strings.HasPrefix(string(m.Raw), "Return-Path: <bounce@real.test>") {
-		t.Errorf("Return-Path not replaced:\n%s", m.Raw[:200])
+	if strings.Contains(string(raw), "forged@evil.test") || !strings.HasPrefix(string(raw), "Return-Path: <bounce@real.test>") {
+		t.Errorf("Return-Path not replaced:\n%s", raw[:200])
 	}
 	if m.Verdict.ID != m.ID || m.Verdict.Fingerprint.ReturnPathDomain != "real.test" {
 		t.Errorf("verdict id %q, return path %q", m.Verdict.ID, m.Verdict.Fingerprint.ReturnPathDomain)
@@ -113,6 +121,66 @@ func TestRefusesUnknownAndExpiredAddresses(t *testing.T) {
 		if se, ok := err.(*smtp.SMTPError); !ok || se.Code != 550 {
 			t.Errorf("%s: err = %v, want 550", to, err)
 		}
+	}
+}
+
+func TestRefusesSendersThatBreakReturnPath(t *testing.T) {
+	store, addr := start(t)
+	// The go-smtp client refuses to send these, so speak SMTP by hand.
+	for _, from := range []string{"a@b.example\rX-Injected:yes", `"x>y"@b.example`, `"x<y"@b.example`, "a\x01@b.example"} {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tc := textproto.NewConn(conn)
+		tc.ReadResponse(220)
+		tc.PrintfLine("EHLO mail.sender.test")
+		tc.ReadResponse(250)
+		tc.PrintfLine("MAIL FROM:<%s>", from)
+		code, _, _ := tc.ReadResponse(250)
+		tc.Close()
+		if code != 501 {
+			t.Errorf("%q: code = %d, want 501", from, code)
+		}
+	}
+	var n int
+	store.DB.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&n)
+	if n != 0 {
+		t.Errorf("stored %d messages", n)
+	}
+}
+
+func TestOneTestAddressPerTransaction(t *testing.T) {
+	store, addr := start(t)
+	ctx := context.Background()
+	a, _ := store.CreateAddress(ctx, time.Hour)
+	b, _ := store.CreateAddress(ctx, time.Hour)
+	c, err := smtp.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Hello("mail.sender.test")
+	if err := c.Mail("bounce@real.test", nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := c.Rcpt("t-"+a.Token+"@in.test", nil); err != nil {
+			t.Fatalf("repeated RCPT %d: %v", i, err)
+		}
+	}
+	if err := c.Rcpt("t-"+b.Token+"@in.test", nil); err == nil || err.(*smtp.SMTPError).Code != 452 {
+		t.Errorf("second address: err = %v, want 452", err)
+	}
+	w, _ := c.Data()
+	w.Write(sample(t))
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	store.DB.QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&n)
+	if n != 1 {
+		t.Errorf("stored %d messages, want 1", n)
 	}
 }
 
@@ -149,7 +217,7 @@ func TestStartTLS(t *testing.T) {
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	m, err := store.LatestForToken(context.Background(), a.Token)
+	m, err := store.LatestForToken(context.Background(), a.Token, "")
 	if err != nil {
 		t.Fatal(err)
 	}
