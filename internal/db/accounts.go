@@ -341,3 +341,56 @@ func (s *Store) Count(ctx context.Context, name, bucket string) (int, error) {
 	}
 	return n, err
 }
+
+// DeleteUser deletes an account and everything that belongs to it, in one
+// transaction: its test addresses, its publications, every message received
+// at either or uploaded while signed in (raw bodies with them), its alerts,
+// sessions, sign-in links, known browsers, API tokens, OAuth codes and
+// tokens, usage counters, and subscription. The messages are deleted by
+// hand rather than left to the foreign keys, which would keep an upload as
+// an anonymous row. Creem events are kept, since they are the payment
+// record, with the account taken off them. OAuth clients are shared
+// registrations with no owner, so they stay. An unknown id is ErrNotFound.
+func (s *Store) DeleteUser(ctx context.Context, userID string) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // a no-op after commit
+	var email string
+	err = tx.QueryRowContext(ctx, `SELECT email FROM users WHERE id = ?`, userID).Scan(&email)
+	if errors.Is(err, sql.ErrNoRows) || userID == "" {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	for _, q := range []struct {
+		query string
+		args  []any
+	}{
+		{`DELETE FROM messages WHERE user_id = ?1
+			OR token IN (SELECT token FROM addresses WHERE user_id = ?1)
+			OR publication_id IN (SELECT id FROM publications WHERE user_id = ?1)`, []any{userID}},
+		{`DELETE FROM alerts WHERE publication_id IN (SELECT id FROM publications WHERE user_id = ?)`, []any{userID}},
+		{`DELETE FROM publications WHERE user_id = ?`, []any{userID}},
+		{`DELETE FROM addresses WHERE user_id = ?`, []any{userID}},
+		{`DELETE FROM sessions WHERE user_id = ?`, []any{userID}},
+		{`DELETE FROM api_tokens WHERE user_id = ?`, []any{userID}},
+		{`DELETE FROM oauth_codes WHERE user_id = ?`, []any{userID}},
+		{`DELETE FROM oauth_tokens WHERE user_id = ?`, []any{userID}},
+		{`DELETE FROM login_tokens WHERE email = ?`, []any{email}},
+		{`DELETE FROM known_browsers WHERE email = ?`, []any{email}},
+		// Counters about an account are named <what>:user:<id>. Ids are
+		// base32 with a prefix, so they hold no GLOB wildcard.
+		{`DELETE FROM counters WHERE name GLOB '*:user:' || ?`, []any{userID}},
+		{`DELETE FROM subscriptions WHERE user_id = ?`, []any{userID}},
+		{`UPDATE creem_events SET user_id = NULL WHERE user_id = ?`, []any{userID}},
+		{`DELETE FROM users WHERE id = ?`, []any{userID}},
+	} {
+		if _, err := tx.ExecContext(ctx, q.query, q.args...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}

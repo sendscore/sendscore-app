@@ -1,0 +1,26 @@
+{{define "content"}}
+<section class="sheet">
+  <p class="label">Delete</p>
+  <div>
+    <h1>Delete your account?</h1>
+    {{if .Blocked}}
+    <p class="error">{{.Blocked}}</p>
+    {{if .Manage}}<form method="post" action="/account/billing/portal" class="form"><input type="hidden" name="csrf" value="{{.CSRF}}"><button type="submit">Manage billing</button></form>{{end}}
+    <p><a href="/account">Back to your account</a></p>
+    {{else}}
+    <p>This deletes the account for <strong>{{.User.Email}}</strong> and everything in it. That means its test addresses, every message and report received or uploaded (with the original messages), its monitored newsletters and their history and alerts, its API tokens, its connected apps, and its sign-in sessions. It cannot be undone.</p>
+    {{if .Paying}}<p class="notice">This account has a subscription at Creem. SendScore cancels it first, straight away, so nothing more is charged. If Creem cannot cancel it, nothing is deleted.</p>{{end}}
+    <p>Mail sent to the account's addresses afterwards is refused. Signing in again with the same email starts a new, empty account.</p>
+    {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+    <form method="post" action="/account/delete" class="form">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <label>Type your email address to confirm<input type="email" name="email" autocomplete="off" required></label>
+      <div class="consent">
+        <button type="submit" class="danger">Delete my account</button>
+        <a class="button secondary" href="/account">Keep it</a>
+      </div>
+    </form>
+    {{end}}
+  </div>
+</section>
+{{end}}

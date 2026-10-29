@@ -28,6 +28,10 @@ type fakeCreem struct {
 	mu       sync.Mutex
 	requests []fakeRequest
 	fail     bool
+	// cancelStatus is what a cancel is answered with, 200 when zero, and
+	// onCancel runs as a cancel arrives.
+	cancelStatus int
+	onCancel     func()
 }
 
 type fakeRequest struct {
@@ -41,8 +45,11 @@ func (f *fakeCreem) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(b, &body)
 	f.mu.Lock()
 	f.requests = append(f.requests, fakeRequest{r.URL.Path, body})
-	fail := f.fail
+	fail, cancelStatus, onCancel := f.fail, f.cancelStatus, f.onCancel
 	f.mu.Unlock()
+	if onCancel != nil && strings.HasSuffix(r.URL.Path, "/cancel") {
+		onCancel()
+	}
 	if fail || r.Header.Get("x-api-key") != "creem_test_key" {
 		http.Error(w, `{"message":"no"}`, http.StatusBadGateway)
 		return
@@ -52,6 +59,12 @@ func (f *fakeCreem) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, `{"id":"ch_1","checkout_url":"https://checkout.creem.io/ch_1"}`)
 	case "/v1/customers/billing":
 		io.WriteString(w, `{"customer_portal_link":"https://creem.io/portal/`+body["customer_id"].(string)+`"}`)
+	case "/v1/subscriptions/sub_1/cancel":
+		if cancelStatus != 0 {
+			http.Error(w, `{"message":"no"}`, cancelStatus)
+			return
+		}
+		io.WriteString(w, `{"id":"sub_1","status":"canceled"}`)
 	default:
 		http.NotFound(w, r)
 	}

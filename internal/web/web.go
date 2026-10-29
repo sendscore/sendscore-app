@@ -174,7 +174,7 @@ func New(cfg Config, store *db.Store, log *slog.Logger) (*App, error) {
 		"worsened": worsened,
 	}
 	for _, page := range []string{"home", "address", "report", "upload", "error", "signin", "account", "consent",
-		"newsletters", "newsletter", "newsletter_form", "newsletter_delete", "message"} {
+		"newsletters", "newsletter", "newsletter_form", "newsletter_delete", "message", "account_delete"} {
 		t, err := template.New("layout.html").Funcs(funcs).ParseFS(templateFS, "templates/layout.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, err
@@ -216,6 +216,9 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("POST /account/tokens", a.form(formLimit, a.createToken))
 	mux.HandleFunc("POST /account/tokens/{id}/revoke", a.form(formLimit, a.revokeToken))
 	mux.HandleFunc("POST /account/apps/{id}/disconnect", a.form(formLimit, a.disconnect))
+	// Deleting the account (see delete.go). Web only, never the API.
+	mux.HandleFunc("GET /account/delete", a.deleteAccountForm)
+	mux.HandleFunc("POST /account/delete", a.form(formLimit, a.deleteAccount))
 	if a.cfg.Billing != nil {
 		// Billing (see billing.go). The webhook is under /api/, so it gets no
 		// session or CSRF cookie: its signature is its authentication.
@@ -310,7 +313,8 @@ func (a *App) address(token string) string {
 }
 
 func (a *App) home(w http.ResponseWriter, r *http.Request) {
-	a.render(w, r, http.StatusOK, "home", map[string]any{"Title": "Check a newsletter"})
+	deleted := r.URL.Query().Get("deleted") == "1" && userFrom(r.Context()) == nil
+	a.render(w, r, http.StatusOK, "home", map[string]any{"Title": "Check a newsletter", "Deleted": deleted})
 }
 
 func (a *App) createAddressPage(w http.ResponseWriter, r *http.Request) {

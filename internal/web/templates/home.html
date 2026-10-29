@@ -1,5 +1,9 @@
 {{define "content"}}
-<section class="sheet">
+{{if .Deleted}}<section class="sheet">
+  <p class="label">Deleted</p>
+  <div><p class="notice">Your account and everything in it were deleted.</p></div>
+</section>
+{{end}}<section class="sheet">
   <p class="label">Check</p>
   <div>
     <h1>Check a newsletter before it goes out</h1>
