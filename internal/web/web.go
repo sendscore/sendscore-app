@@ -89,6 +89,9 @@ func (a *App) Routes() http.Handler {
 	assets, _ := fs.Sub(assetFS, "assets")
 	mux.Handle("GET /assets/", http.StripPrefix("/assets/", http.FileServerFS(assets)))
 
+	mux.HandleFunc("GET /favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/assets/images/favicon.ico", http.StatusMovedPermanently)
+	})
 	mux.HandleFunc("GET /{$}", a.home)
 	mux.HandleFunc("POST /test", a.createAddressPage)
 	mux.HandleFunc("GET /t/{token}", a.addressPage)
