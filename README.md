@@ -36,6 +36,9 @@ Settings (environment, or `.env.local`):
 | `SENDSCORE_MAIL_DOMAIN` | `localhost` (production: the domain the MX record points here) |
 | `SENDSCORE_BASE_URL` | `http://` plus the web address |
 | `SENDSCORE_DB` | `sendscore.db` |
+| `SENDSCORE_SPAMHAUS_DQS_KEY` | unset: no Spamhaus lookups. A Spamhaus DQS key, which allows commercial use. The hosted service must use this. |
+| `SENDSCORE_SURBL_ZONE` | unset: no SURBL lookups. A SURBL data feed zone, for subscribers. |
+| `SENDSCORE_PUBLIC_BLOCKLISTS` | unset. `1` uses the free public Spamhaus and SURBL zones, which are for non-commercial use only (a personal self-hosted instance). |
 | `SENDSCORE_TLS_CERT`, `SENDSCORE_TLS_KEY` | unset: STARTTLS off. Production must set them (a certificate for the mail domain), or every message fails `auth.tls`. |
 
 ## API

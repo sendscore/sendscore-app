@@ -38,6 +38,8 @@ type Config struct {
 	MaxWait time.Duration
 	// Resolver overrides DNS for uploads (tests).
 	Resolver engine.Resolver
+	// Blocklists are the domain blocklists uploads are checked against.
+	Blocklists []engine.Blocklist
 	// BehindProxy is set when a reverse proxy on the same machine forwards
 	// public requests, so loopback connections carry a public Host header.
 	BehindProxy bool
@@ -197,7 +199,10 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	now := a.store.Now().UTC()
-	v, err := engine.Analyze(r.Context(), raw, engine.Options{Envelope: env, Resolver: a.cfg.Resolver, ReceivedAt: now})
+	// Bounded well inside the server's write timeout.
+	actx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	v, err := engine.Analyze(actx, raw, engine.Options{Envelope: env, Resolver: a.cfg.Resolver, Blocklists: a.cfg.Blocklists, ReceivedAt: now})
 	if err != nil {
 		a.fail(w, http.StatusBadRequest, "That file is not an email message: "+err.Error())
 		return

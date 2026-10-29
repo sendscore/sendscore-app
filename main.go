@@ -20,6 +20,7 @@ import (
 	"github.com/sendscore/sendscore-app/internal/db"
 	"github.com/sendscore/sendscore-app/internal/receiver"
 	"github.com/sendscore/sendscore-app/internal/web"
+	"github.com/sendscore/sendscore/engine"
 )
 
 func main() {
@@ -40,7 +41,9 @@ func main() {
 	mailDomain := getenv("SENDSCORE_MAIL_DOMAIN", "localhost")
 	baseURL := strings.TrimRight(getenv("SENDSCORE_BASE_URL", "http://"+httpAddr), "/")
 
+	lists := blocklists()
 	app, err := web.New(web.Config{
+		Blocklists:  lists,
 		BehindProxy: !isLocal(baseURL),
 		BaseURL:     baseURL,
 		MailDomain:  mailDomain,
@@ -67,6 +70,7 @@ func main() {
 		MailDomain: mailDomain,
 		ReportTTL:  7 * 24 * time.Hour,
 		TLS:        tlsConfig,
+		Blocklists: lists,
 	}, store, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -119,6 +123,27 @@ func sweep(ctx context.Context, store *db.Store, log *slog.Logger) {
 		case <-t.C:
 		}
 	}
+}
+
+// blocklists reads which domain blocklists to use. The free public zones
+// are for non-commercial use, so the hosted service uses a Spamhaus DQS key;
+// a personal self-hosted instance may turn the public zones on instead.
+func blocklists() []engine.Blocklist {
+	var out []engine.Blocklist
+	public := os.Getenv("SENDSCORE_PUBLIC_BLOCKLISTS") == "1"
+	switch key := os.Getenv("SENDSCORE_SPAMHAUS_DQS_KEY"); {
+	case key != "":
+		out = append(out, engine.SpamhausDQS(key))
+	case public:
+		out = append(out, engine.SpamhausPublic())
+	}
+	switch zone := os.Getenv("SENDSCORE_SURBL_ZONE"); {
+	case zone != "":
+		out = append(out, engine.SURBLZone(zone))
+	case public:
+		out = append(out, engine.SURBLPublic())
+	}
+	return out
 }
 
 // isLocal reports whether the public URL is this machine, as in development.

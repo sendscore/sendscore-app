@@ -27,6 +27,11 @@ import (
 // MaxMessageBytes is the largest message accepted.
 const MaxMessageBytes = 25 << 20
 
+const (
+	analyzeTimeout = 45 * time.Second
+	saveTimeout    = 10 * time.Second
+)
+
 // Config configures the receiver.
 type Config struct {
 	Addr string
@@ -39,6 +44,8 @@ type Config struct {
 	Resolver engine.Resolver
 	// CheckLinks fetches links in received messages.
 	CheckLinks bool
+	// Blocklists are the domain blocklists link domains are looked up on.
+	Blocklists []engine.Blocklist
 	// TLS enables STARTTLS. Without it, every message arrives in plain text
 	// and auth.tls fails, so production must set it.
 	TLS *tls.Config
@@ -139,12 +146,17 @@ func (s *session) Data(rd io.Reader) error {
 	// The receiving server records the envelope sender, as any MTA does.
 	stamped := append([]byte("Return-Path: <"+s.from+">\r\n"), stripReturnPath(raw)...)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+	// The checks get their own deadline, and saving gets a fresh one, so slow
+	// DNS can never cost a report that was already checked.
+	actx, acancel := context.WithTimeout(context.Background(), analyzeTimeout)
+	defer acancel()
 	now := s.r.store.Now().UTC()
-	v, err := engine.Analyze(ctx, stamped, engine.Options{
-		Envelope: env, Resolver: s.r.cfg.Resolver, CheckLinks: s.r.cfg.CheckLinks, ReceivedAt: now,
+	v, err := engine.Analyze(actx, stamped, engine.Options{
+		Envelope: env, Resolver: s.r.cfg.Resolver, CheckLinks: s.r.cfg.CheckLinks,
+		Blocklists: s.r.cfg.Blocklists, ReceivedAt: now,
 	})
+	ctx, cancel := context.WithTimeout(context.Background(), saveTimeout)
+	defer cancel()
 	if err != nil {
 		return &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 6, 0}, Message: "Could not read the message: " + err.Error()}
 	}
