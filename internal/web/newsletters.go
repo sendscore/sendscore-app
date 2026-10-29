@@ -26,6 +26,7 @@ import (
 // Defaults for the publication settings in Config.
 const (
 	DefaultProPublications = 5
+	DefaultProDailyTests   = 500
 	DefaultGraceMinutes    = 30
 	// timelineLength is how many messages a publication page shows.
 	timelineLength = 100

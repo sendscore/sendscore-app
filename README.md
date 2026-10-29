@@ -70,8 +70,10 @@ Settings (environment, or `.env.local`):
 | `SENDSCORE_PUBLICATION_DAILY_MESSAGES` | `50` messages one monitoring address accepts per UTC day (then a 452) |
 | `SENDSCORE_ALERTS_PER_DAY` | `10` alerts one newsletter may send per UTC day |
 | `SENDSCORE_FREE_DAILY_TESTS` | `25` test addresses per UTC day for a free account |
+| `SENDSCORE_PRO_DAILY_TESTS` | `500` test addresses per UTC day for a Pro account |
 | `SENDSCORE_ANON_DAILY_TESTS` | `5` test addresses and uploads per UTC day for an anonymous IP |
 | `SENDSCORE_FREE_DAILY_MESSAGES` | `100` messages per UTC day received by a free account's addresses, together |
+| `SENDSCORE_PRO_DAILY_MESSAGES` | `1000` messages per UTC day received by a Pro account's addresses, together |
 | `SENDSCORE_MESSAGES_PER_ADDRESS` | `20` messages one test address accepts in its life |
 | `SENDSCORE_SMTP_SESSIONS` | `50` SMTP connections open at once |
 | `SENDSCORE_SMTP_SESSIONS_PER_IP` | `5` SMTP connections open at once from one sending IP |

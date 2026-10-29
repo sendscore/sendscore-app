@@ -36,6 +36,17 @@ const (
 	userTable = `users u LEFT JOIN subscriptions s ON s.user_id = u.id`
 )
 
+// PlanOf returns the plan in effect for a user id, or PlanFree for an id
+// with no account.
+func (s *Store) PlanOf(ctx context.Context, userID string) (string, error) {
+	var plan string
+	err := s.DB.QueryRowContext(ctx, `SELECT `+planExpr+` FROM `+userTable+` WHERE u.id = ?`, userID).Scan(&plan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return PlanFree, nil
+	}
+	return plan, err
+}
+
 // Subscription is the Creem subscription behind an account's paid plan.
 type Subscription struct {
 	UserID         string

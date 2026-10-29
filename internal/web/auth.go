@@ -218,13 +218,12 @@ func (a *App) testCounter(u *db.User, ip string) (string, int) {
 	return "tests:ip:" + ip, a.cfg.AnonDailyTests
 }
 
-// dailyLimit is the user's test addresses per UTC day, the same on every
-// plan for now.
+// dailyLimit is the user's test addresses per UTC day, by plan.
 func (a *App) dailyLimit(u *db.User) int {
-	switch u.Plan {
-	default:
-		return a.cfg.FreeDailyTests
+	if u.Plan == db.PlanPro {
+		return a.cfg.ProDailyTests
 	}
+	return a.cfg.FreeDailyTests
 }
 
 // limitPage explains a used-up daily allowance.

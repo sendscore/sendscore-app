@@ -271,3 +271,21 @@ func TestCertLoaderReloadsRenewedCertificate(t *testing.T) {
 		t.Errorf("after a broken renewal = %s, err %v", got, reloadErr)
 	}
 }
+
+func TestProDailyMessages(t *testing.T) {
+	store, addr := start(t, func(c *Config) { c.DailyMessages = 1; c.ProDailyMessages = 2 })
+	ctx := context.Background()
+	if _, err := store.DB.Exec(`INSERT INTO users (id, email, plan, created_at) VALUES ('usr_pro', 'p@example.com', 'pro', 0)`); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := store.CreateAddressFor(ctx, time.Hour, "usr_pro")
+	to := "t-" + a.Token + "@in.test"
+	for i := 0; i < 2; i++ {
+		if err := deliver(addr, "bounce@real.test", to, sample(t)); err != nil {
+			t.Fatalf("message %d: %v", i, err)
+		}
+	}
+	if err := deliver(addr, "bounce@real.test", to, sample(t)); smtpCode(err) != 452 {
+		t.Errorf("third message today: err = %v, want 452", err)
+	}
+}

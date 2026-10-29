@@ -111,6 +111,7 @@ func main() {
 		SecureCookies:        secureCookies,
 		Mailer:               mailer,
 		FreeDailyTests:       getint(log, "SENDSCORE_FREE_DAILY_TESTS", 25),
+		ProDailyTests:        getpos(log, "SENDSCORE_PRO_DAILY_TESTS", web.DefaultProDailyTests),
 		AnonDailyTests:       getint(log, "SENDSCORE_ANON_DAILY_TESTS", 5),
 		SigninEmailsPerHour:  getpos(log, "SENDSCORE_SIGNIN_EMAILS_PER_HOUR", 200),
 		RegistrationsPerHour: getpos(log, "SENDSCORE_OAUTH_REGISTRATIONS_PER_HOUR", 600),
@@ -150,6 +151,7 @@ func main() {
 
 		MessagesPerAddress: getpos(log, "SENDSCORE_MESSAGES_PER_ADDRESS", receiver.DefaultMessagesPerAddress),
 		DailyMessages:      getpos(log, "SENDSCORE_FREE_DAILY_MESSAGES", receiver.DefaultDailyMessages),
+		ProDailyMessages:   getpos(log, "SENDSCORE_PRO_DAILY_MESSAGES", receiver.DefaultProDailyMessages),
 		MaxSessions:        getpos(log, "SENDSCORE_SMTP_SESSIONS", receiver.DefaultMaxSessions),
 		MaxSessionsPerIP:   getpos(log, "SENDSCORE_SMTP_SESSIONS_PER_IP", receiver.DefaultMaxSessionsPerIP),
 

@@ -59,6 +59,9 @@ type Config struct {
 	// FreeDailyTests and AnonDailyTests are the test addresses (and
 	// uploads) per UTC day for a free account and for an anonymous IP.
 	FreeDailyTests int
+	// ProDailyTests is the test addresses a Pro account may make per UTC
+	// day.
+	ProDailyTests  int
 	AnonDailyTests int
 	// SigninEmailsPerHour caps the sign-in emails the whole service sends
 	// in an hour. It defaults to 200.
@@ -133,6 +136,9 @@ func New(cfg Config, store *db.Store, log *slog.Logger) (*App, error) {
 	}
 	if cfg.RegistrationsPerHour == 0 {
 		cfg.RegistrationsPerHour = 600
+	}
+	if cfg.ProDailyTests == 0 {
+		cfg.ProDailyTests = DefaultProDailyTests
 	}
 	if cfg.ProPublications == 0 {
 		cfg.ProPublications = DefaultProPublications
