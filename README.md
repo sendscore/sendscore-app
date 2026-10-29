@@ -1,10 +1,12 @@
 # sendscore-app
 
-The hosted SendScore app: test addresses, the SMTP receiver, reports, uploads, and the JSON API the MCP tools call. It runs the engine from [sendscore/sendscore](https://github.com/sendscore/sendscore).
+The SendScore app: test addresses, the SMTP receiver, reports, uploads, and the JSON API the MCP tools call. It runs the engine from [sendscore/sendscore](https://github.com/sendscore/sendscore).
+
+It is open source (AGPL-3.0) and self-hostable: run it on your own server with your own domain, or use the hosted version at [sendscore.ai](https://sendscore.ai). Self-hosting needs a server that can receive mail on port 25 and a domain whose MX record points at it.
 
 ## Stack
 
-Go (one binary serving HTTP and SMTP), `html/template`, SQLite (modernc), hand-written CSS with no build, and a CSP with no inline script or style. Modelled on preflightsh-app. Billing will be Creem, ported from Scratchpad.
+Go (one binary serving HTTP and SMTP), `html/template`, SQLite (modernc), hand-written CSS with no build, and a CSP with no inline script or style. Modelled on preflightsh-app. Billing for the hosted version will be Creem, ported from Scratchpad, as an optional module: a self-hosted instance runs without it.
 
 ## Run locally
 
@@ -45,7 +47,7 @@ Addresses accept mail for 24 hours; reports are kept for 7 days.
 
 ## Not built yet
 
-Accounts, API keys and rate limits, Creem billing, monitored publications, the heartbeat, alerts (SES), the MCP server, STARTTLS on the receiver, and deploy scripts. Nothing is deployed.
+Accounts, API keys and rate limits, monitored publications, the heartbeat, alerts (SES), the MCP server, STARTTLS on the receiver, a Docker image and self-hosting docs, Creem billing (hosted only), and deploy scripts. Nothing is deployed.
 
 ## Develop
 
@@ -54,3 +56,7 @@ go vet ./... && go test ./...
 ```
 
 No em or en dashes anywhere. Commits: short one-line messages, no attribution lines.
+
+## License
+
+AGPL-3.0. The engine and CLI it imports are MIT.
