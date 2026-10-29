@@ -9,6 +9,7 @@ package receiver
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"log/slog"
@@ -38,6 +39,9 @@ type Config struct {
 	Resolver engine.Resolver
 	// CheckLinks fetches links in received messages.
 	CheckLinks bool
+	// TLS enables STARTTLS. Without it, every message arrives in plain text
+	// and auth.tls fails, so production must set it.
+	TLS *tls.Config
 }
 
 // Receiver wraps the SMTP server.
@@ -58,6 +62,7 @@ func New(cfg Config, store *db.Store, log *slog.Logger) *Receiver {
 	s.MaxRecipients = 10
 	s.ReadTimeout = 60 * time.Second
 	s.WriteTimeout = 60 * time.Second
+	s.TLSConfig = cfg.TLS
 	r.server = s
 	return r
 }

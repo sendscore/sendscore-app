@@ -2,8 +2,15 @@ package receiver
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -107,4 +114,66 @@ func TestRefusesUnknownAndExpiredAddresses(t *testing.T) {
 			t.Errorf("%s: err = %v, want 550", to, err)
 		}
 	}
+}
+
+func TestStartTLS(t *testing.T) {
+	cert := selfSigned(t)
+	store, err := db.Open(filepath.Join(t.TempDir(), "tls.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	r := New(Config{MailDomain: "in.test", ReportTTL: time.Hour, Resolver: engine.OfflineResolver{},
+		TLS: &tls.Config{Certificates: []tls.Certificate{cert}}}, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go r.Serve(l)
+	defer r.Close()
+
+	a, _ := store.CreateAddress(context.Background(), time.Hour)
+	c, err := smtp.DialStartTLS(l.Addr().String(), &tls.Config{InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatalf("STARTTLS: %v", err)
+	}
+	defer c.Close()
+	if err := c.Mail("bounce@real.test", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Rcpt("t-"+a.Token+"@in.test", nil); err != nil {
+		t.Fatal(err)
+	}
+	w, _ := c.Data()
+	w.Write(sample(t))
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m, err := store.LatestForToken(context.Background(), a.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.TLS == nil || !*m.TLS {
+		t.Error("message delivered over STARTTLS was not recorded as TLS")
+	}
+	for _, ch := range m.Verdict.Checks {
+		if ch.ID == "auth.tls" && ch.Status != verdict.Pass {
+			t.Errorf("auth.tls = %s", ch.Status)
+		}
+	}
+}
+
+func selfSigned(t *testing.T) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "in.test"},
+		DNSNames: []string{"in.test"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }

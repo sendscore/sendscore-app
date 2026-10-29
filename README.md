@@ -36,6 +36,7 @@ Settings (environment, or `.env.local`):
 | `SENDSCORE_MAIL_DOMAIN` | `localhost` (production: the domain the MX record points here) |
 | `SENDSCORE_BASE_URL` | `http://` plus the web address |
 | `SENDSCORE_DB` | `sendscore.db` |
+| `SENDSCORE_TLS_CERT`, `SENDSCORE_TLS_KEY` | unset: STARTTLS off. Production must set them (a certificate for the mail domain), or every message fails `auth.tls`. |
 
 ## API
 
@@ -49,7 +50,7 @@ Addresses accept mail for 24 hours; reports are kept for 7 days.
 
 ## Not built yet
 
-Accounts, API keys and rate limits, monitored publications, the heartbeat, alerts (SES), STARTTLS on the receiver, a Docker image and self-hosting docs, Creem billing (hosted only), and deploy scripts. Nothing is deployed.
+Accounts, API keys and rate limits, monitored publications, the heartbeat, alerts (SES), a Docker image and self-hosting docs, Creem billing (hosted only), and deploy scripts. Nothing is deployed.
 
 ## Develop
 

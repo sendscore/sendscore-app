@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -50,10 +51,22 @@ func main() {
 		log.Error("templates", "err", err)
 		os.Exit(1)
 	}
+	var tlsConfig *tls.Config
+	if cert, key := os.Getenv("SENDSCORE_TLS_CERT"), os.Getenv("SENDSCORE_TLS_KEY"); cert != "" || key != "" {
+		pair, err := tls.LoadX509KeyPair(cert, key)
+		if err != nil {
+			log.Error("tls certificate", "err", err)
+			os.Exit(1)
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12}
+	} else {
+		log.Warn("STARTTLS is off: set SENDSCORE_TLS_CERT and SENDSCORE_TLS_KEY, or every message fails auth.tls")
+	}
 	rcv := receiver.New(receiver.Config{
 		Addr:       smtpAddr,
 		MailDomain: mailDomain,
 		ReportTTL:  7 * 24 * time.Hour,
+		TLS:        tlsConfig,
 	}, store, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
