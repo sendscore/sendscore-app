@@ -2,6 +2,8 @@ module github.com/sendscore/sendscore-app
 
 go 1.26.0
 
+toolchain go1.26.10
+
 require (
 	github.com/emersion/go-smtp v0.25.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
