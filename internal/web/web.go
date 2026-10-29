@@ -38,6 +38,9 @@ type Config struct {
 	MaxWait time.Duration
 	// Resolver overrides DNS for uploads (tests).
 	Resolver engine.Resolver
+	// BehindProxy is set when a reverse proxy on the same machine forwards
+	// public requests, so loopback connections carry a public Host header.
+	BehindProxy bool
 }
 
 // App is the web application.
@@ -97,6 +100,7 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/test-addresses", a.apiCreateAddress)
 	mux.HandleFunc("GET /api/v1/test-addresses/{token}/wait", a.apiWait)
 	mux.HandleFunc("GET /api/v1/reports/{id}", a.apiReport)
+	mux.Handle("/api/mcp", a.mcpHandler())
 	return secure(mux)
 }
 

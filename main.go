@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -39,10 +40,11 @@ func main() {
 	baseURL := strings.TrimRight(getenv("SENDSCORE_BASE_URL", "http://"+httpAddr), "/")
 
 	app, err := web.New(web.Config{
-		BaseURL:    baseURL,
-		MailDomain: mailDomain,
-		AddressTTL: 24 * time.Hour,
-		ReportTTL:  7 * 24 * time.Hour,
+		BehindProxy: !isLocal(baseURL),
+		BaseURL:     baseURL,
+		MailDomain:  mailDomain,
+		AddressTTL:  24 * time.Hour,
+		ReportTTL:   7 * 24 * time.Hour,
 	}, store, log)
 	if err != nil {
 		log.Error("templates", "err", err)
@@ -104,6 +106,16 @@ func sweep(ctx context.Context, store *db.Store, log *slog.Logger) {
 		case <-t.C:
 		}
 	}
+}
+
+// isLocal reports whether the public URL is this machine, as in development.
+func isLocal(base string) bool {
+	u, err := url.Parse(base)
+	if err != nil {
+		return true
+	}
+	h := u.Hostname()
+	return h == "localhost" || h == "127.0.0.1" || h == "::1"
 }
 
 func getenv(key, fallback string) string {

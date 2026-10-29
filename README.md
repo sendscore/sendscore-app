@@ -43,11 +43,13 @@ Settings (environment, or `.env.local`):
 - `GET /api/v1/test-addresses/{token}/wait?timeout=30` long-polls (at most 60 seconds) and returns `{"status": "received", "report_id", "verdict"}` or `{"status": "not_received"}`.
 - `GET /api/v1/reports/{id}` returns the verdict JSON.
 
+- `/api/mcp` is the remote MCP connector (streamable HTTP) with `get_test_address`, `wait_for_message`, `get_report`, and `compare_to_previous`. The tools live in the engine repository's `mcpserver` package; here they read the database directly.
+
 Addresses accept mail for 24 hours; reports are kept for 7 days.
 
 ## Not built yet
 
-Accounts, API keys and rate limits, monitored publications, the heartbeat, alerts (SES), the MCP server, STARTTLS on the receiver, a Docker image and self-hosting docs, Creem billing (hosted only), and deploy scripts. Nothing is deployed.
+Accounts, API keys and rate limits, monitored publications, the heartbeat, alerts (SES), STARTTLS on the receiver, a Docker image and self-hosting docs, Creem billing (hosted only), and deploy scripts. Nothing is deployed.
 
 ## Develop
 
