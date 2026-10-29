@@ -26,15 +26,18 @@ import (
 	"github.com/sendscore/sendscore/verdict"
 )
 
-func start(t *testing.T) (*db.Store, string) {
+func start(t *testing.T, opts ...func(*Config)) (*db.Store, string) {
 	t.Helper()
 	store, err := db.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
-	r := New(Config{MailDomain: "in.test", ReportTTL: time.Hour, Resolver: engine.OfflineResolver{}},
-		store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cfg := Config{MailDomain: "in.test", ReportTTL: time.Hour, Resolver: engine.OfflineResolver{}}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	r := New(cfg, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
