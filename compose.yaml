@@ -1,0 +1,28 @@
+# An example deployment. Put a reverse proxy with TLS (Caddy, nginx, or
+# similar) in front of port 3014, and set SENDSCORE_TRUST_PROXY=1 in .env.
+# Port 25 on the host is the SMTP receiver, so the domain's MX record must
+# point at this host.
+services:
+  app:
+    image: sendscore-app
+    build:
+      context: .
+      # The engine checkout next to this repository. After launch, remove
+      # this and set args: ENGINE_VERSION: <version> instead.
+      additional_contexts:
+        engine: ../sendscore
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "25:2525"
+      - "127.0.0.1:3014:3014"
+    volumes:
+      - sendscore-data:/data
+      # The certificate for the mail domain, readable by uid 65532. Mount
+      # the directory, not the files, so a renewal is picked up.
+      # - /srv/sendscore/certs:/certs:ro
+    # The app gives open sessions up to a minute to finish on SIGTERM.
+    stop_grace_period: 90s
+
+volumes:
+  sendscore-data:

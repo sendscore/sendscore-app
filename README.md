@@ -168,9 +168,47 @@ Creem posts events to `POST /api/creem/webhook`, which takes no session or CSRF 
 
 When Pro lapses (paused, expired, or cancelled), nothing is deleted. Newsletters stay listed and their addresses keep receiving mail, but no alert is sent and the heartbeat skips them, new issues are kept for 7 days as on the free plan, and adding a newsletter is refused with a link to the plan. Paying again turns it all back on.
 
+## Docker
+
+The `Dockerfile` builds a static binary (`CGO_ENABLED=0`, `-trimpath`) with the Go toolchain `go.mod` pins, into a distroless image (`gcr.io/distroless/static-debian13:nonroot`, with CA certificates and tzdata) that runs as uid 65532. Both base images are pinned by digest.
+
+The engine has to come from somewhere, since `go.mod` replaces it with `../sendscore`. Until launch the engine repository is private, so build with the local checkout as a named build context, which the Dockerfile copies to where the replace points.
+
+```sh
+docker build --build-context engine=../sendscore -t sendscore-app .
+```
+
+Once the engine is public, a build needs only this repository. `ENGINE_VERSION` drops the replace and fetches that version of the engine from GitHub (a tag such as `v0.1.0`, a commit, or a pseudo-version).
+
+```sh
+docker build --build-arg ENGINE_VERSION=v0.1.0 -t sendscore-app .
+```
+
+At launch, tag the engine (`git tag v0.1.0 && git push origin v0.1.0` in sendscore/sendscore), then switch `compose.yaml` from `additional_contexts` to `args: { ENGINE_VERSION: v0.1.0 }`. A build with neither stops with a message saying which to pass.
+
+To run it, with the certificate directory mounted, use this.
+
+```sh
+docker run -d --name sendscore --env-file .env --stop-timeout 90 \
+  -p 25:2525 -p 127.0.0.1:3014:3014 \
+  -v sendscore-data:/data \
+  -v /srv/sendscore/certs:/certs:ro \
+  sendscore-app
+```
+
+With Compose, `docker compose up -d --build` does the same from `compose.yaml` and a `.env` next to it.
+
+- The image listens on `0.0.0.0:3014` (web) and `0.0.0.0:2525` (SMTP). Map port 25 on the host to 2525 in the container, since the container runs as non-root and cannot bind 25 itself, and point the domain's MX record at the host.
+- The database is `/data/sendscore.db` on the volume `/data`. Back up the volume, not the container.
+- Publish 3014 on 127.0.0.1 only, and put a reverse proxy with TLS (Caddy, nginx, or similar) in front of it.
+- For STARTTLS, bind mount the directory holding the mail domain's certificate read-only and point `SENDSCORE_TLS_CERT` and `SENDSCORE_TLS_KEY` at the files in it, such as `/certs/fullchain.pem` and `/certs/privkey.pem`. Mount the directory rather than the files, because a file bind mount keeps the old file after a renewal replaces it, and the app reloads the files when they change. The key must be readable by uid 65532. Certbot's own keys are root only, so have a deploy hook copy both files into `/srv/sendscore/certs` and `chown 65532` them.
+- The settings that matter in production are `SENDSCORE_BASE_URL` (the public https URL, which the image otherwise sets to `http://127.0.0.1:3014` for a local run), `SENDSCORE_MAIL_DOMAIN`, `SES_ACCESS_KEY_ID` and `SES_SECRET_ACCESS_KEY` (required once the base URL is https), `SENDSCORE_TRUST_PROXY=1` behind the proxy, the TLS files, and the blocklist and billing settings above.
+- On SIGTERM the app gives open sessions up to a minute to finish, so stop it with a timeout over 60 seconds (`--stop-timeout 90`, `docker stop -t 90`, or `stop_grace_period: 90s` as in `compose.yaml`). Docker's default of 10 seconds would cut them off.
+- There is no `HEALTHCHECK`. The app has no health endpoint, and the distroless image has no shell or curl to run one; check `GET /` from outside instead.
+
 ## Not built yet
 
-A Docker image and deploy scripts. Nothing is deployed. Self-hosting is documented on the website.
+Deploy scripts. Nothing is deployed. Self-hosting is documented on the website.
 
 ## Develop
 

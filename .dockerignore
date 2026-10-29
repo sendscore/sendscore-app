@@ -1,0 +1,10 @@
+.git
+.github
+.env
+.env.*
+*.db
+*.db-*
+/bin/
+/out/
+.DS_Store
+compose.yaml
