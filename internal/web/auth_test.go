@@ -415,3 +415,19 @@ func TestProDailyLimit(t *testing.T) {
 		t.Errorf("over the Pro limit = %d", w.Code)
 	}
 }
+
+func TestPolicyLinks(t *testing.T) {
+	_, _, h := newApp(t)
+	if body := serve(h, request("GET", "/signin", nil, "", "")).Body.String(); strings.Contains(body, "Privacy") {
+		t.Error("policy links shown without SENDSCORE_PRIVACY_URL")
+	}
+	_, _, h = newApp(t, func(c *Config) {
+		c.PrivacyURL, c.TermsURL = "https://example.com/privacy/", "https://example.com/terms/"
+	})
+	body := serve(h, request("GET", "/signin", nil, "", "")).Body.String()
+	for _, want := range []string{`href="https://example.com/privacy/">Privacy`, `href="https://example.com/terms/">terms`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("sign-in page lacks %s", want)
+		}
+	}
+}

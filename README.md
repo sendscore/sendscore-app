@@ -39,6 +39,8 @@ Without SES keys the link is written to the app's log instead of emailed. To sig
 
 Test addresses are limited per UTC day. A free account gets 25 (through the API, MCP, or the site while signed in), and an anonymous visitor gets 5 per IP for "Get a test address" and uploads together. Over the limit, the API answers 429 and the site shows a page saying when it starts again. An account is Pro when the operator granted it (the addresses in `SENDSCORE_PRO_EMAILS`, set to `pro` in `users.plan` at startup and whenever they sign in) or when its Creem subscription is in good standing, and free otherwise. No webhook can take Pro away from a granted account. Pro is what allows newsletter monitoring (see below).
 
+Delete an account from the Account page. SendScore cancels any Creem subscription first and deletes nothing if it cannot. It then deletes the account's test addresses, messages and reports (including the original messages), monitored newsletters with their history and alerts, API tokens, connected apps, and sessions. Creem webhook records are kept as the payment record, without the account. Signing in again with the same email starts a new account.
+
 Settings (environment, or `.env.local`):
 
 | Variable | Default |
@@ -79,6 +81,7 @@ Settings (environment, or `.env.local`):
 | `SENDSCORE_SMTP_SESSIONS_PER_IP` | `5` SMTP connections open at once from one sending IP |
 | `SENDSCORE_SIGNIN_EMAILS_PER_HOUR` | `200` sign-in emails per hour for the whole service |
 | `SENDSCORE_OAUTH_REGISTRATIONS_PER_HOUR` | `600` connector registrations per hour for the whole service |
+| `SENDSCORE_PRIVACY_URL`, `SENDSCORE_TERMS_URL` | unset. The operator's privacy and terms pages, linked from the footer and the sign-in page when set. The hosted app uses the pages on the marketing site. |
 | `SENDSCORE_TRUST_PROXY` | unset. `1` behind a reverse proxy: the client IP for limits is the last `X-Forwarded-For` entry, the one the proxy added. Leave it unset when the app is reachable directly, or anyone could choose their IP. A public `SENDSCORE_BASE_URL` without it logs a warning at startup, because behind a proxy every visitor would share one IP and one set of limits. |
 
 ## Newsletter monitoring

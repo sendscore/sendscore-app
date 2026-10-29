@@ -34,7 +34,11 @@ var assetFS embed.FS
 
 // Config configures the app.
 type Config struct {
-	BaseURL    string
+	BaseURL string
+	// PrivacyURL and TermsURL are the operator's policy pages, linked from
+	// the footer and the sign-in page when set.
+	PrivacyURL string
+	TermsURL   string
 	MailDomain string
 	AddressTTL time.Duration
 	ReportTTL  time.Duration
@@ -171,7 +175,9 @@ func New(cfg Config, store *db.Store, log *slog.Logger) (*App, error) {
 			}
 			return t.Format("Mon 2 Jan 2006, 15:04 MST")
 		},
-		"worsened": worsened,
+		"worsened":   worsened,
+		"privacyURL": func() string { return cfg.PrivacyURL },
+		"termsURL":   func() string { return cfg.TermsURL },
 	}
 	for _, page := range []string{"home", "address", "report", "upload", "error", "signin", "account", "consent",
 		"newsletters", "newsletter", "newsletter_form", "newsletter_delete", "message", "account_delete"} {

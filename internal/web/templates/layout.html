@@ -20,6 +20,6 @@
 <main>
 {{template "content" .}}
 </main>
-<footer class="foot">Receipt at SendScore does not prove inbox placement at Gmail or any other provider.</footer>
+<footer class="foot">Receipt at SendScore does not prove inbox placement at Gmail or any other provider.{{with privacyURL}} <a href="{{.}}">Privacy</a>{{end}}{{with termsURL}} <a href="{{.}}">Terms</a>{{end}}</footer>
 </body>
 </html>

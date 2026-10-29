@@ -121,6 +121,8 @@ func main() {
 		Billing:              creem(log),
 		HistoryDays:          historyDays,
 		BaseURL:              baseURL,
+		PrivacyURL:           os.Getenv("SENDSCORE_PRIVACY_URL"),
+		TermsURL:             os.Getenv("SENDSCORE_TERMS_URL"),
 		MailDomain:           mailDomain,
 		AddressTTL:           24 * time.Hour,
 		ReportTTL:            7 * 24 * time.Hour,

@@ -54,6 +54,7 @@ pre { background: #181818; border: 1px solid var(--line); padding: 12px; overflo
 details p { margin: 8px 0 8px 4.5em; font-size: 15px; }
 details pre { margin-left: 4.5em; }
 .foot { max-width: 920px; margin: 0 auto; padding: 24px 16px; color: var(--muted); font-size: 12px; }
+.foot a { color: var(--muted); margin-left: 12px; }
 @media (max-width: 640px) {
   .sheet { grid-template-columns: 1fr; gap: 8px; }
   details p, details pre { margin-left: 0; }

@@ -25,6 +25,7 @@
       <label>Email<input type="email" name="email" value="{{.Email}}" autocomplete="email" required></label>
       <button type="submit">Email me a sign-in link</button>
     </form>
+    {{if and termsURL privacyURL}}<p class="muted small">By signing in, you agree to the <a href="{{termsURL}}">terms</a> and the <a href="{{privacyURL}}">privacy policy</a>.</p>{{end}}
   {{end}}
   </div>
 </section>
