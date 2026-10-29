@@ -1,0 +1,11 @@
+{{define "content"}}
+<section class="sheet">
+  <p class="label">Send to</p>
+  <div>
+    <h1>Send a preview to this address</h1>
+    <p class="address"><code>{{.Address}}</code></p>
+    <p>This page refreshes on its own and opens the report when the email arrives. The address accepts mail until {{when .Expires}}.</p>
+    <p class="muted waiting">Waiting for your email</p>
+  </div>
+</section>
+{{end}}

@@ -1,0 +1,56 @@
+/* Placeholder styles for local testing. Once sendscore-website settles,
+   copy its site.css here (as preflightsh-app does) and keep app additions
+   in this file. Colour is used only for the states. */
+:root {
+  --bg: #111;
+  --fg: #e6e6e6;
+  --muted: #8a8a8a;
+  --line: #2a2a2a;
+  --pass: #5bb974;
+  --warn: #e0b341;
+  --fail: #e5534b;
+  --info: #8a8a8a;
+  --skipped: #6b6b6b;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  --serif: Georgia, "Times New Roman", serif;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.55 var(--serif); }
+a { color: inherit; }
+code, pre, .label, .mark, .bar, .foot, button, input { font-family: var(--mono); }
+.bar { display: flex; justify-content: space-between; align-items: baseline; padding: 16px 24px; border-bottom: 1px solid var(--line); font-size: 14px; }
+.bar nav a { margin-left: 20px; color: var(--muted); text-decoration: none; }
+.brand { text-decoration: none; font-weight: 600; }
+main { max-width: 920px; margin: 0 auto; padding: 0 16px 48px; }
+.sheet { display: grid; grid-template-columns: 120px 1fr; gap: 24px; padding: 28px 0; border-bottom: 1px solid var(--line); }
+.label { margin: 4px 0 0; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+h1 { margin: 0 0 12px; font-size: 28px; font-weight: 400; line-height: 1.25; }
+.muted { color: var(--muted); }
+.address code { font-size: 20px; user-select: all; }
+.waiting::after { content: " ..."; }
+button { background: var(--fg); color: var(--bg); border: 0; padding: 10px 16px; font-size: 14px; cursor: pointer; }
+.form { display: grid; gap: 14px; max-width: 460px; }
+.form label { display: grid; gap: 6px; font-size: 14px; color: var(--muted); }
+input[type=text], input[type=file] { background: transparent; color: var(--fg); border: 1px solid var(--line); padding: 8px; font-size: 14px; }
+.checks, .fixes { margin: 0; padding: 0; }
+.checks { list-style: none; }
+.checks li { padding: 6px 0; border-top: 1px solid var(--line); }
+.checks li:first-child { border-top: 0; }
+.fixes li { margin-bottom: 8px; }
+summary { cursor: pointer; list-style: none; }
+summary::-webkit-details-marker { display: none; }
+.mark { display: inline-block; width: 4.5em; font-size: 13px; text-transform: uppercase; }
+.s-pass .mark { color: var(--pass); }
+.s-warn .mark, li.s-warn { color: var(--warn); }
+.s-fail .mark { color: var(--fail); }
+.s-info .mark { color: var(--info); }
+.s-skipped .mark { color: var(--skipped); }
+.verdict { font-size: 18px; }
+pre { background: #181818; border: 1px solid var(--line); padding: 12px; overflow-x: auto; font-size: 13px; }
+details p { margin: 8px 0 8px 4.5em; font-size: 15px; }
+details pre { margin-left: 4.5em; }
+.foot { max-width: 920px; margin: 0 auto; padding: 24px 16px; color: var(--muted); font-size: 12px; }
+@media (max-width: 640px) {
+  .sheet { grid-template-columns: 1fr; gap: 8px; }
+  details p, details pre { margin-left: 0; }
+}

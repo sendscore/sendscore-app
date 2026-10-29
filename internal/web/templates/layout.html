@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{{if .Refresh}}<meta http-equiv="refresh" content="3">{{end}}
+<title>{{.Title}} · SendScore</title>
+<link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+<header class="bar">
+  <a class="brand" href="/">SendScore</a>
+  <nav><a href="/">New test</a><a href="/upload">Check a saved email</a></nav>
+</header>
+<main>
+{{template "content" .}}
+</main>
+<footer class="foot">Receipt at SendScore does not prove inbox placement at Gmail or any other provider.</footer>
+</body>
+</html>

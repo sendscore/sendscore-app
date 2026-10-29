@@ -1,0 +1,54 @@
+{{define "content"}}
+<section class="sheet">
+  <p class="label">Report</p>
+  <div>
+    <h1>{{.V.Message.Subject}}</h1>
+    <p class="muted">From {{.V.Message.From}} · received {{when .V.Message.ReceivedAt}} · {{kb .V.Message.SizeBytes}}{{if .M.RemoteIP}} · from {{.M.RemoteIP}}{{end}}</p>
+    <p class="verdict s-{{status .V.Verdict}}"><span class="mark">{{status .V.Verdict}}</span> {{.V.Summary}}</p>
+    <p>Ready to send: <strong>{{if .V.ReadyToSend}}yes{{else}}no{{end}}</strong></p>
+  </div>
+</section>
+
+{{if .V.TopFixes}}
+<section class="sheet">
+  <p class="label">Fix first</p>
+  <ol class="fixes">
+    {{range .V.TopFixes}}<li>{{.Fix}} <span class="muted">({{who .Who}}, <code>{{.Check}}</code>)</span></li>{{end}}
+  </ol>
+</section>
+{{end}}
+
+{{range .Sections}}
+<section class="sheet">
+  <p class="label">{{.Name}}</p>
+  <ul class="checks">
+    {{range .Checks}}
+    <li class="s-{{status .Status}}">
+      <details>
+        <summary><span class="mark">{{status .Status}}</span> {{.Title}}</summary>
+        {{if .Detail}}<p>{{.Detail}}</p>{{end}}
+        {{if .Reason}}<p class="muted">{{.Reason}}</p>{{end}}
+        {{if .Fix}}<p>Fix ({{who .Fix.Who}}): {{.Fix.Text}}</p>{{end}}
+        {{if .Evidence}}<pre>{{json .Evidence}}</pre>{{end}}
+        <p class="muted"><code>{{.ID}}</code>{{if .Docs}} · <a href="{{.Docs}}" rel="noopener">reference</a>{{end}}</p>
+      </details>
+    </li>
+    {{end}}
+  </ul>
+</section>
+{{end}}
+
+{{if .V.Changes}}
+<section class="sheet">
+  <p class="label">Changes</p>
+  <ul class="checks">
+    {{range .V.Changes}}<li class="{{if .Worsened}}s-warn{{else}}s-info{{end}}"><code>{{.Field}}</code>: {{.Before}} to {{.After}}</li>{{end}}
+  </ul>
+</section>
+{{end}}
+
+<section class="sheet">
+  <p class="label">Raw</p>
+  <p><a href="/api/v1/reports/{{.V.ID}}">Verdict JSON</a> · <a href="/r/{{.V.ID}}/raw">Raw message</a> · <span class="muted">Kept until {{when .M.ExpiresAt}}</span></p>
+</section>
+{{end}}
