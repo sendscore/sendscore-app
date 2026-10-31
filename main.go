@@ -85,6 +85,16 @@ func main() {
 	} else if n > 0 {
 		log.Info("accounts moved to the pro plan", "count", n)
 	}
+	// Without billing nothing is for sale, so nobody is held to the free limits.
+	billingClient := creem(log)
+	if billingClient == nil {
+		if n, err := store.PromoteAll(context.Background()); err != nil {
+			log.Error("pro accounts", "err", err)
+			os.Exit(1)
+		} else if n > 0 {
+			log.Info("accounts moved to the pro plan", "count", n)
+		}
+	}
 	historyDays := getpos(log, "SENDSCORE_HISTORY_DAYS", 365)
 	mon := &monitor.Monitor{
 		Store: store, Mailer: alerter, BaseURL: baseURL, Log: log,
@@ -118,7 +128,7 @@ func main() {
 		ProPublications:      getpos(log, "SENDSCORE_PRO_PUBLICATIONS", web.DefaultProPublications),
 		FreePublications:     getint(log, "SENDSCORE_FREE_PUBLICATIONS", 0),
 		ProEmails:            proEmails,
-		Billing:              creem(log),
+		Billing:              billingClient,
 		HistoryDays:          historyDays,
 		BaseURL:              baseURL,
 		PrivacyURL:           os.Getenv("SENDSCORE_PRIVACY_URL"),
@@ -256,7 +266,7 @@ func sweep(ctx context.Context, store *db.Store, log *slog.Logger) {
 }
 
 // blocklists reads which domain blocklists to use. The free public zones
-// are for non-commercial use, so the hosted service uses a Spamhaus DQS key;
+// are for non-commercial use, so a commercial instance uses a Spamhaus DQS key;
 // a personal self-hosted instance may turn the public zones on instead.
 func blocklists() []engine.Blocklist {
 	var out []engine.Blocklist

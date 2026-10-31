@@ -1,36 +1,19 @@
 # syntax=docker/dockerfile:1
 
-# The engine (github.com/sendscore/sendscore) comes from one of two places.
-#
-# A local checkout, passed as a named build context. go.mod's replace
-# directive points at ../sendscore, and the engine is copied there.
-#
-#   docker build --build-context engine=../sendscore -t sendscore-app .
-#
-# Or a published version, fetched from GitHub with the replace dropped.
+# The engine (github.com/sendscore/sendscore) is the version go.mod names.
+# ENGINE_VERSION overrides it with another tag, a commit, or a pseudo-version.
 #
 #   docker build --build-arg ENGINE_VERSION=v0.1.0 -t sendscore-app .
-#
-# This stage stands in for the engine when no build context replaces it. It
-# copies a file so it is not empty, because BuildKit reuses an empty stage's
-# cache from an earlier build that had the engine.
-FROM scratch AS engine
-COPY .dockerignore /.placeholder
 
 FROM golang:1.26.10-trixie@sha256:a050dcceee6eb9bf110151662dfac7662f3bec40927c7dee48731e3d92083d42 AS build
 ARG ENGINE_VERSION=
 WORKDIR /src/sendscore-app
-COPY --from=engine / /src/sendscore/
 COPY . .
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     set -eu; \
     if [ -n "$ENGINE_VERSION" ]; then \
-      go mod edit -dropreplace=github.com/sendscore/sendscore -droprequire=github.com/sendscore/sendscore; \
       go get github.com/sendscore/sendscore@"$ENGINE_VERSION"; \
-    elif [ ! -f /src/sendscore/go.mod ]; then \
-      echo "No engine. Pass --build-context engine=../sendscore or --build-arg ENGINE_VERSION=<version>" >&2; \
-      exit 1; \
     fi; \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/sendscore-app .; \
     mkdir -p /out/data

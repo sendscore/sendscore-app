@@ -2,18 +2,17 @@
 
 The SendScore app: test addresses, newsletter monitoring with alerts, the SMTP receiver, reports, uploads, and the JSON API the MCP tools call. It runs the engine from [sendscore/sendscore](https://github.com/sendscore/sendscore).
 
-It is open source (AGPL-3.0) and self-hostable: run it on your own server with your own domain, or use the hosted version at [sendscore.ai](https://sendscore.ai). Self-hosting needs a server that can receive mail on port 25 and a domain whose MX record points at it.
+It is open source (AGPL-3.0), and you run it yourself on your own server with your own domain. It needs a server that can receive mail on port 25 and a domain whose MX record points at it. Many cloud hosts block port 25 until you ask, so check yours first.
+
+There is no hosted version right now. If you would use one, [open an issue](https://github.com/sendscore/sendscore/issues) and say so. To check saved messages without running a server, use the [CLI](https://github.com/sendscore/sendscore).
 
 ## Stack
 
-Go (one binary serving HTTP and SMTP), `html/template`, SQLite (modernc), hand-written CSS with no build, and a CSP with no inline script or style. Modelled on preflightsh-app. Billing for the hosted version is Creem, ported from Scratchpad, and optional: a self-hosted instance runs without it (see Billing below).
+Go (one binary serving HTTP and SMTP), `html/template`, SQLite (modernc), hand-written CSS with no build, and a CSP with no inline script or style. Modelled on preflightsh-app. Billing through Creem is optional and off by default (see Billing below).
 
 ## Run locally
 
-The engine is private until launch, so clone it next to this repository; `go.mod` points at `../sendscore`.
-
 ```sh
-git clone git@github.com:sendscore/sendscore.git ../sendscore   # once
 go run .
 ```
 
@@ -22,7 +21,7 @@ That serves the web app on http://127.0.0.1:3014 and the SMTP receiver on 127.0.
 To test the whole loop:
 
 1. Open http://127.0.0.1:3014 and press "Get a test address" (or, with an API token from the account page, `curl -X POST -H "Authorization: Bearer $SENDSCORE_TOKEN" http://127.0.0.1:3014/api/v1/test-addresses`).
-2. Deliver a saved email to it: `go run ./cmd/sendtest -to t-<token>@localhost ../sendscore/testdata/sample.eml`. Any `.eml` works; save one from Gmail with "Show original" then "Download original".
+2. Deliver a saved email to it: `go run ./cmd/sendtest -to t-<token>@localhost testdata/sample.eml`. Any `.eml` works; save one from Gmail with "Show original" then "Download original".
 3. The page opens the report on its own. Locally the message comes from 127.0.0.1 without TLS, so SPF, reverse DNS, and TLS reflect that; DKIM and DMARC are checked against real DNS.
 
 Or upload a saved file at http://127.0.0.1:3014/upload.
@@ -50,7 +49,7 @@ Settings (environment, or `.env.local`):
 | `SENDSCORE_MAIL_DOMAIN` | `localhost` (production: the domain the MX record points here) |
 | `SENDSCORE_BASE_URL` | `http://` plus the web address |
 | `SENDSCORE_DB` | `sendscore.db` |
-| `SENDSCORE_SPAMHAUS_DQS_KEY` | unset: no Spamhaus lookups. A Spamhaus DQS key, which allows commercial use. The hosted service must use this. |
+| `SENDSCORE_SPAMHAUS_DQS_KEY` | unset: no Spamhaus lookups. A Spamhaus DQS key, which allows commercial use. Any commercial instance must use this. |
 | `SENDSCORE_SURBL_ZONE` | unset: no SURBL lookups. A SURBL data feed zone, for subscribers. |
 | `SENDSCORE_PUBLIC_BLOCKLISTS` | unset. `1` uses the free public Spamhaus and SURBL zones, which are for non-commercial use only (a personal self-hosted instance). |
 | `SENDSCORE_CHECK_LINKS` | on. Fetches every link and image in received and uploaded messages, with a client that refuses private and loopback addresses and never fetches unsubscribe, confirm, or preference links. `0` turns it off, and `content.links` and `content.images` are skipped. |
@@ -59,9 +58,9 @@ Settings (environment, or `.env.local`):
 | `SES_ACCESS_KEY_ID`, `SES_SECRET_ACCESS_KEY` | unset: sign-in links are logged, not emailed (development only). |
 | `SES_REGION` | `us-east-1` |
 | `SENDSCORE_MAIL_FROM` | `SendScore <hello@sendscore.ai>` |
-| `SENDSCORE_ALERT_FROM` | `SendScore alerts <alerts@sendscore.ai>`, the sender of alerts. The SES IAM user may only send as hello@ or alerts@sendscore.ai. |
-| `SENDSCORE_PRO_EMAILS` | unset. Comma separated addresses whose accounts are Pro whatever billing says. |
-| `CREEM_API_KEY` | unset: billing off, as on a self-hosted instance. A Creem key; one starting `creem_test_` talks to Creem's test API, any other to the live one. |
+| `SENDSCORE_ALERT_FROM` | `SendScore alerts <alerts@sendscore.ai>`, the sender of alerts. Set both to an address on your own domain. |
+| `SENDSCORE_PRO_EMAILS` | unset. Comma separated addresses whose accounts are Pro whatever billing says. With billing off, every account is already Pro. |
+| `CREEM_API_KEY` | unset: billing off, the default, which makes every account Pro. A Creem key; one starting `creem_test_` talks to Creem's test API, any other to the live one. |
 | `CREEM_WEBHOOK_SECRET` | unset. The secret Creem signs webhooks with. |
 | `CREEM_PRODUCT_PRO_MONTHLY` | unset. The Creem product for Pro at $9 a month. Billing is on only with this, the key, and the webhook secret; setting some of the three and not all stops the app at startup. |
 | `CREEM_PRODUCT_PRO_YEARLY` | unset: yearly is not offered. The Creem product for Pro at $90 a year. |
@@ -81,7 +80,7 @@ Settings (environment, or `.env.local`):
 | `SENDSCORE_SMTP_SESSIONS_PER_IP` | `5` SMTP connections open at once from one sending IP |
 | `SENDSCORE_SIGNIN_EMAILS_PER_HOUR` | `200` sign-in emails per hour for the whole service |
 | `SENDSCORE_OAUTH_REGISTRATIONS_PER_HOUR` | `600` connector registrations per hour for the whole service |
-| `SENDSCORE_PRIVACY_URL`, `SENDSCORE_TERMS_URL` | unset. The operator's privacy and terms pages, linked from the footer and the sign-in page when set. The hosted app uses the pages on the marketing site. |
+| `SENDSCORE_PRIVACY_URL`, `SENDSCORE_TERMS_URL` | unset. The operator's privacy and terms pages, linked from the footer and the sign-in page when set. |
 | `SENDSCORE_TRUST_PROXY` | unset. `1` behind a reverse proxy: the client IP for limits is the last `X-Forwarded-For` entry, the one the proxy added. Leave it unset when the app is reachable directly, or anyone could choose their IP. A public `SENDSCORE_BASE_URL` without it logs a warning at startup, because behind a proxy every visitor would share one IP and one set of limits. |
 
 ## Newsletter monitoring
@@ -115,7 +114,7 @@ The heartbeat runs every minute. For each scheduled newsletter that is not pause
 3. Deliver a saved email to it twice, changing it in between to see the comparison (for example, delete its `List-Unsubscribe` line the second time, which is worse and sends an alert to the log):
 
    ```sh
-   go run ./cmd/sendtest -to m-<token>@localhost ../sendscore/testdata/sample.eml
+   go run ./cmd/sendtest -to m-<token>@localhost testdata/sample.eml
    go run ./cmd/sendtest -to m-<token>@localhost changed.eml
    ```
 
@@ -125,7 +124,7 @@ To see a missed-issue alert, give the newsletter a schedule a minute or two from
 
 ## Connector (OAuth)
 
-To connect Claude or another MCP client, add `https://app.sendscore.ai/api/mcp` as a custom connector (locally, `http://127.0.0.1:3014/api/mcp`). You will be asked to sign in and allow access. Nothing needs pasting, because the client finds the sign-in on its own, as the MCP authorization spec describes (OAuth 2.1 with PKCE).
+To connect Claude or another MCP client, add `https://sendscore.example.com/api/mcp` as a custom connector (locally, `http://127.0.0.1:3014/api/mcp`). You will be asked to sign in and allow access. Nothing needs pasting, because the client finds the sign-in on its own, as the MCP authorization spec describes (OAuth 2.1 with PKCE).
 
 1. An unauthenticated call to `/api/mcp` gets a 401 with `WWW-Authenticate: Bearer resource_metadata="<base>/.well-known/oauth-protected-resource/api/mcp"` (and `error="invalid_token"` when a token was sent but is no good).
 2. `/.well-known/oauth-protected-resource` (and its `/api/mcp` variant) is RFC 9728 metadata naming the app as the authorization server, and `/.well-known/oauth-authorization-server` is RFC 8414 metadata. There is also `/.well-known/mcp/server-card.json`.
@@ -142,7 +141,7 @@ To try it locally, run `npx @modelcontextprotocol/inspector`, choose Streamable 
 Every `/api/v1/` route and `/api/mcp` take an API token from the account page in the `Authorization` header:
 
 ```sh
-curl -H "Authorization: Bearer ss_live_..." -X POST https://app.sendscore.ai/api/v1/test-addresses
+curl -H "Authorization: Bearer ss_live_..." -X POST https://sendscore.example.com/api/v1/test-addresses
 ```
 
 A missing, unknown, or revoked token gets a 401 (`{"error": ...}` on `/api/v1/`, and a plain 401 with `WWW-Authenticate: Bearer` on `/api/mcp`). Addresses made with a token belong to its account, and the wait, report, and MCP tools answer only for that account's addresses, with a 404 for anyone else's. The report page `/r/{id}`, its `/r/{id}/json`, and the address page `/t/{token}` stay viewable by their unguessable links. A report page shows its test address and the link to send again only to whoever made the address (its account, or for an anonymous address, the browser that made it), since a shared report link should not let anyone else send to it. Uploads made while signed in belong to the account, so the report API and `get_report` return them. `sendscore mcp` sends the token from `SENDSCORE_TOKEN`.
@@ -165,6 +164,8 @@ On shutdown (SIGTERM), open waits answer `not_received` at once, and uploads and
 
 ## Billing
 
+Billing is off unless you set the Creem settings above, and then every account has the Pro limits, now and when it signs in. Turning billing on later leaves those accounts Pro, since they count as granted by the operator.
+
 With the Creem settings above, the account page has a Plan section. A free account sees "Upgrade to Pro" with a monthly and a yearly button, which open a Creem checkout. Creem decides. Returning from the checkout grants nothing, and Pro turns on when Creem's webhook says the payment went through, usually within seconds. A Pro account sees when it is paid through and a "Manage billing" button for Creem's own page (card, invoices, and cancelling). A failed renewal shows that Creem is retrying, and Pro stays on meanwhile. A granted account says so and has no billing buttons. Without the settings, none of this shows and nothing changes.
 
 Creem posts events to `POST /api/creem/webhook`, which takes no session or CSRF token and is authenticated by the `creem-signature` header alone (the hex HMAC-SHA256 of the raw body). Point the Creem webhook there. Every event is stored in `creem_events` (its id is the primary key, so a retry is never applied twice), and the subscription in `subscriptions`. These rules come from Scratchpad. A bad signature is 401, a body over 1 MB is 413, an event with no id is 500, anything understood or deliberately ignored is 200, and a failure while applying gives the event back and answers 500 so Creem retries. An event older than the newest one applied is recorded and ignored. The account comes from the signed claim the checkout put in the metadata, then the bound subscription id, then the bound customer id, and never from an email address. Past due only keeps a plan that was already paid, a product this install does not sell grants nothing, only the bound subscription can end a plan, a healthy plan is never rebound to another customer, and a running period end is never wiped.
@@ -175,19 +176,12 @@ When Pro lapses (paused, expired, or cancelled), nothing is deleted. Newsletters
 
 The `Dockerfile` builds a static binary (`CGO_ENABLED=0`, `-trimpath`) with the Go toolchain `go.mod` pins, into a distroless image (`gcr.io/distroless/static-debian13:nonroot`, with CA certificates and tzdata) that runs as uid 65532. Both base images are pinned by digest.
 
-The engine has to come from somewhere, since `go.mod` replaces it with `../sendscore`. Until launch the engine repository is private, so build with the local checkout as a named build context, which the Dockerfile copies to where the replace points.
+A build needs only this repository, and uses the engine version in `go.mod`. `ENGINE_VERSION` picks another (a tag, a commit, or a pseudo-version).
 
 ```sh
-docker build --build-context engine=../sendscore -t sendscore-app .
-```
-
-Once the engine is public, a build needs only this repository. `ENGINE_VERSION` drops the replace and fetches that version of the engine from GitHub (a tag such as `v0.1.0`, a commit, or a pseudo-version).
-
-```sh
+docker build -t sendscore-app .
 docker build --build-arg ENGINE_VERSION=v0.1.0 -t sendscore-app .
 ```
-
-At launch, tag the engine (`git tag v0.1.0 && git push origin v0.1.0` in sendscore/sendscore), then switch `compose.yaml` from `additional_contexts` to `args: { ENGINE_VERSION: v0.1.0 }`. A build with neither stops with a message saying which to pass.
 
 To run it, with the certificate directory mounted, use this.
 

@@ -91,7 +91,7 @@ func TestNewslettersNeedPro(t *testing.T) {
 }
 
 func TestProEmailsArePromotedAtSignin(t *testing.T) {
-	a, store, h := newApp(t, func(c *Config) { c.ProEmails = []string{"jon@example.com"} })
+	a, store, h, _ := billingApp(t, func(c *Config) { c.ProEmails = []string{"jon@example.com"} })
 	for _, email := range []string{"jon@example.com", "other@example.com"} {
 		post(h, "/signin", url.Values{"email": {email}}, "")
 		if w := post(h, "/signin/verify", url.Values{"t": {mailer(a).lastLink(t)}}, ""); w.Code != 303 {
@@ -292,5 +292,27 @@ func TestNewslettersBelongToTheirOwner(t *testing.T) {
 			t.Errorf("list_publications for %s: %s", token[:12], b)
 		}
 		cs.Close()
+	}
+}
+
+func TestBillingOffGivesEveryAccountPro(t *testing.T) {
+	a, store, _ := newApp(t)
+	ctx := context.Background()
+	u, _, _ := newUser(t, store, "self@example.com")
+	if p, _ := store.PlanOf(ctx, u.ID); p != db.PlanFree {
+		t.Fatalf("plan before = %q", p)
+	}
+	if n, err := store.PromoteAll(ctx); err != nil || n != 1 {
+		t.Fatalf("PromoteAll = %d %v", n, err)
+	}
+	if p, _ := store.PlanOf(ctx, u.ID); p != db.PlanPro {
+		t.Errorf("plan after = %q", p)
+	}
+
+	// An account made after startup is promoted as it signs in.
+	v, _, _ := newUser(t, store, "new@example.com")
+	a.promote(ctx, &v)
+	if p, _ := store.PlanOf(ctx, v.ID); p != db.PlanPro || a.publicationLimit(&v) != DefaultProPublications {
+		t.Errorf("after sign-in: plan %q, limit %d", p, a.publicationLimit(&v))
 	}
 }

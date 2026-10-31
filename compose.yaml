@@ -5,12 +5,7 @@
 services:
   app:
     image: sendscore-app
-    build:
-      context: .
-      # The engine checkout next to this repository. After launch, remove
-      # this and set args: ENGINE_VERSION: <version> instead.
-      additional_contexts:
-        engine: ../sendscore
+    build: .
     restart: unless-stopped
     env_file: .env
     ports:

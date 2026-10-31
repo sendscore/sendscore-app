@@ -71,7 +71,7 @@ func deliver(addr, from, to string, raw []byte) error {
 }
 
 func sample(t *testing.T) []byte {
-	raw, err := os.ReadFile("../../../sendscore/testdata/sample.eml")
+	raw, err := os.ReadFile("../../testdata/sample.eml")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -264,6 +264,16 @@ func (s *Store) PromoteEmails(ctx context.Context, emails []string) (int64, erro
 	return total, nil
 }
 
+// PromoteAll grants every account Pro and returns how many changed. It is for
+// an instance with billing off, where no plan is for sale.
+func (s *Store) PromoteAll(ctx context.Context) (int64, error) {
+	res, err := s.DB.ExecContext(ctx, `UPDATE users SET plan = ? WHERE plan != ?`, PlanPro, PlanPro)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // Alert statuses.
 const (
 	AlertPending = "pending"
