@@ -11,7 +11,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sesv2 v1.61.1
 	github.com/emersion/go-smtp v0.25.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
-	github.com/sendscore/sendscore v0.1.0
+	github.com/sendscore/sendscore v0.2.0
 	golang.org/x/net v0.62.0
 	modernc.org/sqlite v1.51.0
 )
