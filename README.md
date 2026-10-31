@@ -4,7 +4,7 @@ The SendScore app: test addresses, newsletter monitoring with alerts, the SMTP r
 
 It is open source (AGPL-3.0), and you run it yourself on your own server with your own domain. It needs a server that can receive mail on port 25 and a domain whose MX record points at it. Many cloud hosts block port 25 until you ask, so check yours first.
 
-There is no hosted version right now. If you would use one, [open an issue](https://github.com/sendscore/sendscore/issues) and say so. To check saved messages without running a server, use the [CLI](https://github.com/sendscore/sendscore).
+There is no hosted version right now. If you would use one, [say so on this issue](https://github.com/sendscore/sendscore/issues/1). To check saved messages without running a server, use the [CLI](https://github.com/sendscore/sendscore).
 
 ## Stack
 

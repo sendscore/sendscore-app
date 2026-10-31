@@ -283,3 +283,18 @@ func TestShutdownWaitsForAMessageInDATA(t *testing.T) {
 		t.Errorf("shutdown: %v", err)
 	}
 }
+
+func TestLongLineInAMessageIsAccepted(t *testing.T) {
+	store, addr, _ := startMonitored(t)
+	u := owner(t, store, "long@example.com")
+	p := publication(t, store, u, false)
+	raw := append(numbered(t, 1), bytes.Repeat([]byte("x"), 8<<10)...)
+	raw = append(raw, "\r\n"...)
+	if err := deliver(addr, "bounce@real.test", "m-"+p.Token+"@in.test", raw); err != nil {
+		t.Fatalf("a message with an 8 KB line was refused: %v", err)
+	}
+	msgs, err := store.PublicationMessages(context.Background(), p.ID, 10)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("stored %d messages, err %v", len(msgs), err)
+	}
+}

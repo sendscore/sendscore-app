@@ -35,6 +35,9 @@ import (
 // MaxMessageBytes is the largest message accepted.
 const MaxMessageBytes = 25 << 20
 
+// maxLineBytes is the longest line accepted, in a command or a message.
+const maxLineBytes = 1 << 20
+
 const (
 	analyzeTimeout = 45 * time.Second
 	saveTimeout    = 10 * time.Second
@@ -189,6 +192,9 @@ func New(cfg Config, store *db.Store, log *slog.Logger) *Receiver {
 	s.Addr = cfg.Addr
 	s.Domain = cfg.MailDomain
 	s.MaxMessageBytes = MaxMessageBytes
+	// Past RFC 5321, but real mail breaks that limit and arrives elsewhere, so
+	// refusing it here would report a failure no subscriber sees.
+	s.MaxLineLength = maxLineBytes
 	// A transaction is for one test address (see Rcpt); the cap only bounds
 	// how often a sender may repeat that address.
 	s.MaxRecipients = 10
