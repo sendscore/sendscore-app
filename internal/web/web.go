@@ -332,7 +332,6 @@ func (a *App) render(w http.ResponseWriter, r *http.Request, status int, page st
 	}
 	data["MailDomain"] = a.cfg.MailDomain
 	data["User"] = userFrom(r.Context())
-	data["ReportDays"] = int(a.cfg.ReportTTL / (24 * time.Hour))
 	data["CSRF"], _ = r.Context().Value(csrfKey).(string)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)

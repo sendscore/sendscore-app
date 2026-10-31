@@ -336,7 +336,7 @@ func TestDailyLimits(t *testing.T) {
 	_, store, h := newApp(t, func(c *Config) { c.DailyTests = 2; c.AnonDailyTests = 1 })
 	u, session, tok := newUser(t, store, "daily@example.com")
 
-	// Free accounts: the API and the signed-in page share the allowance.
+	// The API and the signed-in page share the allowance.
 	if w := apiDo(h, "POST", "/api/v1/test-addresses", tok); w.Code != 201 {
 		t.Fatalf("first = %d", w.Code)
 	}
