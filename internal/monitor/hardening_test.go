@@ -270,3 +270,116 @@ func TestPermanentOnlyMatchesRefusals(t *testing.T) {
 		t.Error("Permanent")
 	}
 }
+
+// slowMailer takes longer than the status write's timeout, then fails, as a
+// send does when SES hangs.
+type slowMailer struct {
+	wait  time.Duration
+	calls int
+}
+
+func (m *slowMailer) SendAlert(context.Context, mail.Alert) error {
+	m.calls++
+	time.Sleep(m.wait)
+	return errors.New("deadline exceeded")
+}
+
+func TestASendThatTimesOutIsStillRetried(t *testing.T) {
+	old := statusTimeout
+	statusTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { statusTimeout = old })
+	f := setup(t, utc("2026-10-26T07:00:00Z"))
+	f.mon.Mailer = &slowMailer{wait: 60 * time.Millisecond}
+	p := f.publication(t, db.Publication{})
+	f.receive(t, p, good())
+	f.receive(t, p, bad())
+	if k := strings.Join(kinds(t, f, p), " "); k != "worse:pending" {
+		t.Errorf("alerts = %s, want it waiting to be retried", k)
+	}
+}
+
+func TestSkippedChecksAloneAreNotWorse(t *testing.T) {
+	cur := good()
+	cur.ReadyToSend = false
+	cur.Checks = []verdict.Check{{ID: "auth.dkim", Status: verdict.Skipped}}
+	if w := Worse(good(), cur); len(w) != 0 {
+		t.Errorf("Worse = %v, want nothing when a check could not run", w)
+	}
+}
+
+func TestPausingStopsAQueuedRetry(t *testing.T) {
+	for name, change := range map[string]func(*db.Publication){
+		"paused": func(p *db.Publication) { p.Paused = true },
+		"moved":  func(p *db.Publication) { p.AlertEmail = "new@example.com" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := setup(t, utc("2026-10-26T07:00:00Z"))
+			ctx := context.Background()
+			p := f.publication(t, db.Publication{})
+			f.out.setFail(true)
+			f.receive(t, p, good())
+			f.receive(t, p, bad())
+			f.out.setFail(false)
+			change(&p)
+			if err := f.store.UpdatePublication(ctx, &p); err != nil {
+				t.Fatal(err)
+			}
+			f.clock.Set(f.clock.Now().Add(time.Hour))
+			f.mon.Tick(ctx)
+			if n := len(f.out.all()); n != 0 {
+				t.Errorf("sent %d", n)
+			}
+			if k := strings.Join(kinds(t, f, p), " "); k != "worse:stopped" {
+				t.Errorf("alerts = %s", k)
+			}
+		})
+	}
+}
+
+func TestReceivedReportsAnAlertItCouldNotStore(t *testing.T) {
+	f := setup(t, utc("2026-10-26T07:00:00Z"))
+	p := f.publication(t, db.Publication{})
+	prev := f.receive(t, p, good())
+	m := f.receive(t, p, good())
+	m.Verdict = bad()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := f.mon.Received(ctx, p, m, prev); err == nil {
+		t.Error("no error, so the sender would not retry")
+	}
+}
+
+func TestATickWithFailedQueriesDoesNotCount(t *testing.T) {
+	f := setup(t, utc("2026-10-26T07:00:00Z"))
+	f.mon.Tick(context.Background())
+	if f.mon.LastTick().IsZero() {
+		t.Fatal("a clean tick was not recorded")
+	}
+	m := f.newMonitor()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	m.Tick(ctx)
+	if !m.LastTick().IsZero() {
+		t.Error("a tick whose queries failed counted as healthy")
+	}
+}
+
+func TestATickStopsSendingAtItsBudget(t *testing.T) {
+	old := tickSendBudget
+	tickSendBudget = 10 * time.Millisecond
+	t.Cleanup(func() { tickSendBudget = old })
+	f := setup(t, utc("2026-10-26T07:00:00Z"))
+	ctx := context.Background()
+	for i := range 5 {
+		p := f.publication(t, db.Publication{Name: fmt.Sprint("n", i)})
+		if _, err := f.store.AddAlert(ctx, &db.Alert{PublicationID: p.ID, Kind: KindWorse, Key: "k", To: p.AlertEmail}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	slow := &slowMailer{wait: 30 * time.Millisecond}
+	f.mon.Mailer = slow
+	f.mon.Tick(ctx)
+	if slow.calls != 1 {
+		t.Errorf("sent %d in one tick, want the budget to stop it after 1", slow.calls)
+	}
+}

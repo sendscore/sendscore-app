@@ -180,8 +180,7 @@ func TestWorseIssueAlertsOnce(t *testing.T) {
 	if a.To != "alerts@example.com" || !strings.Contains(a.Subject, "worse") {
 		t.Errorf("alert to %q subject %q", a.To, a.Subject)
 	}
-	for _, want := range []string{"DKIM signature now fails (auth.dkim).", "which made auth.dkim worse",
-		"The previous issue was ready to send, and this one is not.", "http://test/r/" + m.ID,
+	for _, want := range []string{"DKIM signature now fails (auth.dkim).", "which made auth.dkim worse", "http://test/r/" + m.ID,
 		"http://test/newsletters/" + p.ID, "You get this email because"} {
 		if !strings.Contains(a.Text, want) {
 			t.Errorf("text is missing %q:\n%s", want, a.Text)
@@ -233,7 +232,13 @@ func TestMissedIssueAlertsOnceAndSurvivesRestart(t *testing.T) {
 	if n := len(f.out.all()); n != 0 {
 		t.Fatalf("alerted %d times before the deadline", n)
 	}
+	// At the deadline an issue may still be being checked, so it waits.
 	f.clock.Set(utc("2026-10-26T11:30:00Z"))
+	f.mon.Tick(ctx)
+	if n := len(f.out.all()); n != 0 {
+		t.Fatalf("alerted %d times with an issue possibly still being checked", n)
+	}
+	f.clock.Set(utc("2026-10-26T11:32:00Z"))
 	f.mon.Tick(ctx)
 	sent := f.out.all()
 	if len(sent) != 1 || !strings.Contains(sent[0].Subject, "has not arrived") {
@@ -244,7 +249,7 @@ func TestMissedIssueAlertsOnceAndSurvivesRestart(t *testing.T) {
 	}
 	// Every minute after, and after a restart, nothing more is sent.
 	for i := range 5 {
-		f.clock.Set(utc("2026-10-26T11:31:00Z").Add(time.Duration(i) * time.Minute))
+		f.clock.Set(utc("2026-10-26T11:33:00Z").Add(time.Duration(i) * time.Minute))
 		f.mon.Tick(ctx)
 	}
 	f.mon = f.newMonitor()
@@ -265,7 +270,7 @@ func TestMissedIssueAlertsOnceAndSurvivesRestart(t *testing.T) {
 	if n := len(f.out.all()); n != 1 {
 		t.Errorf("alerted at the summer time deadline in winter")
 	}
-	f.clock.Set(utc("2026-11-02T12:30:00Z"))
+	f.clock.Set(utc("2026-11-02T12:32:00Z"))
 	f.mon.Tick(ctx)
 	if n := len(f.out.all()); n != 2 {
 		t.Errorf("sent %d alerts, want a second one for 2 November", n)

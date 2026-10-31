@@ -113,7 +113,7 @@ An alert address other than the account's own has to accept first, because alert
 
 Alerts are emailed through SES from `SENDSCORE_ALERT_FROM` to the newsletter's alert address, as plain text and simple HTML with no tracking. Each says why it was sent and links to the newsletter page, where alerts can be redirected, paused, or rescheduled. One is sent:
 
-- when a new issue is worse than the previous one, meaning a check that fails now and did not before, a change the engine marks as worsened, or ready to send going from yes to no;
+- when a new issue is worse than the previous one, meaning a check that fails now and did not before, or a change the engine marks as worsened. A check that could not run, as in a DNS outage, is not an alert;
 - when the expected issue has not arrived by the slot's time plus the grace period (a late issue that arrives before the heartbeat runs cancels it);
 - when a second issue arrives for the same slot (that alert also lists anything that got worse).
 

@@ -59,6 +59,20 @@ const (
 // taken to have stopped while sending it.
 const staleSending = 5 * time.Minute
 
+// missedSettle is how long after a deadline a missed issue waits to be
+// reported. An issue is only counted once it is saved, and one that arrived
+// in time may still be waiting for a turn to be checked, or being checked.
+const missedSettle = 2 * time.Minute
+
+// tickSendBudget bounds the time one heartbeat spends sending alerts, so a
+// slow SES cannot stall missed-issue checks or fail the health check. What
+// is left waits for the next tick. statusTimeout bounds writing what happened
+// to an alert. Variables for tests.
+var (
+	tickSendBudget = 45 * time.Second
+	statusTimeout  = 10 * time.Second
+)
+
 // missedWindow is how long after a deadline a missed issue is still
 // reported, so a restart after a long outage does not send stale alerts.
 const missedWindow = 24 * time.Hour
@@ -80,7 +94,8 @@ type Monitor struct {
 	lastTick atomic.Int64
 }
 
-// LastTick is when the heartbeat last finished, or zero before the first.
+// LastTick is when the heartbeat last finished with every query working, or
+// zero before the first.
 func (m *Monitor) LastTick() time.Time {
 	if n := m.lastTick.Load(); n != 0 {
 		return time.Unix(n, 0)
@@ -91,10 +106,12 @@ func (m *Monitor) LastTick() time.Time {
 // Received is called once a publication's message is saved, with the
 // issue before it (nil for the first). It sends at most one alert for the
 // message: when it is a second issue in the same slot, or when it is worse
-// than the previous issue. A paused publication gets none.
-func (m *Monitor) Received(ctx context.Context, p db.Publication, msg, prev *db.Message) {
+// than the previous issue. A paused publication gets none. An error means
+// the alert could not be stored, so the sender should be told to retry, and
+// a retry decides again.
+func (m *Monitor) Received(ctx context.Context, p db.Publication, msg, prev *db.Message) error {
 	if p.Paused || msg.Kind != db.KindIssue {
-		return
+		return nil
 	}
 	var worse []string
 	if prev != nil {
@@ -104,7 +121,7 @@ func (m *Monitor) Received(ctx context.Context, p db.Publication, msg, prev *db.
 	if !msg.SlotAt.IsZero() {
 		n, err := m.Store.IssuesInSlot(ctx, p.ID, msg.SlotAt, msg.ID)
 		if err != nil {
-			m.Log.Error("count issues in slot", "publication", p.ID, "err", err)
+			return fmt.Errorf("count issues in slot: %w", err)
 		}
 		dup = n > 0
 	}
@@ -112,20 +129,25 @@ func (m *Monitor) Received(ctx context.Context, p db.Publication, msg, prev *db.
 		// Two issues for one send: one alert for the slot, which also says
 		// what got worse. A later issue in the slot has no duplicate alert to
 		// send, so what it made worse needs its own.
-		if m.enqueue(ctx, p, KindDuplicate, slotKey(msg.SlotAt), msg.ID, m.duplicateAlert(ctx, p, msg, worse)) || len(worse) == 0 {
-			return
+		added, err := m.enqueue(ctx, p, KindDuplicate, slotKey(msg.SlotAt), msg.ID, m.duplicateAlert(ctx, p, msg, worse))
+		if err != nil || added || len(worse) == 0 {
+			return err
 		}
 	}
 	if len(worse) > 0 {
-		m.enqueue(ctx, p, KindWorse, "report:"+msg.ID, msg.ID, m.worseAlert(ctx, p, msg, worse))
+		_, err := m.enqueue(ctx, p, KindWorse, "report:"+msg.ID, msg.ID, m.worseAlert(ctx, p, msg, worse))
+		return err
 	}
+	return nil
 }
 
 func slotKey(t time.Time) string { return fmt.Sprintf("slot:%d", t.Unix()) }
 
 // Worse lists how cur is worse than prev, in sentences: a check that fails
-// now and did not before, a change that made a check worse, and ready to
-// send turning from yes to no. It is empty when nothing got worse.
+// now and did not before, and a change that made a check worse. It is empty
+// when nothing got worse. Ready to send turning from yes to no is not listed
+// on its own: a failure behind it is listed already, and otherwise a check
+// could not run, as in a DNS outage here, which says nothing about the issue.
 func Worse(prev, cur *verdict.Verdict) []string {
 	var out []string
 	before := map[string]verdict.Status{}
@@ -142,9 +164,6 @@ func Worse(prev, cur *verdict.Verdict) []string {
 			out = append(out, fmt.Sprintf("%s changed from %v to %v, which made %s worse.", c.Field, show(c.Before), show(c.After), c.Worsened))
 		}
 	}
-	if prev.ReadyToSend && !cur.ReadyToSend {
-		out = append(out, "The previous issue was ready to send, and this one is not.")
-	}
 	return out
 }
 
@@ -155,52 +174,67 @@ func show(v any) string {
 	return "nothing"
 }
 
-// Tick runs one heartbeat: it sends the missed-issue alert for each
+// Tick runs one heartbeat: it stores the missed-issue alert for each
 // scheduled publication whose latest deadline passed with no issue, sends
 // alerts waiting to be sent, and gives up on any left half sent by a
-// process that stopped.
+// process that stopped. The health check counts a tick only when every query
+// in it worked.
 func (m *Monitor) Tick(ctx context.Context) {
 	now := m.Store.Now()
+	healthy := true
 	pubs, err := m.Store.ScheduledPublications(ctx)
 	if err != nil {
 		m.Log.Error("heartbeat publications", "err", err)
+		healthy = false
 	}
 	for _, p := range pubs {
-		m.checkMissed(ctx, p, now)
+		healthy = m.checkMissed(ctx, p, now) && healthy
 	}
 	if n, err := m.Store.FailStaleAlerts(ctx, now.Add(-staleSending)); err != nil {
 		m.Log.Error("stale alerts", "err", err)
+		healthy = false
 	} else if n > 0 {
 		m.Log.Warn("alerts left half sent were not retried", "count", n)
 	}
 	pending, err := m.Store.PendingAlerts(ctx, 100)
 	if err != nil {
 		m.Log.Error("pending alerts", "err", err)
+		healthy = false
 	}
+	start := time.Now()
 	for _, a := range pending {
+		if time.Since(start) >= tickSendBudget {
+			break
+		}
 		m.deliver(ctx, a.ID)
 	}
-	m.lastTick.Store(time.Now().Unix())
+	if healthy {
+		m.lastTick.Store(time.Now().Unix())
+	}
 }
 
-func (m *Monitor) checkMissed(ctx context.Context, p db.Publication, now time.Time) {
+// checkMissed stores the alert for p's latest slot if its issue was missed,
+// for the rest of the tick to send. It returns false when a query failed.
+func (m *Monitor) checkMissed(ctx context.Context, p db.Publication, now time.Time) bool {
 	s, ok := ScheduleOf(p)
 	if !ok {
-		return
+		return true
 	}
 	slot := s.LastDue(now)
 	deadline := s.Deadline(slot)
 	// A deadline from before the schedule was set (or alerts were turned
 	// back on), or from long ago, is not reported.
-	if !deadline.After(p.WatchSince) || now.Sub(deadline) > missedWindow {
-		return
+	if !deadline.After(p.WatchSince) || now.Sub(deadline) > missedWindow || now.Sub(deadline) < missedSettle {
+		return true
 	}
 	key := slotKey(slot)
-	if done, err := m.Store.HasAlert(ctx, p.ID, KindMissed, key); err != nil || done {
-		if err != nil {
-			m.Log.Error("missed alert lookup", "publication", p.ID, "err", err)
-		}
-		return
+	done, err := m.Store.HasAlert(ctx, p.ID, KindMissed, key)
+	if err != nil {
+		m.Log.Error("missed alert lookup", "publication", p.ID, "err", err)
+		return false
+	}
+	if done {
+		return true
 	}
 	// An issue anywhere in the slot's window, even a late one that arrived
 	// after the deadline while the heartbeat was not running, means it was
@@ -209,12 +243,16 @@ func (m *Monitor) checkMissed(ctx context.Context, p db.Publication, now time.Ti
 	n, err := m.Store.IssuesBetween(ctx, p.ID, start, minTime(end, now.Add(time.Second)))
 	if err != nil {
 		m.Log.Error("count issues", "publication", p.ID, "err", err)
-		return
+		return false
 	}
 	if n > 0 {
-		return
+		return true
 	}
-	m.enqueue(ctx, p, KindMissed, key, "", m.missedAlert(ctx, p, s, slot))
+	if _, _, err := m.add(ctx, p, KindMissed, key, "", m.missedAlert(ctx, p, s, slot)); err != nil {
+		m.Log.Error("add alert", "publication", p.ID, "err", err)
+		return false
+	}
+	return true
 }
 
 func minTime(a, b time.Time) time.Time {
@@ -257,11 +295,20 @@ func (m *Monitor) caps(p db.Publication) []db.Cap {
 	}
 }
 
-// enqueue stores an alert, once per publication, kind, and key, then sends
-// it, and reports whether it was new. Over a cap it is kept as capped and
-// never sent. An alert to an address that opted out is not counted, and
-// deliver stops it.
-func (m *Monitor) enqueue(ctx context.Context, p db.Publication, kind, key, reportID string, a mail.Alert) bool {
+// enqueue stores an alert and sends it, and reports whether it was new.
+func (m *Monitor) enqueue(ctx context.Context, p db.Publication, kind, key, reportID string, a mail.Alert) (bool, error) {
+	id, added, err := m.add(ctx, p, kind, key, reportID, a)
+	if id != "" {
+		m.deliver(ctx, id)
+	}
+	return added, err
+}
+
+// add stores an alert, once per publication, kind, and key, and reports
+// whether it was new, with its id when it should be sent. Over a cap it is
+// kept as capped and never sent. An alert to an address that opted out is
+// not counted, and deliver stops it.
+func (m *Monitor) add(ctx context.Context, p db.Publication, kind, key, reportID string, a mail.Alert) (id string, added bool, err error) {
 	row := &db.Alert{PublicationID: p.ID, Kind: kind, Key: key, ReportID: reportID, To: p.AlertEmail,
 		Subject: a.Subject, Text: a.Text, HTML: a.HTML}
 	var caps []db.Cap
@@ -271,20 +318,18 @@ func (m *Monitor) enqueue(ctx context.Context, p db.Publication, kind, key, repo
 	} else if !stopped {
 		caps = m.caps(p)
 	}
-	added, err := m.Store.AddAlert(ctx, row, caps...)
+	added, err = m.Store.AddAlert(ctx, row, caps...)
 	if err != nil {
-		m.Log.Error("add alert", "publication", p.ID, "err", err)
-		return false
+		return "", false, fmt.Errorf("add alert: %w", err)
 	}
 	if !added {
-		return false
+		return "", false, nil
 	}
 	if row.Status == db.AlertCapped {
 		m.Log.Warn("alert over a cap, not sent", "publication", p.ID, "kind", kind)
-		return true
+		return "", true, nil
 	}
-	m.deliver(ctx, row.ID)
-	return true
+	return row.ID, true, nil
 }
 
 // retryAt is when an alert that has failed attempts times may be tried
@@ -307,16 +352,26 @@ func (m *Monitor) deliver(ctx context.Context, id string) {
 		}
 		return
 	}
-	// A fresh context, so a request that ended cannot leave it claimed.
-	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
-	setStatus := func(status, errText string) {
-		if err := m.Store.SetAlertStatus(sctx, a.ID, status, errText); err != nil {
+	// Each write gets a fresh context, made after the send, so neither a
+	// request that ended nor a send that used up its own timeout can leave
+	// the alert claimed, which would give it up for good.
+	status := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.WithoutCancel(ctx), statusTimeout)
+	}
+	setStatus := func(st, errText string) {
+		sctx, cancel := status()
+		defer cancel()
+		if err := m.Store.SetAlertStatus(sctx, a.ID, st, errText); err != nil {
 			m.Log.Error("alert status", "err", err)
 		}
 	}
-	// Checked here too, since a retry may come after the recipient opted out.
+	// Checked here too, since a retry may come after the recipient opted out,
+	// the owner paused alerts, or they moved to another address.
 	if stopped, err := m.Store.AlertsStopped(ctx, a.To); err == nil && stopped {
+		setStatus(db.AlertStopped, "")
+		return
+	}
+	if p, err := m.Store.PublicationByID(ctx, a.PublicationID); err == nil && (p.Paused || !strings.EqualFold(p.AlertEmail, a.To)) {
 		setStatus(db.AlertStopped, "")
 		return
 	}
@@ -333,6 +388,8 @@ func (m *Monitor) deliver(ctx context.Context, id string) {
 		setStatus(db.AlertFailed, err.Error())
 		return
 	}
+	sctx, cancel := status()
+	defer cancel()
 	if err := m.Store.RetryAlert(sctx, a.ID, err.Error(), next); err != nil {
 		m.Log.Error("alert retry", "err", err)
 	}

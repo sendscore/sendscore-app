@@ -101,13 +101,10 @@ func TestRetryDecidesAnAlertLostInACrash(t *testing.T) {
 	}
 	// As if the process stopped after saving, before any alert was made: the
 	// second issue is worse, and nothing has been said about it.
-	second.Verdict.ReadyToSend = false
-	first.Verdict.ReadyToSend = true
-	if _, err := store.DB.Exec(`UPDATE messages SET verdict = json_set(verdict, '$.ready_to_send', json('true')) WHERE id = ?`, first.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.DB.Exec(`UPDATE messages SET verdict = json_set(verdict, '$.ready_to_send', json('false')) WHERE id = ?`, second.ID); err != nil {
-		t.Fatal(err)
+	for _, set := range []struct{ id, status string }{{first.ID, "pass"}, {second.ID, "fail"}} {
+		if _, err := store.DB.Exec(`UPDATE messages SET verdict = json_set(verdict, '$.checks[0].status', ?) WHERE id = ?`, set.status, set.id); err != nil {
+			t.Fatal(err)
+		}
 	}
 	before := out.count()
 	if err := deliver(addr, "bounce@real.test", to, numbered(t, 2)); err != nil {

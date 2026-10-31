@@ -569,8 +569,10 @@ func (r *Receiver) readBody(rd io.Reader) ([]byte, func(), error) {
 // redelivered handles a retry of a message already saved, as when the sender
 // never saw the 250 because the process stopped or it timed out. The message
 // is not stored or counted twice. Alerts are decided again, each sent once,
-// so one lost in the stop still goes out.
-func (r *Receiver) redelivered(p db.Publication, hash string) bool {
+// so one lost in the stop still goes out. It reports whether the message was
+// a retry, and an error when alerts could not be decided, so the sender
+// tries again.
+func (r *Receiver) redelivered(p db.Publication, hash string) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), alertTimeout)
 	defer cancel()
 	m, err := r.store.MessageByDedupe(ctx, p.ID, hash, r.store.Now().Add(-dedupeWindow))
@@ -578,21 +580,19 @@ func (r *Receiver) redelivered(p db.Publication, hash string) bool {
 		if !errors.Is(err, db.ErrNotFound) {
 			r.log.Error("message lookup", "publication", p.ID, "err", err)
 		}
-		return false
+		return false, nil
 	}
 	r.log.Info("redelivered", "report", m.ID, "publication", p.ID)
 	if r.cfg.Monitor == nil {
-		return true
+		return true, nil
 	}
 	prev, err := r.store.IssueBefore(ctx, p.ID, m.ID)
 	if errors.Is(err, db.ErrNotFound) {
 		prev = nil
 	} else if err != nil {
-		r.log.Error("previous issue", "publication", p.ID, "err", err)
-		return true
+		return true, fmt.Errorf("previous issue: %w", err)
 	}
-	r.cfg.Monitor.Received(ctx, p, m, prev)
-	return true
+	return true, r.cfg.Monitor.Received(ctx, p, m, prev)
 }
 
 func (s *session) Data(rd io.Reader) error {
@@ -622,22 +622,29 @@ func (s *session) Data(rd io.Reader) error {
 		return &smtp.SMTPError{Code: 552, EnhancedCode: smtp.EnhancedCode{5, 3, 4}, Message: "Message too large"}
 	}
 	dedupe := ""
+	var turn func()
 	if s.pub != nil {
 		sum := sha256.Sum256(raw)
 		dedupe = hex.EncodeToString(sum[:])
-		if s.r.redelivered(*s.pub, dedupe) {
+		if again, err := s.r.redelivered(*s.pub, dedupe); err != nil {
+			s.r.log.Error("redelivered", "publication", s.pub.ID, "err", err)
+			return errTemporary
+		} else if again {
 			return nil
 		}
 	}
 	if s.r.storageFull(ctx) {
 		return errStorageFull
 	}
-	// A turn to be checked, held from here to the save.
+	// A turn to be checked, held from here to the save, so a slow alert send
+	// after it holds no slot.
 	wait := time.NewTimer(analyzeWait)
 	defer wait.Stop()
 	select {
 	case s.r.analyzing <- struct{}{}:
-		defer func() { <-s.r.analyzing }()
+		endTurn := sync.OnceFunc(func() { <-s.r.analyzing })
+		defer endTurn()
+		turn = endTurn
 	case <-wait.C:
 		return errBusy
 	}
@@ -698,12 +705,18 @@ func (s *session) Data(rd io.Reader) error {
 		s.r.log.Error("save message", "err", err)
 		return errTemporary
 	}
+	turn()
 	s.r.log.Info("received", "report", m.ID, "from", s.from, "ip", m.RemoteIP, "verdict", v.Verdict, "publication", m.PublicationID)
 	if s.pub != nil && s.r.cfg.Monitor != nil {
 		// Its own deadline, covering an alert's send.
 		mctx, mcancel := context.WithTimeout(context.Background(), alertTimeout)
 		defer mcancel()
-		s.r.cfg.Monitor.Received(mctx, *s.pub, m, prev)
+		if err := s.r.cfg.Monitor.Received(mctx, *s.pub, m, prev); err != nil {
+			// The sender retries, the retry is recognized, and alerts are
+			// decided again, so saving the message first loses nothing.
+			s.r.log.Error("alert", "publication", s.pub.ID, "err", err)
+			return errTemporary
+		}
 	}
 	return nil
 }
