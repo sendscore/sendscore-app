@@ -10,7 +10,9 @@ package receiver
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -43,10 +45,21 @@ const (
 	maxBodyTime = 10 * time.Minute
 	// messagesPerSession is how many messages one connection may deliver.
 	messagesPerSession = 10
+	// analyzeWait is how long a message waits for a turn to be checked
+	// before the sender is told to try again.
+	analyzeWait = 30 * time.Second
+	// dedupeWindow is how far back a sender's retry is recognized, longer
+	// than the days a mail server keeps retrying.
+	dedupeWindow = 7 * 24 * time.Hour
 )
 
-// readTimeout bounds each read from a sender (a variable for tests).
-var readTimeout = 60 * time.Second
+// readTimeout bounds each read from a sender, and maxSessionTime one whole
+// connection, however busy, so a slot cannot be held forever with NOOPs
+// (variables for tests).
+var (
+	readTimeout    = 60 * time.Second
+	maxSessionTime = 20 * time.Minute
+)
 
 // Defaults for the volume limits in Config.
 const (
@@ -58,13 +71,26 @@ const (
 	// A monitoring address takes this many messages a UTC day, far more
 	// than any newsletter sends.
 	DefaultPublicationDailyMessages = 50
+	// DefaultDailyBytes is what one account, or anonymous senders together,
+	// may have stored in a UTC day, across test and monitoring addresses.
+	DefaultDailyBytes = 1 << 30
+	// DefaultAnonDailyMessages is what all anonymous test addresses accept
+	// in a UTC day, together.
+	DefaultAnonDailyMessages = 200
+	// DefaultMaxStorageBytes is the size of the database at which new mail
+	// is turned away with a temporary refusal.
+	DefaultMaxStorageBytes = 10 << 30
+	// DefaultMaxBufferedBytes bounds messages held in memory across all
+	// sessions, and DefaultMaxAnalyzing the messages checked at once.
+	DefaultMaxBufferedBytes = 256 << 20
+	DefaultMaxAnalyzing     = 8
 )
 
 // Config configures the receiver.
 type Config struct {
 	Addr string
 	// MailDomain is the domain test addresses live on, such as
-	// in.sendscore.ai. Mail for any other domain is refused.
+	// in.example.com. Mail for any other domain is refused.
 	MailDomain string
 	// ReportTTL is how long a received message and its report are kept.
 	ReportTTL time.Duration
@@ -90,6 +116,16 @@ type Config struct {
 	// PublicationDailyMessages is how many messages one monitoring address
 	// takes per UTC day. Zero means the default.
 	PublicationDailyMessages int
+	// DailyBytes is how much one account, or anonymous senders together, may
+	// have stored in a UTC day. AnonDailyMessages is what all anonymous
+	// addresses accept in a UTC day. MaxStorageBytes is the database size at
+	// which mail is refused. MaxBufferedBytes bounds messages in memory, and
+	// MaxAnalyzing the messages checked at once. Zero means the default.
+	DailyBytes        int
+	AnonDailyMessages int
+	MaxStorageBytes   int64
+	MaxBufferedBytes  int64
+	MaxAnalyzing      int
 	// HistoryTTL is how long a pro account's publication messages are kept.
 	// Other publication messages are kept for ReportTTL.
 	HistoryTTL time.Duration
@@ -106,9 +142,13 @@ type Receiver struct {
 	server *smtp.Server
 	// readTimeout is the package's, taken when the receiver is built.
 	readTimeout time.Duration
+	sessionTime time.Duration
 
 	connMu sync.Mutex
 	conns  map[string]int // open connections per IP, and "" for the total
+
+	buffered  atomic.Int64  // bytes of messages held in memory
+	analyzing chan struct{} // a slot per message being checked
 }
 
 // New builds a receiver.
@@ -134,7 +174,23 @@ func New(cfg Config, store *db.Store, log *slog.Logger) *Receiver {
 	if cfg.HistoryTTL == 0 {
 		cfg.HistoryTTL = cfg.ReportTTL
 	}
-	r := &Receiver{cfg: cfg, store: store, log: log, conns: map[string]int{}, readTimeout: readTimeout}
+	if cfg.DailyBytes == 0 {
+		cfg.DailyBytes = DefaultDailyBytes
+	}
+	if cfg.AnonDailyMessages == 0 {
+		cfg.AnonDailyMessages = DefaultAnonDailyMessages
+	}
+	if cfg.MaxStorageBytes == 0 {
+		cfg.MaxStorageBytes = DefaultMaxStorageBytes
+	}
+	if cfg.MaxBufferedBytes == 0 {
+		cfg.MaxBufferedBytes = DefaultMaxBufferedBytes
+	}
+	if cfg.MaxAnalyzing == 0 {
+		cfg.MaxAnalyzing = DefaultMaxAnalyzing
+	}
+	r := &Receiver{cfg: cfg, store: store, log: log, conns: map[string]int{}, readTimeout: readTimeout, sessionTime: maxSessionTime,
+		analyzing: make(chan struct{}, cfg.MaxAnalyzing)}
 	s := smtp.NewServer(r)
 	s.Addr = cfg.Addr
 	s.Domain = cfg.MailDomain
@@ -178,10 +234,10 @@ func (l *limitListener) Accept() (net.Conn, error) {
 		}
 		ip := ""
 		if addr, ok := c.RemoteAddr().(*net.TCPAddr); ok {
-			ip = addr.IP.String()
+			ip = connKey(addr.IP)
 		}
 		if l.r.takeConn(ip) {
-			return &countedConn{Conn: c, timeout: l.r.readTimeout, release: func() { l.r.releaseConn(ip) }}, nil
+			return &countedConn{Conn: c, timeout: l.r.readTimeout, end: time.Now().Add(l.r.sessionTime), release: func() { l.r.releaseConn(ip) }}, nil
 		}
 		go func() {
 			_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -189,6 +245,15 @@ func (l *limitListener) Accept() (net.Conn, error) {
 			_ = c.Close()
 		}()
 	}
+}
+
+// connKey is what sessions are counted against: an IPv4 address, or an IPv6
+// /64, since one host usually has the whole network.
+func connKey(ip net.IP) string {
+	if ip.To4() != nil {
+		return ip.String()
+	}
+	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
 }
 
 func (r *Receiver) takeConn(ip string) bool {
@@ -214,20 +279,38 @@ func (r *Receiver) releaseConn(ip string) {
 // countedConn gives its slot back once, when closed. While a message body
 // is arriving (bodyUntil is set), each read gets a fresh read deadline,
 // because go-smtp sets one only for the DATA line and its body reader fills
-// a whole buffer in one call.
+// a whole buffer in one call. No read deadline ever passes end, which is what
+// bounds a whole session.
 type countedConn struct {
 	net.Conn
 	once      sync.Once
 	release   func()
 	timeout   time.Duration
+	end       time.Time
 	bodyUntil atomic.Int64 // Unix nanoseconds, or 0
 }
 
 func (c *countedConn) Read(p []byte) (int, error) {
 	if end := c.bodyUntil.Load(); end != 0 {
-		_ = c.Conn.SetReadDeadline(minTime(time.Now().Add(c.timeout), time.Unix(0, end)))
+		_ = c.Conn.SetReadDeadline(minTime(minTime(time.Now().Add(c.timeout), time.Unix(0, end)), c.end))
 	}
 	return c.Conn.Read(p)
+}
+
+// SetReadDeadline keeps every deadline go-smtp sets within the session.
+func (c *countedConn) SetReadDeadline(t time.Time) error {
+	if t.IsZero() {
+		t = c.end
+	}
+	return c.Conn.SetReadDeadline(minTime(t, c.end))
+}
+
+// SetDeadline is SetReadDeadline with a write deadline.
+func (c *countedConn) SetDeadline(t time.Time) error {
+	if err := c.Conn.SetWriteDeadline(t); err != nil {
+		return err
+	}
+	return c.SetReadDeadline(t)
 }
 
 // counted finds the countedConn under a session's connection, which is a
@@ -288,6 +371,25 @@ var errSessionFull = &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{
 
 var errTemporary = &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0}, Message: "Temporary failure, try again"}
 
+var errBusy = &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 2}, Message: "Too many messages are being checked right now, try again later"}
+
+var errStorageFull = &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 3, 1}, Message: "This server is out of storage for messages, try again later"}
+
+// storageFull reports whether the database has reached MaxStorageBytes. A
+// failed check lets the message through, since a full disk fails on its own.
+func (r *Receiver) storageFull(ctx context.Context) bool {
+	n, err := r.store.SizeBytes(ctx)
+	if err != nil {
+		r.log.Error("database size", "err", err)
+		return false
+	}
+	if n >= r.cfg.MaxStorageBytes {
+		r.log.Error("refusing mail: the database reached SENDSCORE_MAX_STORAGE_MB", "bytes", n)
+		return true
+	}
+	return false
+}
+
 func (s *session) Mail(from string, _ *smtp.MailOptions) error {
 	if s.sent >= messagesPerSession {
 		return errSessionFull
@@ -311,6 +413,9 @@ func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 	local, domain, ok := strings.Cut(strings.ToLower(strings.Trim(to, "<>")), "@")
 	if !ok || domain != strings.ToLower(s.r.cfg.MailDomain) {
 		return errNoMailbox
+	}
+	if s.r.storageFull(context.Background()) {
+		return errStorageFull
 	}
 	if strings.HasPrefix(local, "m-") {
 		return s.rcptPublication(to, strings.TrimPrefix(local, "m-"))
@@ -402,10 +507,11 @@ func (s *session) rcptPublication(to, token string) error {
 }
 
 // publicationLimit is the daily count a monitoring address's messages are
-// taken against. It does not count against the account's test messages.
+// taken against. It does not count against the account's test messages, so
+// a burst of tests cannot cost an issue; the account's bytes cover both.
 func (r *Receiver) publicationLimit(pubID string) limit {
-	return limit{"messages:pub:" + pubID, db.Day(r.store.Now()), r.cfg.PublicationDailyMessages, 48 * time.Hour,
-		&smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 2, 2},
+	return limit{name: "messages:pub:" + pubID, bucket: db.Day(r.store.Now()), limit: r.cfg.PublicationDailyMessages, keep: 48 * time.Hour,
+		err: &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 2, 2},
 			Message: fmt.Sprintf("This monitoring address has received its %d messages for today, try again after midnight UTC", r.cfg.PublicationDailyMessages)}}
 }
 
@@ -415,45 +521,103 @@ type limit struct {
 	limit        int
 	keep         time.Duration
 	err          *smtp.SMTPError
+	n            int // how much one message counts for, 1 when zero
+}
+
+// bytesLimit is the daily count of bytes stored for an account, or for
+// anonymous senders together.
+func (r *Receiver) bytesLimit(owner string, n int) limit {
+	name := "bytes:anon"
+	if owner != "" {
+		name = "bytes:user:" + owner
+	}
+	return limit{name: name, bucket: db.Day(r.store.Now()), limit: r.cfg.DailyBytes, keep: 48 * time.Hour, n: n,
+		err: &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 2, 2},
+			Message: "This account has stored all it may for today, try again after midnight UTC"}}
 }
 
 // limits are the counts a message to the address is taken against: the
-// address's lifetime allowance, and its account's daily one.
+// address's lifetime allowance, and its account's daily one, or for an
+// anonymous address, what all of them take together.
 func (r *Receiver) limits(token, owner string, daily int) []limit {
-	ls := []limit{{"messages:addr:" + token, "all", r.cfg.MessagesPerAddress, 8 * 24 * time.Hour,
-		&smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 2, 2},
+	ls := []limit{{name: "messages:addr:" + token, bucket: "all", limit: r.cfg.MessagesPerAddress, keep: 8 * 24 * time.Hour,
+		err: &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 2, 2},
 			Message: fmt.Sprintf("This test address has taken its %d messages, get a new test address", r.cfg.MessagesPerAddress)}}}
 	if owner != "" {
-		ls = append(ls, limit{"messages:user:" + owner, db.Day(r.store.Now()), daily, 48 * time.Hour,
-			&smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 2, 2},
+		return append(ls, limit{name: "messages:user:" + owner, bucket: db.Day(r.store.Now()), limit: daily, keep: 48 * time.Hour,
+			err: &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 2, 2},
 				Message: fmt.Sprintf("This account has received its %d messages for today, try again after midnight UTC", daily)}})
 	}
-	return ls
+	return append(ls, limit{name: "messages:anon", bucket: db.Day(r.store.Now()), limit: r.cfg.AnonDailyMessages, keep: 48 * time.Hour,
+		err: &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 2, 2},
+			Message: "Test addresses have taken all they may for today, try again after midnight UTC"}})
+}
+
+// readBody reads a message into memory, charging it against
+// MaxBufferedBytes as it arrives, at twice its size since stamping copies it.
+// The charge stands until release is called.
+func (r *Receiver) readBody(rd io.Reader) ([]byte, func(), error) {
+	var buf bytes.Buffer
+	var charged int64
+	release := func() { r.buffered.Add(-charged) }
+	src := io.LimitReader(rd, MaxMessageBytes+1)
+	chunk := make([]byte, 64<<10)
+	for {
+		n, err := src.Read(chunk)
+		buf.Write(chunk[:n])
+		charged += 2 * int64(n)
+		if r.buffered.Add(2*int64(n)) > r.cfg.MaxBufferedBytes {
+			return nil, release, errBusy
+		}
+		if errors.Is(err, io.EOF) {
+			return buf.Bytes(), release, nil
+		}
+		if err != nil {
+			return nil, release, err
+		}
+	}
+}
+
+// redelivered handles a retry of a message already saved, as when the sender
+// never saw the 250 because the process stopped or it timed out. The message
+// is not stored or counted twice. Alerts are decided again, each sent once,
+// so one lost in the stop still goes out.
+func (r *Receiver) redelivered(p db.Publication, hash string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), alertTimeout)
+	defer cancel()
+	m, err := r.store.MessageByDedupe(ctx, p.ID, hash, r.store.Now().Add(-dedupeWindow))
+	if err != nil {
+		if !errors.Is(err, db.ErrNotFound) {
+			r.log.Error("message lookup", "publication", p.ID, "err", err)
+		}
+		return false
+	}
+	r.log.Info("redelivered", "report", m.ID, "publication", p.ID)
+	if r.cfg.Monitor == nil {
+		return true
+	}
+	prev, err := r.store.IssueBefore(ctx, p.ID, m.ID)
+	if errors.Is(err, db.ErrNotFound) {
+		prev = nil
+	} else if err != nil {
+		r.log.Error("previous issue", "publication", p.ID, "err", err)
+		return true
+	}
+	r.cfg.Monitor.Received(ctx, p, m, prev)
+	return true
 }
 
 func (s *session) Data(rd io.Reader) error {
 	s.sent++
 	ctx := context.Background()
-	ls := s.r.limits(s.token, s.owner, s.daily)
-	if s.pub != nil {
-		ls = []limit{s.r.publicationLimit(s.pub.ID)}
-	}
-	for _, l := range ls {
-		if _, err := s.r.store.Take(ctx, l.name, l.bucket, l.limit, l.keep); err != nil {
-			if errors.Is(err, db.ErrLimit) {
-				return l.err
-			}
-			s.r.log.Error("message count", "err", err)
-			return errTemporary
-		}
-	}
 	// Each read of the body gets a fresh deadline, up to maxBodyTime in all,
 	// so a large message over a slow link is not cut off.
 	cc := counted(s.conn.Conn())
 	if cc != nil {
 		cc.bodyUntil.Store(time.Now().Add(maxBodyTime).UnixNano())
 	}
-	raw, err := io.ReadAll(io.LimitReader(rd, MaxMessageBytes+1))
+	raw, release, err := s.r.readBody(rd)
+	defer release()
 	if cc != nil {
 		cc.bodyUntil.Store(0)
 	}
@@ -468,6 +632,44 @@ func (s *session) Data(rd io.Reader) error {
 	}
 	if len(raw) > MaxMessageBytes {
 		return &smtp.SMTPError{Code: 552, EnhancedCode: smtp.EnhancedCode{5, 3, 4}, Message: "Message too large"}
+	}
+	dedupe := ""
+	if s.pub != nil {
+		sum := sha256.Sum256(raw)
+		dedupe = hex.EncodeToString(sum[:])
+		if s.r.redelivered(*s.pub, dedupe) {
+			return nil
+		}
+	}
+	if s.r.storageFull(ctx) {
+		return errStorageFull
+	}
+	// A turn to be checked, held from here to the save.
+	wait := time.NewTimer(analyzeWait)
+	defer wait.Stop()
+	select {
+	case s.r.analyzing <- struct{}{}:
+		defer func() { <-s.r.analyzing }()
+	case <-wait.C:
+		return errBusy
+	}
+	// The allowances count a message that arrived, all of them or none, so a
+	// stalled or refused body costs the sender nothing.
+	ls := s.r.limits(s.token, s.owner, s.daily)
+	if s.pub != nil {
+		ls = []limit{s.r.publicationLimit(s.pub.ID)}
+	}
+	ls = append(ls, s.r.bytesLimit(s.owner, len(raw)))
+	caps := make([]db.Cap, len(ls))
+	for i, l := range ls {
+		caps[i] = db.Cap{Name: l.name, Bucket: l.bucket, Limit: l.limit, N: l.n, Keep: l.keep}
+	}
+	if i, err := s.r.store.TakeAll(ctx, caps); err != nil {
+		if errors.Is(err, db.ErrLimit) {
+			return ls[i].err
+		}
+		s.r.log.Error("message count", "err", err)
+		return errTemporary
 	}
 	_, isTLS := s.conn.TLSConnectionState()
 	env := engine.Envelope{RemoteIP: s.ip, Helo: s.conn.Hostname(), MailFrom: s.from, TLS: &isTLS}
@@ -488,7 +690,7 @@ func (s *session) Data(rd io.Reader) error {
 	m := &db.Message{
 		Token: s.token, Source: "smtp", ReceivedAt: now, ExpiresAt: now.Add(s.r.cfg.ReportTTL),
 		RemoteIP: ipString(s.ip), Helo: env.Helo, MailFrom: s.from, RcptTo: s.rcpt,
-		TLS: &isTLS, Raw: stamped,
+		TLS: &isTLS, Raw: stamped, Dedupe: dedupe,
 	}
 	var prev *db.Message
 	if s.pub != nil {

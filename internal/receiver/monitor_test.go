@@ -210,11 +210,11 @@ func TestMonitoringAddressDailyLimit(t *testing.T) {
 	to := "m-" + p.Token + "@in.test"
 	// The test address limits do not apply to a monitoring address.
 	for i := range 3 {
-		if err := deliver(addr, "bounce@real.test", to, sample(t)); err != nil {
+		if err := deliver(addr, "bounce@real.test", to, numbered(t, i)); err != nil {
 			t.Fatalf("message %d: %v", i+1, err)
 		}
 	}
-	err := deliver(addr, "bounce@real.test", to, sample(t))
+	err := deliver(addr, "bounce@real.test", to, numbered(t, 99))
 	if se, ok := err.(*smtp.SMTPError); !ok || se.Code != 452 {
 		t.Errorf("past the daily limit: err = %v, want 452", err)
 	}
