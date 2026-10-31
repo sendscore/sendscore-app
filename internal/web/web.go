@@ -21,7 +21,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sendscore/sendscore-app/internal/billing"
 	"github.com/sendscore/sendscore-app/internal/db"
 	"github.com/sendscore/sendscore-app/internal/mail"
 	"github.com/sendscore/sendscore/engine"
@@ -62,12 +61,9 @@ type Config struct {
 	SecureCookies bool
 	// Mailer sends sign-in links. It defaults to logging them.
 	Mailer mail.Sender
-	// FreeDailyTests and AnonDailyTests are the test addresses (and
-	// uploads) per UTC day for a free account and for an anonymous IP.
-	FreeDailyTests int
-	// ProDailyTests is the test addresses a Pro account may make per UTC
-	// day.
-	ProDailyTests  int
+	// DailyTests and AnonDailyTests are the test addresses (and uploads) per
+	// UTC day for an account and for an anonymous IP.
+	DailyTests     int
 	AnonDailyTests int
 	// SigninEmailsPerHour caps the sign-in emails the whole service sends
 	// in an hour. It defaults to 200.
@@ -76,13 +72,12 @@ type Config struct {
 	// service in an hour, on top of the per-network limit. It defaults to
 	// 600.
 	RegistrationsPerHour int
-	// ProPublications and FreePublications are how many newsletters a pro
-	// and a free account may monitor. ProPublications defaults to 5.
-	ProPublications  int
-	FreePublications int
-	// ProEmails are granted Pro when they sign in, whatever billing says.
-	ProEmails []string
-	// ClosedSignups lets only ProEmails make a new account. Accounts that
+	// Publications is how many newsletters an account may monitor. It
+	// defaults to DefaultPublications.
+	Publications int
+	// AllowedEmails may make an account while sign-ups are closed.
+	AllowedEmails []string
+	// ClosedSignups lets only AllowedEmails make a new account. Accounts that
 	// exist still sign in, and the sign-in page says the same to everyone.
 	ClosedSignups bool
 	// AnonDailyTotal caps test addresses and uploads by all anonymous
@@ -98,10 +93,7 @@ type Config struct {
 	TrustedProxies []netip.Prefix
 	// Health adds checks to /healthz, such as the heartbeat's age.
 	Health func(context.Context) error
-	// Billing sells Pro through Creem. Nil turns billing off, as on a
-	// self-hosted instance: no plan section, no checkout, and no webhook.
-	Billing *billing.Client
-	// HistoryDays is how long a pro account's newsletter history is kept,
+	// HistoryDays is how long a newsletter's history is kept,
 	// for the pages to say.
 	HistoryDays int
 }
@@ -147,8 +139,6 @@ type App struct {
 	// counts them per network, under waitMu.
 	uploads   chan struct{}
 	uploadIPs map[string]int
-	// billingMu applies one Creem event at a time.
-	billingMu sync.Mutex
 }
 
 // StopWaits makes every open and future long poll answer at once, as if its
@@ -170,11 +160,11 @@ func New(cfg Config, store *db.Store, log *slog.Logger) (*App, error) {
 	if cfg.RegistrationsPerHour == 0 {
 		cfg.RegistrationsPerHour = 600
 	}
-	if cfg.ProDailyTests == 0 {
-		cfg.ProDailyTests = DefaultProDailyTests
+	if cfg.DailyTests == 0 {
+		cfg.DailyTests = DefaultDailyTests
 	}
-	if cfg.ProPublications == 0 {
-		cfg.ProPublications = DefaultProPublications
+	if cfg.Publications == 0 {
+		cfg.Publications = DefaultPublications
 	}
 	if cfg.HistoryDays == 0 {
 		cfg.HistoryDays = 365
@@ -267,13 +257,6 @@ func (a *App) Routes() http.Handler {
 	// Deleting the account (see delete.go). Web only, never the API.
 	mux.HandleFunc("GET /account/delete", a.deleteAccountForm)
 	mux.HandleFunc("POST /account/delete", a.form(formLimit, a.deleteAccount))
-	if a.cfg.Billing != nil {
-		// Billing (see billing.go). The webhook is under /api/, so it gets no
-		// session or CSRF cookie: its signature is its authentication.
-		mux.HandleFunc("POST /account/billing/checkout", a.form(formLimit, a.checkout))
-		mux.HandleFunc("POST /account/billing/portal", a.form(formLimit, a.billingPortal))
-		mux.HandleFunc("POST /api/creem/webhook", a.creemWebhook)
-	}
 
 	// Monitored newsletters (see newsletters.go).
 	mux.HandleFunc("GET /newsletters", a.newsletters)

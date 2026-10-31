@@ -13,8 +13,7 @@
   <p class="label">Schedule</p>
   <div>
     <p>{{.Schedule}}</p>
-    {{if .User.Lapsed}}<p class="notice">Pro has ended for this account, so SendScore sends no alert and does not check the schedule. Issues are still received and checked, and kept for {{.ReportDays}} days.</p>
-    {{else if .P.Paused}}<p class="notice">Alerts are paused. Issues are still received, checked, and kept, but no alert email is sent.</p>
+    {{if .P.Paused}}<p class="notice">Alerts are paused. Issues are still received, checked, and kept, but no alert email is sent.</p>
     {{else}}<p>Alerts go to <strong>{{.P.AlertEmail}}</strong>.{{with .Next}} The next issue is expected {{local . $.P.TimeZone}}.{{end}}</p>{{end}}
     {{if .P.AlertPending}}<p class="notice">Waiting for <strong>{{.P.AlertPending}}</strong> to accept alerts. A confirmation link went to that address, and alerts keep going to {{.P.AlertEmail}} until it is opened.</p>{{end}}
     {{if .AlertLimit}}<p class="error">The confirmation email could not be sent right now, so alerts stay with {{.P.AlertEmail}}. Try saving again later.</p>{{end}}

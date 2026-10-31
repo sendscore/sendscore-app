@@ -11,21 +11,6 @@ import (
 	"github.com/sendscore/sendscore/verdict"
 )
 
-func TestAllProIsNeverStored(t *testing.T) {
-	s := open(t)
-	ctx := context.Background()
-	u := fillAccount(t, s, "free@example.com")
-	s.AllPro = true
-	if p, err := s.PlanOf(ctx, u.ID); err != nil || p != PlanPro {
-		t.Fatalf("plan with AllPro = %q %v", p, err)
-	}
-	s.AllPro = false
-	var stored string
-	if err := s.DB.QueryRow(`SELECT plan FROM users WHERE id = ?`, u.ID).Scan(&stored); err != nil || stored != PlanFree {
-		t.Errorf("users.plan = %q %v", stored, err)
-	}
-}
-
 func TestTakeAllCountsAllOrNone(t *testing.T) {
 	s := open(t)
 	ctx := context.Background()
@@ -41,25 +26,6 @@ func TestTakeAllCountsAllOrNone(t *testing.T) {
 	}
 	if i, err := s.TakeAll(ctx, []Cap{{Name: "zero", Bucket: "d", Limit: 0}}); !errors.Is(err, ErrLimit) || i != 0 {
 		t.Errorf("a limit of 0 = %d %v", i, err)
-	}
-}
-
-func TestCreemEventNotMarkedAppliedIsAppliedAgain(t *testing.T) {
-	s := open(t)
-	ctx := context.Background()
-	e := CreemEvent{ID: "evt_1", Kind: "x", Body: "{}"}
-	if first, err := s.RecordCreemEvent(ctx, e); err != nil || !first {
-		t.Fatalf("first = %v %v", first, err)
-	}
-	// The process stopped here, between the record and the apply.
-	if again, err := s.RecordCreemEvent(ctx, e); err != nil || !again {
-		t.Fatalf("retry after a crash = %v %v, want it applied", again, err)
-	}
-	if err := s.MarkCreemEventApplied(ctx, e.ID); err != nil {
-		t.Fatal(err)
-	}
-	if again, err := s.RecordCreemEvent(ctx, e); err != nil || again {
-		t.Errorf("retry after applying = %v %v", again, err)
 	}
 }
 

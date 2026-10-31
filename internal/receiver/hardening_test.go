@@ -58,7 +58,7 @@ func TestSessionHasAnAbsoluteDeadline(t *testing.T) {
 
 func TestRetryOfASavedMessageIsNotStoredTwice(t *testing.T) {
 	store, addr, out := startMonitored(t)
-	u := owner(t, store, "dup@example.com", db.PlanPro)
+	u := owner(t, store, "dup@example.com")
 	p := publication(t, store, u, false)
 	to := "m-" + p.Token + "@in.test"
 	raw := numbered(t, 1)
@@ -82,7 +82,7 @@ func TestRetryOfASavedMessageIsNotStoredTwice(t *testing.T) {
 func TestRetryDecidesAnAlertLostInACrash(t *testing.T) {
 	store, addr, out := startMonitored(t)
 	ctx := context.Background()
-	u := owner(t, store, "crash@example.com", db.PlanPro)
+	u := owner(t, store, "crash@example.com")
 	p := publication(t, store, u, false)
 	to := "m-" + p.Token + "@in.test"
 	if err := deliver(addr, "bounce@real.test", to, numbered(t, 1)); err != nil {
@@ -147,7 +147,7 @@ func TestStalledBodyCostsNothing(t *testing.T) {
 func TestRefusedMessageUsesUpNoOtherAllowance(t *testing.T) {
 	store, addr := start(t, func(c *Config) { c.DailyMessages = 1 })
 	ctx := context.Background()
-	u := owner(t, store, "refused@example.com", db.PlanFree)
+	u := owner(t, store, "refused@example.com")
 	a, err := store.CreateAddressFor(ctx, time.Hour, u.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -171,7 +171,7 @@ func TestDailyBytesCoverTestAndMonitoringAddresses(t *testing.T) {
 	size := len(sample(t)) + 100
 	store, addr, _ := startMonitored(t, func(c *Config) { c.DailyBytes = 3 * size / 2 })
 	ctx := context.Background()
-	u := owner(t, store, "bytes@example.com", db.PlanPro)
+	u := owner(t, store, "bytes@example.com")
 	p := publication(t, store, u, false)
 	a, err := store.CreateAddressFor(ctx, time.Hour, u.ID)
 	if err != nil {

@@ -34,11 +34,6 @@ var ErrUnknownAfter = errors.New("unknown after report")
 type Store struct {
 	DB  *sql.DB
 	Now func() time.Time
-	// AllPro gives every account Pro while it is set, for an instance with
-	// billing off. It is read when a plan is read and never written to
-	// users.plan, so a restart without billing settings changes nothing that
-	// outlives the restart.
-	AllPro bool
 	// RawKeep is how long Sweep keeps the original of a message; the verdict
 	// stays until the message expires. Zero keeps it as long as the message.
 	RawKeep time.Duration
@@ -134,9 +129,6 @@ func migrate(d *sql.DB) error {
 		`ALTER TABLE publications ADD COLUMN alert_confirm_expires INTEGER NOT NULL DEFAULT 0`,
 		// When a failed alert may be tried again (Unix seconds).
 		`ALTER TABLE alerts ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0`,
-		// Set once a Creem event was applied. Rows from before the column
-		// were applied or given back, so they default to set.
-		`ALTER TABLE creem_events ADD COLUMN applied INTEGER NOT NULL DEFAULT 1`,
 	}
 	for _, a := range alters {
 		if _, err := d.Exec(a); err != nil && !strings.Contains(err.Error(), "duplicate column name") {

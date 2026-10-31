@@ -23,7 +23,6 @@ import (
 
 	"github.com/emersion/go-smtp"
 
-	"github.com/sendscore/sendscore-app/internal/billing"
 	"github.com/sendscore/sendscore-app/internal/db"
 	"github.com/sendscore/sendscore-app/internal/mail"
 	"github.com/sendscore/sendscore-app/internal/monitor"
@@ -83,20 +82,8 @@ func main() {
 		log.Warn("SES is not configured, so sign-in links and alerts are logged here instead of emailed")
 	}
 
-	// These accounts are Pro, now and at sign-in, whatever billing says.
-	proEmails := emailList(os.Getenv("SENDSCORE_PRO_EMAILS"))
-	if n, err := store.PromoteEmails(context.Background(), proEmails); err != nil {
-		log.Error("pro accounts", "err", err)
-		os.Exit(1)
-	} else if n > 0 {
-		log.Info("accounts moved to the pro plan", "count", n)
-	}
-	// Without billing nothing is for sale, so nobody is held to the free
-	// limits. This is read with each plan and never written to an account.
-	billingClient := creem(log)
-	store.AllPro = billingClient == nil
 	store.RawKeep = time.Duration(getpos(log, "SENDSCORE_RAW_DAYS", 30)) * 24 * time.Hour
-	closedSignups, err := signupsClosed(os.Getenv("SENDSCORE_SIGNUPS"), billingClient != nil)
+	closedSignups, err := signupsClosed(os.Getenv("SENDSCORE_SIGNUPS"))
 	if err != nil {
 		log.Error(err.Error())
 		os.Exit(1)
@@ -145,15 +132,12 @@ func main() {
 		},
 		SecureCookies:        secureCookies,
 		Mailer:               mailer,
-		FreeDailyTests:       getint(log, "SENDSCORE_FREE_DAILY_TESTS", 25),
-		ProDailyTests:        getpos(log, "SENDSCORE_PRO_DAILY_TESTS", web.DefaultProDailyTests),
+		DailyTests:           getpos(log, "SENDSCORE_DAILY_TESTS", web.DefaultDailyTests),
 		AnonDailyTests:       getint(log, "SENDSCORE_ANON_DAILY_TESTS", anonDefault(closedSignups, isLocal(baseURL))),
 		SigninEmailsPerHour:  getpos(log, "SENDSCORE_SIGNIN_EMAILS_PER_HOUR", 200),
 		RegistrationsPerHour: getpos(log, "SENDSCORE_OAUTH_REGISTRATIONS_PER_HOUR", 600),
-		ProPublications:      getpos(log, "SENDSCORE_PRO_PUBLICATIONS", web.DefaultProPublications),
-		FreePublications:     getint(log, "SENDSCORE_FREE_PUBLICATIONS", 0),
-		ProEmails:            proEmails,
-		Billing:              billingClient,
+		Publications:         getpos(log, "SENDSCORE_PUBLICATIONS", web.DefaultPublications),
+		AllowedEmails:        emailList(os.Getenv("SENDSCORE_ALLOWED_EMAILS")),
 		HistoryDays:          historyDays,
 		BaseURL:              baseURL,
 		PrivacyURL:           os.Getenv("SENDSCORE_PRIVACY_URL"),
@@ -187,8 +171,7 @@ func main() {
 		CheckLinks: checkLinks,
 
 		MessagesPerAddress: getpos(log, "SENDSCORE_MESSAGES_PER_ADDRESS", receiver.DefaultMessagesPerAddress),
-		DailyMessages:      getpos(log, "SENDSCORE_FREE_DAILY_MESSAGES", receiver.DefaultDailyMessages),
-		ProDailyMessages:   getpos(log, "SENDSCORE_PRO_DAILY_MESSAGES", receiver.DefaultProDailyMessages),
+		DailyMessages:      getpos(log, "SENDSCORE_DAILY_MESSAGES", receiver.DefaultDailyMessages),
 		MaxSessions:        getpos(log, "SENDSCORE_SMTP_SESSIONS", receiver.DefaultMaxSessions),
 		MaxSessionsPerIP:   getpos(log, "SENDSCORE_SMTP_SESSIONS_PER_IP", receiver.DefaultMaxSessionsPerIP),
 
@@ -355,17 +338,14 @@ func checkConfig(baseURL, mailDomain string, secureCookies bool) error {
 	return nil
 }
 
-// signupsClosed reads SENDSCORE_SIGNUPS: open or closed, and when unset,
-// closed unless billing is on. An instance that sells nothing has Pro limits
-// for everyone, which suit its operator and not the whole internet.
-func signupsClosed(setting string, billing bool) (bool, error) {
+// signupsClosed reads SENDSCORE_SIGNUPS, open or closed, which is closed when
+// unset. The limits suit an operator and their team, not the whole internet.
+func signupsClosed(setting string) (bool, error) {
 	switch setting {
 	case "open":
 		return false, nil
-	case "closed":
+	case "closed", "":
 		return true, nil
-	case "":
-		return !billing, nil
 	}
 	return false, fmt.Errorf("SENDSCORE_SIGNUPS must be open or closed, not %q", setting)
 }
@@ -398,34 +378,6 @@ func parseProxies(s string) ([]netip.Prefix, error) {
 		out = append(out, prefix)
 	}
 	return out, nil
-}
-
-// creem reads the Creem settings and returns the billing client, or nil
-// when billing is off (a self-hosted instance sells nothing). It exits on a
-// half-configured billing, and on one without SENDSCORE_SECRET, which signs
-// the account in every checkout.
-func creem(log *slog.Logger) *billing.Client {
-	cfg := billing.Config{
-		APIKey:         strings.TrimSpace(os.Getenv("CREEM_API_KEY")),
-		WebhookSecret:  strings.TrimSpace(os.Getenv("CREEM_WEBHOOK_SECRET")),
-		ProductMonthly: strings.TrimSpace(os.Getenv("CREEM_PRODUCT_PRO_MONTHLY")),
-		ProductYearly:  strings.TrimSpace(os.Getenv("CREEM_PRODUCT_PRO_YEARLY")),
-		Secret:         os.Getenv("SENDSCORE_SECRET"),
-	}
-	if !cfg.Configured() {
-		if missing := cfg.Missing(); len(missing) < 3 {
-			log.Error("billing is half configured; set the rest or none of them", "missing", strings.Join(missing, ", "))
-			os.Exit(1)
-		}
-		return nil
-	}
-	if len(cfg.Secret) < billing.MinSecretLen {
-		log.Error(fmt.Sprintf("SENDSCORE_SECRET must be at least %d characters when billing is on; it signs the account in each checkout", billing.MinSecretLen))
-		os.Exit(1)
-	}
-	c := billing.New(cfg)
-	log.Info("billing via Creem", "mode", c.Mode(), "yearly", c.YearlyOffered())
-	return c
 }
 
 // sweep deletes expired reports every hour.

@@ -75,16 +75,12 @@ func TestCheckConfig(t *testing.T) {
 }
 
 func TestSignupDefaults(t *testing.T) {
-	for _, c := range []struct {
-		setting string
-		billing bool
-		want    bool
-	}{{"", false, true}, {"", true, false}, {"open", false, false}, {"closed", true, true}} {
-		if got, err := signupsClosed(c.setting, c.billing); err != nil || got != c.want {
-			t.Errorf("signupsClosed(%q, %v) = %v, %v", c.setting, c.billing, got, err)
+	for setting, want := range map[string]bool{"": true, "closed": true, "open": false} {
+		if got, err := signupsClosed(setting); err != nil || got != want {
+			t.Errorf("signupsClosed(%q) = %v, %v", setting, got, err)
 		}
 	}
-	if _, err := signupsClosed("maybe", false); err == nil {
+	if _, err := signupsClosed("maybe"); err == nil {
 		t.Error("accepted a typo")
 	}
 	if anonDefault(true, false) != 0 || anonDefault(false, false) != 5 || anonDefault(true, true) != 5 {

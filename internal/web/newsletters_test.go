@@ -31,13 +31,6 @@ func addNewsletter(t *testing.T, h http.Handler, session, name string) string {
 	return strings.TrimPrefix(loc, "/newsletters/")
 }
 
-func pro(t *testing.T, store *db.Store, u db.User) {
-	t.Helper()
-	if err := store.SetPlan(context.Background(), u.ID, db.PlanPro); err != nil {
-		t.Fatal(err)
-	}
-}
-
 // saveIssue stores the sample as a received issue of the publication.
 func saveIssue(t *testing.T, store *db.Store, pubID string) *db.Message {
 	t.Helper()
@@ -60,29 +53,17 @@ func saveIssue(t *testing.T, store *db.Store, pubID string) *db.Message {
 	return m
 }
 
-func TestNewslettersNeedPro(t *testing.T) {
-	_, store, h := newApp(t, func(c *Config) { c.ProPublications = 2 })
-	u, session, _ := newUser(t, store, "free@example.com")
+func TestNewsletterLimit(t *testing.T) {
+	_, store, h := newApp(t, func(c *Config) { c.Publications = 2 })
+	_, session, _ := newUser(t, store, "self@example.com")
 
-	w := serve(h, request("GET", "/newsletters", nil, "", session))
-	if w.Code != 200 || !strings.Contains(w.Body.String(), "part of the Pro plan") || strings.Contains(w.Body.String(), `href="/newsletters/new"`) {
-		t.Errorf("free list page = %d:\n%s", w.Code, w.Body)
-	}
-	if w := serve(h, request("GET", "/newsletters/new", nil, "", session)); w.Code != 403 {
-		t.Errorf("free new page = %d", w.Code)
-	}
-	if w := post(h, "/newsletters", newsletterForm("Letter"), session); w.Code != 403 {
-		t.Errorf("free create = %d", w.Code)
-	}
-
-	pro(t, store, u)
-	if w := serve(h, request("GET", "/newsletters/new", nil, "", session)); w.Code != 200 || !strings.Contains(w.Body.String(), `value="free@example.com"`) {
-		t.Errorf("pro new page = %d, or the alert address is not the account's", w.Code)
+	if w := serve(h, request("GET", "/newsletters/new", nil, "", session)); w.Code != 200 || !strings.Contains(w.Body.String(), `value="self@example.com"`) {
+		t.Errorf("new page = %d, or the alert address is not the account's", w.Code)
 	}
 	addNewsletter(t, h, session, "One")
 	addNewsletter(t, h, session, "Two")
 	if w := post(h, "/newsletters", newsletterForm("Three"), session); w.Code != 403 || !strings.Contains(w.Body.String(), "can monitor 2 newsletters") {
-		t.Errorf("past the pro limit = %d", w.Code)
+		t.Errorf("past the limit = %d", w.Code)
 	}
 	// Signed out, the pages ask to sign in.
 	if w := serve(h, request("GET", "/newsletters", nil, "", "")); w.Code != 303 || !strings.HasPrefix(w.Header().Get("Location"), "/signin") {
@@ -90,30 +71,9 @@ func TestNewslettersNeedPro(t *testing.T) {
 	}
 }
 
-func TestProEmailsArePromotedAtSignin(t *testing.T) {
-	a, store, h := newApp(t, func(c *Config) { c.ProEmails = []string{"jon@example.com"} })
-	for _, email := range []string{"jon@example.com", "other@example.com"} {
-		post(h, "/signin", url.Values{"email": {email}}, "")
-		if w := post(h, "/signin/verify", url.Values{"t": {mailer(a).lastLink(t)}}, ""); w.Code != 303 {
-			t.Fatalf("verify = %d", w.Code)
-		}
-	}
-	for email, want := range map[string]string{"jon@example.com": db.PlanPro, "other@example.com": db.PlanFree} {
-		var plan string
-		if err := store.DB.QueryRow(`SELECT plan FROM users WHERE email = ?`, email).Scan(&plan); err != nil || plan != want {
-			t.Errorf("%s plan = %q %v, want %s", email, plan, err, want)
-		}
-	}
-	// At startup, the listed accounts that exist are moved.
-	if n, err := store.PromoteEmails(context.Background(), []string{"OTHER@example.com "}); err != nil || n != 1 {
-		t.Errorf("PromoteEmails = %d %v", n, err)
-	}
-}
-
 func TestNewsletterFormValidates(t *testing.T) {
 	_, store, h := newApp(t)
-	u, session, _ := newUser(t, store, "pro@example.com")
-	pro(t, store, u)
+	_, session, _ := newUser(t, store, "self@example.com")
 	cases := []struct {
 		change func(url.Values)
 		want   string
@@ -144,15 +104,14 @@ func TestNewsletterFormValidates(t *testing.T) {
 
 func TestNewsletterPagesEditAndDelete(t *testing.T) {
 	_, store, h := newApp(t)
-	u, session, _ := newUser(t, store, "pro@example.com")
-	pro(t, store, u)
+	u, session, _ := newUser(t, store, "self@example.com")
 	id := addNewsletter(t, h, session, "The Friday Letter")
 	ctx := context.Background()
 	p, err := store.PublicationForUser(ctx, id, u.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Days != 1<<1|1<<4 || p.At != "09:00" || p.TimeZone != "America/Toronto" || p.GraceMinutes != 45 || p.AlertEmail != "pro@example.com" {
+	if p.Days != 1<<1|1<<4 || p.At != "09:00" || p.TimeZone != "America/Toronto" || p.GraceMinutes != 45 || p.AlertEmail != "self@example.com" {
 		t.Errorf("stored %+v", p)
 	}
 	m := saveIssue(t, store, id)
@@ -214,10 +173,8 @@ func TestNewsletterPagesEditAndDelete(t *testing.T) {
 
 func TestNewslettersBelongToTheirOwner(t *testing.T) {
 	_, store, h := newApp(t)
-	alice, aliceSession, aliceToken := newUser(t, store, "alice@example.com")
-	bob, bobSession, bobToken := newUser(t, store, "bob@example.com")
-	pro(t, store, alice)
-	pro(t, store, bob)
+	_, aliceSession, aliceToken := newUser(t, store, "alice@example.com")
+	_, bobSession, bobToken := newUser(t, store, "bob@example.com")
 	id := addNewsletter(t, h, aliceSession, "Alice's Letter")
 	m := saveIssue(t, store, id)
 
@@ -292,28 +249,5 @@ func TestNewslettersBelongToTheirOwner(t *testing.T) {
 			t.Errorf("list_publications for %s: %s", token[:12], b)
 		}
 		cs.Close()
-	}
-}
-
-func TestBillingOffGivesProWithoutWritingIt(t *testing.T) {
-	a, store, _ := newApp(t)
-	ctx := context.Background()
-	u, _, _ := newUser(t, store, "self@example.com")
-	store.AllPro = true
-	plan, err := store.PlanOf(ctx, u.ID)
-	if err != nil || plan != db.PlanPro {
-		t.Fatalf("plan with billing off = %q %v", plan, err)
-	}
-	if got := a.publicationLimit(&db.User{Plan: plan}); got != DefaultProPublications {
-		t.Errorf("limit with billing off = %d", got)
-	}
-	// Billing coming back takes it away again, since nothing was stored.
-	store.AllPro = false
-	if p, _ := store.PlanOf(ctx, u.ID); p != db.PlanFree {
-		t.Errorf("plan after billing returned = %q", p)
-	}
-	var stored string
-	if err := store.DB.QueryRow(`SELECT plan FROM users WHERE id = ?`, u.ID).Scan(&stored); err != nil || stored != db.PlanFree {
-		t.Errorf("users.plan = %q %v", stored, err)
 	}
 }

@@ -64,8 +64,7 @@ var (
 // Defaults for the volume limits in Config.
 const (
 	DefaultMessagesPerAddress = 20
-	DefaultDailyMessages      = 100
-	DefaultProDailyMessages   = 1000
+	DefaultDailyMessages      = 1000
 	DefaultMaxSessions        = 50
 	DefaultMaxSessionsPerIP   = 5
 	// A monitoring address takes this many messages a UTC day, far more
@@ -109,10 +108,8 @@ type Config struct {
 	// connections, in all and per sending IP. Zero means the default.
 	MessagesPerAddress int
 	DailyMessages      int
-	// ProDailyMessages replaces DailyMessages for a Pro account.
-	ProDailyMessages int
-	MaxSessions      int
-	MaxSessionsPerIP int
+	MaxSessions        int
+	MaxSessionsPerIP   int
 	// PublicationDailyMessages is how many messages one monitoring address
 	// takes per UTC day. Zero means the default.
 	PublicationDailyMessages int
@@ -126,7 +123,7 @@ type Config struct {
 	MaxStorageBytes   int64
 	MaxBufferedBytes  int64
 	MaxAnalyzing      int
-	// HistoryTTL is how long a pro account's publication messages are kept.
+	// HistoryTTL is how long a publication's messages are kept.
 	// Other publication messages are kept for ReportTTL.
 	HistoryTTL time.Duration
 	// Monitor is told about each publication message once it is saved, to
@@ -158,9 +155,6 @@ func New(cfg Config, store *db.Store, log *slog.Logger) *Receiver {
 	}
 	if cfg.DailyMessages == 0 {
 		cfg.DailyMessages = DefaultDailyMessages
-	}
-	if cfg.ProDailyMessages == 0 {
-		cfg.ProDailyMessages = DefaultProDailyMessages
 	}
 	if cfg.MaxSessions == 0 {
 		cfg.MaxSessions = DefaultMaxSessions
@@ -351,7 +345,6 @@ type session struct {
 	from  string
 	token string
 	owner string // the account the address belongs to, or empty
-	daily int    // the owner's daily message allowance, by plan
 	// pub is the monitored publication when the recipient is an m- address.
 	pub  *db.Publication
 	rcpt string
@@ -359,7 +352,7 @@ type session struct {
 }
 
 func (s *session) Reset() {
-	s.from, s.token, s.owner, s.rcpt, s.pub, s.daily = "", "", "", "", nil, 0
+	s.from, s.token, s.owner, s.rcpt, s.pub = "", "", "", "", nil
 }
 
 func (s *session) Logout() error { return nil }
@@ -435,20 +428,9 @@ func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 		s.r.log.Error("address lookup", "err", err)
 		return errTemporary
 	}
-	daily := s.r.cfg.DailyMessages
-	if addr.UserID != "" {
-		plan, err := s.r.store.PlanOf(context.Background(), addr.UserID)
-		if err != nil {
-			s.r.log.Error("owner plan", "err", err)
-			return errTemporary
-		}
-		if plan == db.PlanPro {
-			daily = s.r.cfg.ProDailyMessages
-		}
-	}
 	// Refuse here when a limit is already used up, so the body is never
 	// sent; Data counts the message.
-	for _, l := range s.r.limits(addr.Token, addr.UserID, daily) {
+	for _, l := range s.r.limits(addr.Token, addr.UserID) {
 		n, err := s.r.store.Count(context.Background(), l.name, l.bucket)
 		if err != nil {
 			s.r.log.Error("message count", "err", err)
@@ -460,7 +442,7 @@ func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 	}
 	switch {
 	case s.token == "":
-		s.token, s.owner, s.rcpt, s.daily = token, addr.UserID, to, daily
+		s.token, s.owner, s.rcpt = token, addr.UserID, to
 	case s.token != token:
 		// One test address per transaction, so a message is stored once.
 		// RFC 5321 has the client send the rest in another transaction.
@@ -539,14 +521,14 @@ func (r *Receiver) bytesLimit(owner string, n int) limit {
 // limits are the counts a message to the address is taken against: the
 // address's lifetime allowance, and its account's daily one, or for an
 // anonymous address, what all of them take together.
-func (r *Receiver) limits(token, owner string, daily int) []limit {
+func (r *Receiver) limits(token, owner string) []limit {
 	ls := []limit{{name: "messages:addr:" + token, bucket: "all", limit: r.cfg.MessagesPerAddress, keep: 8 * 24 * time.Hour,
 		err: &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 2, 2},
 			Message: fmt.Sprintf("This test address has taken its %d messages, get a new test address", r.cfg.MessagesPerAddress)}}}
 	if owner != "" {
-		return append(ls, limit{name: "messages:user:" + owner, bucket: db.Day(r.store.Now()), limit: daily, keep: 48 * time.Hour,
+		return append(ls, limit{name: "messages:user:" + owner, bucket: db.Day(r.store.Now()), limit: r.cfg.DailyMessages, keep: 48 * time.Hour,
 			err: &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 2, 2},
-				Message: fmt.Sprintf("This account has received its %d messages for today, try again after midnight UTC", daily)}})
+				Message: fmt.Sprintf("This account has received its %d messages for today, try again after midnight UTC", r.cfg.DailyMessages)}})
 	}
 	return append(ls, limit{name: "messages:anon", bucket: db.Day(r.store.Now()), limit: r.cfg.AnonDailyMessages, keep: 48 * time.Hour,
 		err: &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 2, 2},
@@ -655,7 +637,7 @@ func (s *session) Data(rd io.Reader) error {
 	}
 	// The allowances count a message that arrived, all of them or none, so a
 	// stalled or refused body costs the sender nothing.
-	ls := s.r.limits(s.token, s.owner, s.daily)
+	ls := s.r.limits(s.token, s.owner)
 	if s.pub != nil {
 		ls = []limit{s.r.publicationLimit(s.pub.ID)}
 	}
@@ -726,9 +708,7 @@ func (s *session) Data(rd io.Reader) error {
 // its slot and the previous issue to compare with, which it returns.
 func (r *Receiver) preparePublication(ctx context.Context, p db.Publication, m *db.Message, raw []byte, opts *engine.Options) *db.Message {
 	m.PublicationID, m.UserID, m.Kind = p.ID, p.UserID, db.KindIssue
-	if p.OwnerPlan == db.PlanPro {
-		m.ExpiresAt = m.ReceivedAt.Add(r.cfg.HistoryTTL)
-	}
+	m.ExpiresAt = m.ReceivedAt.Add(r.cfg.HistoryTTL)
 	prev, err := r.store.LatestIssue(ctx, p.ID)
 	if err != nil && !errors.Is(err, db.ErrNotFound) {
 		r.log.Error("previous issue", "publication", p.ID, "err", err)

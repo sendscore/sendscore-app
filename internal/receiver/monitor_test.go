@@ -37,8 +37,8 @@ func (a *alerts) count() int {
 	return len(a.sent)
 }
 
-// owner makes an account on the plan.
-func owner(t *testing.T, store *db.Store, email, plan string) db.User {
+// owner makes an account.
+func owner(t *testing.T, store *db.Store, email string) db.User {
 	t.Helper()
 	ctx := context.Background()
 	link, err := store.CreateLoginToken(ctx, email)
@@ -47,9 +47,6 @@ func owner(t *testing.T, store *db.Store, email, plan string) db.User {
 	}
 	u, _, err := store.ConsumeLoginToken(ctx, link)
 	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.SetPlan(ctx, u.ID, plan); err != nil {
 		t.Fatal(err)
 	}
 	return u
@@ -92,7 +89,7 @@ func startMonitored(t *testing.T, opts ...func(*Config)) (*db.Store, string, *al
 
 func TestMonitoringAddressComparesWithThePreviousIssue(t *testing.T) {
 	store, addr, out := startMonitored(t)
-	u := owner(t, store, "pub@example.com", db.PlanPro)
+	u := owner(t, store, "pub@example.com")
 	p := publication(t, store, u, false)
 	to := "m-" + p.Token + "@in.test"
 	ctx := context.Background()
@@ -151,7 +148,7 @@ func TestMonitoringAddressComparesWithThePreviousIssue(t *testing.T) {
 
 func TestPausedPublicationStillReceives(t *testing.T) {
 	store, addr, out := startMonitored(t)
-	u := owner(t, store, "pub@example.com", db.PlanFree)
+	u := owner(t, store, "pub@example.com")
 	p := publication(t, store, u, true)
 	to := "m-" + p.Token + "@in.test"
 	if err := deliver(addr, "bounce@real.test", to, sample(t)); err != nil {
@@ -168,15 +165,11 @@ func TestPausedPublicationStillReceives(t *testing.T) {
 	if out.count() != 0 {
 		t.Errorf("a paused publication sent %d alerts", out.count())
 	}
-	// A free account's history is kept as long as a test report.
-	if d := msgs[0].ExpiresAt.Sub(msgs[0].ReceivedAt); d != time.Hour {
-		t.Errorf("kept for %s, want the report TTL", d)
-	}
 }
 
 func TestSignupMessageIsStoredButNotCompared(t *testing.T) {
 	store, addr, out := startMonitored(t)
-	u := owner(t, store, "pub@example.com", db.PlanPro)
+	u := owner(t, store, "pub@example.com")
 	p := publication(t, store, u, false)
 	to := "m-" + p.Token + "@in.test"
 	if err := deliver(addr, "bounce@real.test", to, sample(t)); err != nil {
@@ -205,7 +198,7 @@ func TestMonitoringAddressDailyLimit(t *testing.T) {
 		c.MessagesPerAddress = 1
 		c.DailyMessages = 1
 	})
-	u := owner(t, store, "pub@example.com", db.PlanPro)
+	u := owner(t, store, "pub@example.com")
 	p := publication(t, store, u, false)
 	to := "m-" + p.Token + "@in.test"
 	// The test address limits do not apply to a monitoring address.

@@ -333,7 +333,7 @@ func TestOwnership(t *testing.T) {
 }
 
 func TestDailyLimits(t *testing.T) {
-	_, store, h := newApp(t, func(c *Config) { c.FreeDailyTests = 2; c.AnonDailyTests = 1 })
+	_, store, h := newApp(t, func(c *Config) { c.DailyTests = 2; c.AnonDailyTests = 1 })
 	u, session, tok := newUser(t, store, "daily@example.com")
 
 	// Free accounts: the API and the signed-in page share the allowance.
@@ -412,22 +412,6 @@ func TestClientIPFromProxy(t *testing.T) {
 	r.RemoteAddr = "198.51.100.5:4000"
 	if ip := a.clientIP(r); ip != "198.51.100.5" {
 		t.Errorf("direct connection: ip = %q, a client chose its own", ip)
-	}
-}
-
-func TestProDailyLimit(t *testing.T) {
-	_, store, h := newApp(t, func(c *Config) { c.FreeDailyTests = 1; c.ProDailyTests = 2 })
-	u, _, tok := newUser(t, store, "prodaily@example.com")
-	if err := store.SetPlan(context.Background(), u.ID, db.PlanPro); err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < 2; i++ {
-		if w := apiDo(h, "POST", "/api/v1/test-addresses", tok); w.Code != 201 {
-			t.Fatalf("test %d = %d %s", i, w.Code, w.Body)
-		}
-	}
-	if w := apiDo(h, "POST", "/api/v1/test-addresses", tok); w.Code != http.StatusTooManyRequests {
-		t.Errorf("over the Pro limit = %d", w.Code)
 	}
 }
 

@@ -14,14 +14,6 @@ const (
 	KindSignup = "signup"
 )
 
-// Plans. With billing on, an account is free until a subscription in good
-// standing (or SENDSCORE_PRO_EMAILS) makes it pro. With billing off, every
-// account is pro (see Store.AllPro).
-const (
-	PlanFree = "free"
-	PlanPro  = "pro"
-)
-
 // AlertKeep is how long alerts are kept.
 const AlertKeep = 400 * 24 * time.Hour
 
@@ -47,11 +39,6 @@ type Publication struct {
 	// turned on; a slot due before it is never reported missed.
 	WatchSince time.Time
 	CreatedAt  time.Time
-	// OwnerPlan is the owner's plan in effect, and OwnerLapsed is set when
-	// the owner's Pro subscription ended; both are filled by
-	// PublicationByToken.
-	OwnerPlan   string
-	OwnerLapsed bool
 }
 
 // Scheduled reports whether the publication has an expected schedule.
@@ -59,11 +46,11 @@ func (p Publication) Scheduled() bool { return p.Days != 0 && p.At != "" }
 
 const publicationCols = `id, user_id, name, token, days, at, time_zone, grace_minutes, alert_email, alert_pending, paused, watch_since, created_at`
 
-func scanPublication(row interface{ Scan(...any) error }, extra ...any) (Publication, error) {
+func scanPublication(row interface{ Scan(...any) error }) (Publication, error) {
 	var p Publication
 	var since, created int64
-	err := row.Scan(append([]any{&p.ID, &p.UserID, &p.Name, &p.Token, &p.Days, &p.At, &p.TimeZone, &p.GraceMinutes,
-		&p.AlertEmail, &p.AlertPending, &p.Paused, &since, &created}, extra...)...)
+	err := row.Scan(&p.ID, &p.UserID, &p.Name, &p.Token, &p.Days, &p.At, &p.TimeZone, &p.GraceMinutes,
+		&p.AlertEmail, &p.AlertPending, &p.Paused, &since, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, ErrNotFound
 	}
@@ -150,24 +137,9 @@ func (s *Store) PublicationByID(ctx context.Context, id string) (Publication, er
 	return scanPublication(s.DB.QueryRowContext(ctx, `SELECT `+publicationCols+` FROM publications WHERE id = ?`, id))
 }
 
-// PublicationByToken returns the publication a monitoring address belongs
-// to, with its owner's plan.
+// PublicationByToken returns the publication a monitoring address belongs to.
 func (s *Store) PublicationByToken(ctx context.Context, token string) (Publication, error) {
-	var plan string
-	var lapsed bool
-	p, err := scanPublication(s.DB.QueryRowContext(ctx, `SELECT `+prefixed("p.", publicationCols)+`, `+s.planExpr()+`, `+s.lapsedExpr()+`
-		FROM publications p JOIN users u ON u.id = p.user_id LEFT JOIN subscriptions s ON s.user_id = u.id
-		WHERE p.token = ?`, strings.ToLower(token)), &plan, &lapsed)
-	p.OwnerPlan, p.OwnerLapsed = plan, lapsed
-	return p, err
-}
-
-func prefixed(prefix, cols string) string {
-	parts := strings.Split(cols, ", ")
-	for i, c := range parts {
-		parts[i] = prefix + c
-	}
-	return strings.Join(parts, ", ")
+	return scanPublication(s.DB.QueryRowContext(ctx, `SELECT `+publicationCols+` FROM publications WHERE token = ?`, strings.ToLower(token)))
 }
 
 // Publications lists the user's publications, oldest first.
@@ -176,11 +148,9 @@ func (s *Store) Publications(ctx context.Context, userID string) ([]Publication,
 }
 
 // ScheduledPublications lists every publication with a schedule and alerts
-// on, for the heartbeat. A lapsed owner's publications are left out.
+// on, for the heartbeat.
 func (s *Store) ScheduledPublications(ctx context.Context) ([]Publication, error) {
-	return s.queryPublications(ctx, `SELECT `+prefixed("p.", publicationCols)+`
-		FROM publications p JOIN users u ON u.id = p.user_id LEFT JOIN subscriptions s ON s.user_id = u.id
-		WHERE p.days != 0 AND p.at != '' AND p.paused = 0 AND NOT `+s.lapsedExpr()+` ORDER BY p.rowid`)
+	return s.queryPublications(ctx, `SELECT `+publicationCols+` FROM publications WHERE days != 0 AND at != '' AND paused = 0 ORDER BY rowid`)
 }
 
 func (s *Store) queryPublications(ctx context.Context, q string, args ...any) ([]Publication, error) {
@@ -243,29 +213,6 @@ func (s *Store) IssuesBetween(ctx context.Context, pubID string, from, to time.T
 	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE publication_id = ? AND kind = ? AND received_at >= ? AND received_at < ?`,
 		pubID, KindIssue, from.Unix(), to.Unix()).Scan(&n)
 	return n, err
-}
-
-// SetPlan sets the plan the operator granted a user (users.plan). Billing
-// never calls it: a subscription lives in subscriptions.
-func (s *Store) SetPlan(ctx context.Context, userID, plan string) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE users SET plan = ? WHERE id = ?`, plan, userID)
-	return err
-}
-
-// PromoteEmails grants the accounts with these addresses Pro and returns how
-// many changed. No webhook can take that away. Addresses without an account are left for
-// their first sign-in.
-func (s *Store) PromoteEmails(ctx context.Context, emails []string) (int64, error) {
-	var total int64
-	for _, e := range emails {
-		res, err := s.DB.ExecContext(ctx, `UPDATE users SET plan = ? WHERE email = ? AND plan != ?`, PlanPro, NormalizeEmail(e), PlanPro)
-		if err != nil {
-			return total, err
-		}
-		n, _ := res.RowsAffected()
-		total += n
-	}
-	return total, nil
 }
 
 // AlertConfirmTTL is how long a link confirming an alert address works.

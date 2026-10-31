@@ -28,19 +28,16 @@ const APITokenPrefix = "ss_live_"
 // bits of a 256-bit sign-in or session token.
 const selectorLen = 12
 
+// The columns and table scanUser reads.
+const (
+	userCols  = `u.id, u.email, u.created_at`
+	userTable = `users u`
+)
+
 // User is an account.
 type User struct {
-	ID    string
-	Email string
-	// Plan is the plan in effect: PlanPro when the operator granted it or a
-	// subscription is in good standing, otherwise PlanFree.
-	Plan string
-	// Comped is set when the operator granted Pro (SENDSCORE_PRO_EMAILS),
-	// whatever billing says.
-	Comped bool
-	// Lapsed is set when the account is not Pro and its subscription
-	// ended, so its newsletters get no alerts or heartbeat.
-	Lapsed    bool
+	ID        string
+	Email     string
 	CreatedAt time.Time
 	// Next is set only by ConsumeLoginToken: the path the sign-in link
 	// asked to open afterwards, or empty.
@@ -152,7 +149,7 @@ func (s *Store) ConsumeLoginToken(ctx context.Context, token string) (User, stri
 		"usr_"+NewToken(10), email, now.Unix()); err != nil {
 		return User{}, "", err
 	}
-	u, err := scanUser(tx.QueryRowContext(ctx, `SELECT `+s.userCols()+` FROM `+userTable+` WHERE u.email = ?`, email))
+	u, err := scanUser(tx.QueryRowContext(ctx, `SELECT `+userCols+` FROM `+userTable+` WHERE u.email = ?`, email))
 	if err != nil {
 		return User{}, "", err
 	}
@@ -198,7 +195,7 @@ func (s *Store) KnownBrowser(ctx context.Context, token, email string) (bool, er
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
 	var created int64
-	err := row.Scan(&u.ID, &u.Email, &u.Plan, &u.Comped, &u.Lapsed, &created)
+	err := row.Scan(&u.ID, &u.Email, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return u, ErrNotFound
 	}
@@ -216,7 +213,7 @@ func (s *Store) UserBySession(ctx context.Context, token string) (User, error) {
 	if err != nil {
 		return User{}, err
 	}
-	return scanUser(s.DB.QueryRowContext(ctx, `SELECT `+s.userCols()+` FROM `+userTable+` WHERE u.id = ?`, uid))
+	return scanUser(s.DB.QueryRowContext(ctx, `SELECT `+userCols+` FROM `+userTable+` WHERE u.id = ?`, uid))
 }
 
 // DeleteSession ends a session (sign out).
@@ -292,7 +289,7 @@ func (s *Store) UserByAPIToken(ctx context.Context, token string) (User, error) 
 	if err != nil {
 		return User{}, err
 	}
-	u, err := scanUser(s.DB.QueryRowContext(ctx, `SELECT `+s.userCols()+` FROM `+userTable+` JOIN api_tokens t ON t.user_id = u.id WHERE t.id = ?`, id))
+	u, err := scanUser(s.DB.QueryRowContext(ctx, `SELECT `+userCols+` FROM `+userTable+` JOIN api_tokens t ON t.user_id = u.id WHERE t.id = ?`, id))
 	if err != nil {
 		return User{}, err
 	}
@@ -397,10 +394,9 @@ func (s *Store) Count(ctx context.Context, name, bucket string) (int, error) {
 // transaction: its test addresses, its publications, every message received
 // at either or uploaded while signed in (raw bodies with them), its alerts,
 // sessions, sign-in links, known browsers, API tokens, OAuth codes and
-// tokens, usage counters, and subscription. The messages are deleted by
-// hand rather than left to the foreign keys, which would keep an upload as
-// an anonymous row. Creem events are kept, since they are the payment
-// record, with the account and their payload taken off them. OAuth clients are shared
+// tokens, and usage counters. The messages are deleted by hand rather than
+// left to the foreign keys, which would keep an upload as an anonymous row.
+// OAuth clients are shared
 // registrations with no owner, so they stay. An unknown id is ErrNotFound.
 func (s *Store) DeleteUser(ctx context.Context, userID string) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
@@ -435,10 +431,8 @@ func (s *Store) DeleteUser(ctx context.Context, userID string) error {
 		// Counters about an account are named <what>:user:<id>. Ids are
 		// base32 with a prefix, so they hold no GLOB wildcard.
 		{`DELETE FROM counters WHERE name GLOB '*:user:' || ?`, []any{userID}},
-		{`DELETE FROM subscriptions WHERE user_id = ?`, []any{userID}},
 		// The body can hold the customer's email and is not needed once the
 		// event has no account.
-		{`UPDATE creem_events SET user_id = NULL, body = '{}' WHERE user_id = ?`, []any{userID}},
 		{`DELETE FROM users WHERE id = ?`, []any{userID}},
 	} {
 		if _, err := tx.ExecContext(ctx, q.query, q.args...); err != nil {

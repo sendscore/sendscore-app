@@ -6,39 +6,6 @@
     <p>Today you have used {{.Used}} of your {{.Limit}} test addresses. The allowance starts again at midnight UTC.</p>
   </div>
 </section>
-{{with .Plan}}
-<section class="sheet" id="plan">
-  <p class="label">Plan</p>
-  <div>
-    {{if .Confirmed}}<p class="notice">Thank you. Pro is on.</p>{{end}}
-    {{if .Confirming}}<p class="notice">Thank you. Pro turns on as soon as Creem confirms the payment, which usually takes a few seconds. Reload this page to see it.</p>{{end}}
-    {{if eq .State "comped"}}
-    <h2>Pro</h2>
-    <p>This account's Pro plan was granted by the operator of this SendScore, so there is nothing to pay{{if not .Manage}} and no billing to manage{{end}}.</p>
-    {{if .Manage}}<p>It also has billing at Creem. To change the card, read invoices, or cancel a subscription there, open the billing page.</p>{{end}}
-    {{else if eq .State "active"}}
-    <h2>Pro</h2>
-    <p>This account is on Pro{{if eq .Period "monthly"}}, billed monthly{{else if eq .Period "yearly"}}, billed yearly{{end}}.{{if not .PeriodEnd.IsZero}} It is paid through {{day .PeriodEnd}}.{{end}}</p>
-    <p>To change the card, read invoices, or cancel, open the billing page at Creem.</p>
-    {{else if eq .State "past_due"}}
-    <h2>Pro</h2>
-    <p class="notice">The last payment for Pro did not go through, and Creem is retrying it. Pro stays on in the meantime.</p>
-    <p>To pay with another card, open the billing page at Creem.</p>
-    {{else}}
-    <h2>Upgrade to Pro</h2>
-    {{if eq .State "lapsed"}}<p class="notice">Pro ended for this account{{if not .PeriodEnd.IsZero}} on {{day .PeriodEnd}}{{end}}. Your newsletters stay listed and keep receiving mail, but SendScore no longer alerts on them or checks their schedule, and new issues are kept for {{$.ReportDays}} days. Nothing has been deleted.</p>
-    {{else}}<p>This account is on the free plan.</p>{{end}}
-    <p>Pro monitors up to {{.Publications}} newsletters, emails you when an issue gets worse, does not arrive, or goes out twice, and keeps each newsletter's history for {{.HistoryDays}} days. It costs {{.PriceMonthly}} a month{{if .Yearly}} or {{.PriceYearly}} a year{{end}}, paid through Creem.</p>
-    <div class="actions">
-      <form method="post" action="/account/billing/checkout" class="inline"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="period" value="monthly"><button type="submit">Pay {{.PriceMonthly}} a month</button></form>
-      {{if .Yearly}}<form method="post" action="/account/billing/checkout" class="inline"><input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="period" value="yearly"><button type="submit" class="secondary">Pay {{.PriceYearly}} a year</button></form>{{end}}
-    </div>
-    {{end}}
-    {{if .Manage}}<form method="post" action="/account/billing/portal" class="form"><input type="hidden" name="csrf" value="{{$.CSRF}}"><button type="submit" class="secondary">Manage billing</button></form>{{end}}
-    {{with $.BillingError}}<p class="error">{{.}}</p>{{end}}
-  </div>
-</section>
-{{end}}
 {{if .NewToken}}
 <section class="sheet">
   <p class="label">New token</p>
@@ -103,7 +70,7 @@
 <section class="sheet">
   <p class="label">Delete</p>
   <div>
-    <p>Deleting your account removes it and everything in it, and cancels any subscription at Creem first. It cannot be undone.</p>
+    <p>Deleting your account removes it and everything in it. It cannot be undone.</p>
     <p><a href="/account/delete">Delete your account</a></p>
   </div>
 </section>

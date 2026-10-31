@@ -3,7 +3,6 @@ package db
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -13,7 +12,7 @@ import (
 // fillAccount signs up email and gives it a row in every table that can
 // hold one: sessions, sign-in links, a known browser, an API token, a test
 // address with a message, an upload, a publication with messages and an
-// alert, an OAuth grant, counters, a subscription, and a Creem event.
+// alert, an OAuth grant, and counters.
 func fillAccount(t *testing.T, s *Store, email string) User {
 	t.Helper()
 	ctx := context.Background()
@@ -63,13 +62,10 @@ func fillAccount(t *testing.T, s *Store, email string) User {
 	_, err = s.CreateOAuthCode(ctx, OAuthCode{ClientID: c.ID, UserID: u.ID, RedirectURI: "https://a.test/cb"}) // unused
 	must(err)
 
-	for _, name := range []string{"tests:user:", "billing:user:", "messages:user:"} {
+	for _, name := range []string{"tests:user:", "messages:user:"} {
 		_, err = s.Take(ctx, name+u.ID, Day(now), 100, time.Hour)
 		must(err)
 	}
-	must(s.PutSubscription(ctx, Subscription{UserID: u.ID, CustomerID: "cust_" + u.ID, SubscriptionID: "sub_" + u.ID, Status: SubActive}))
-	_, err = s.RecordCreemEvent(ctx, CreemEvent{ID: "evt_" + u.ID, Kind: "subscription.paid", UserID: u.ID, Body: `{"customer":{"email":"gone@example.com"}}`})
-	must(err)
 	return u
 }
 
@@ -127,36 +123,29 @@ func TestDeleteUserRemovesEveryRow(t *testing.T) {
 	for table, n := range before {
 		want := n
 		switch table {
-		case "creem_events", "oauth_clients":
-			// The payment record and the shared registration are kept.
+		case "oauth_clients":
+			// The shared registration is kept.
 			want = n + 1
 		}
 		if after[table] != want {
 			t.Errorf("%s has %d rows after the delete, want %d", table, after[table], want)
 		}
 	}
-	e, err := s.CreemEventByID(ctx, "evt_"+u.ID)
-	if err != nil || e.UserID != "" || strings.Contains(e.Body, "@") {
-		t.Errorf("creem event = %+v %v, want kept with no account", e, err)
-	}
-	if ok, _ := s.UserIDExists(ctx, u.ID); ok {
+	if ok, _ := s.userIDExists(ctx, u.ID); ok {
 		t.Error("the user row is still there")
-	}
-	if _, err := s.UserForSubscription(ctx, "sub_"+u.ID); !errors.Is(err, ErrNotFound) {
-		t.Errorf("subscription still resolves: %v", err)
 	}
 
 	// The other account is whole.
-	if ok, _ := s.UserIDExists(ctx, other.ID); !ok {
+	if ok, _ := s.userIDExists(ctx, other.ID); !ok {
 		t.Fatal("the other account went too")
-	}
-	if sub, err := s.Subscription(ctx, other.ID); err != nil || sub.Status != SubActive {
-		t.Errorf("other subscription = %+v %v", sub, err)
-	}
-	if e, _ := s.CreemEventByID(ctx, "evt_"+other.ID); e.UserID != other.ID {
-		t.Errorf("other account's event lost its account: %+v", e)
 	}
 	if err := s.DeleteUser(ctx, u.ID); !errors.Is(err, ErrNotFound) {
 		t.Errorf("deleting twice: err = %v, want ErrNotFound", err)
 	}
+}
+
+func (s *Store) userIDExists(ctx context.Context, id string) (bool, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE id = ?`, id).Scan(&n)
+	return n > 0, err
 }

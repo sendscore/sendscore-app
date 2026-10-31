@@ -13,7 +13,7 @@ import (
 )
 
 func TestClosedSignupsLookTheSameAndMakeNoAccount(t *testing.T) {
-	a, store, h := newApp(t, func(c *Config) { c.ClosedSignups = true; c.ProEmails = []string{"listed@example.com"} })
+	a, store, h := newApp(t, func(c *Config) { c.ClosedSignups = true; c.AllowedEmails = []string{"listed@example.com"} })
 	ctx := context.Background()
 	if _, _, _ = newUser(t, store, "member@example.com"); false {
 		t.Fatal()
@@ -185,7 +185,6 @@ func TestHealthz(t *testing.T) {
 func proUser(t *testing.T, store *db.Store, email string) (db.User, string) {
 	t.Helper()
 	u, session, _ := newUser(t, store, email)
-	pro(t, store, u)
 	return u, session
 }
 

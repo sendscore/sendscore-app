@@ -142,7 +142,7 @@ func TestRemoteMCP(t *testing.T) {
 }
 
 func TestRemoteMCPDailyLimit(t *testing.T) {
-	_, store, h := newApp(t, func(c *Config) { c.FreeDailyTests = 1 })
+	_, store, h := newApp(t, func(c *Config) { c.DailyTests = 1 })
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 	_, _, tok := newUser(t, store, "limit@example.com")

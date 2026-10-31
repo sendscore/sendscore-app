@@ -263,17 +263,9 @@ func (a *App) takeTest(ctx context.Context, u *db.User, ip string) (int, error) 
 // testCounter is the counter and daily limit takeTest uses.
 func (a *App) testCounter(u *db.User, ip string) (string, int) {
 	if u != nil {
-		return "tests:user:" + u.ID, a.dailyLimit(u)
+		return "tests:user:" + u.ID, a.cfg.DailyTests
 	}
 	return "tests:ip:" + ip, a.cfg.AnonDailyTests
-}
-
-// dailyLimit is the user's test addresses per UTC day, by plan.
-func (a *App) dailyLimit(u *db.User) int {
-	if u.Plan == db.PlanPro {
-		return a.cfg.ProDailyTests
-	}
-	return a.cfg.FreeDailyTests
 }
 
 // limitPage explains a used-up daily allowance.
@@ -284,7 +276,7 @@ func (a *App) limitPage(w http.ResponseWriter, r *http.Request, limit int) {
 	case limit == 0:
 		msg = "This SendScore does not offer tests without an account. Sign in to run one."
 	default:
-		msg = fmt.Sprintf("This network has used all %d of today's free tests. Sign in for %d a day, or come back after midnight UTC.", limit, a.cfg.FreeDailyTests)
+		msg = fmt.Sprintf("This network has used all %d of today's tests. Sign in for %d a day, or come back after midnight UTC.", limit, a.cfg.DailyTests)
 	}
 	a.render(w, r, http.StatusTooManyRequests, "error", map[string]any{"Title": "Daily limit reached", "Message": msg})
 }
@@ -370,7 +362,7 @@ func (a *App) signin(w http.ResponseWriter, r *http.Request) {
 	// An address that may not sign up is told so by email, not on this page,
 	// so the page and its timing say nothing about who has an account.
 	subject, body := "Sign in to SendScore", "This SendScore is not taking new accounts, so no sign-in link was made for this address. "+
-		"If you run it, add this address to SENDSCORE_PRO_EMAILS.\n\nIf you did not ask to sign in, ignore this email.\n"
+		"If you run it, add this address to SENDSCORE_ALLOWED_EMAILS.\n\nIf you did not ask to sign in, ignore this email.\n"
 	if allowed {
 		token, err := a.store.CreateLoginTokenNext(ctx, email, next)
 		if err != nil {
@@ -393,7 +385,7 @@ func (a *App) signin(w http.ResponseWriter, r *http.Request) {
 // mayHaveAccount reports whether an address may sign in: it has an account,
 // sign-ups are open, or the operator listed it.
 func (a *App) mayHaveAccount(ctx context.Context, email string) (bool, error) {
-	if !a.cfg.ClosedSignups || slices.Contains(a.cfg.ProEmails, email) {
+	if !a.cfg.ClosedSignups || slices.Contains(a.cfg.AllowedEmails, email) {
 		return true, nil
 	}
 	return a.store.HasAccount(ctx, email)
@@ -498,7 +490,6 @@ func (a *App) verify(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, http.StatusInternalServerError, "Could not sign you in. Try the link again in a minute.")
 		return
 	}
-	a.promote(r.Context(), &u)
 	a.setCookie(w, sessionCookie, session, db.SessionTTL)
 	a.rememberBrowser(w, r, u.Email)
 	next := safeNext(u.Next)
@@ -506,19 +497,6 @@ func (a *App) verify(w http.ResponseWriter, r *http.Request) {
 		next = "/account"
 	}
 	localRedirect(w, next)
-}
-
-// promote grants Pro to an address listed in ProEmails as it signs in,
-// whatever billing says.
-func (a *App) promote(ctx context.Context, u *db.User) {
-	if u.Comped || !slices.Contains(a.cfg.ProEmails, u.Email) {
-		return
-	}
-	if err := a.store.SetPlan(ctx, u.ID, db.PlanPro); err != nil {
-		a.log.Error("set plan", "err", err)
-		return
-	}
-	u.Plan, u.Comped, u.Lapsed = db.PlanPro, true, false
 }
 
 // rememberBrowser records that this browser signed in to email, for the
@@ -574,14 +552,10 @@ func (a *App) renderAccount(w http.ResponseWriter, r *http.Request, status int, 
 	if err != nil {
 		a.log.Error("connected apps", "err", err)
 	}
-	data := map[string]any{"Title": "Account", "Tokens": tokens, "Apps": apps, "Used": used, "Limit": a.dailyLimit(u), "BaseURL": a.cfg.BaseURL}
-	if p := a.planFor(ctx, r, u); p != nil {
-		data["Plan"] = p
-	}
+	data := map[string]any{"Title": "Account", "Tokens": tokens, "Apps": apps, "Used": used, "Limit": a.cfg.DailyTests, "BaseURL": a.cfg.BaseURL}
 	for k, v := range extra {
 		data[k] = v
 	}
-	a.accountCSP(w)
 	a.render(w, r, status, "account", data)
 }
 

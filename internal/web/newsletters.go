@@ -26,9 +26,9 @@ import (
 
 // Defaults for the publication settings in Config.
 const (
-	DefaultProPublications = 5
-	DefaultProDailyTests   = 500
-	DefaultGraceMinutes    = 30
+	DefaultPublications = 5
+	DefaultDailyTests   = 500
+	DefaultGraceMinutes = 30
 	// timelineLength is how many messages a publication page shows.
 	timelineLength = 100
 	// apiReports is how many recent reports the publication API returns.
@@ -48,14 +48,6 @@ var timeZones = []string{
 
 // weekdays lists the days in the form, Monday first.
 var weekdays = []int{1, 2, 3, 4, 5, 6, 0}
-
-// publicationLimit is how many publications the user's plan allows.
-func (a *App) publicationLimit(u *db.User) int {
-	if u.Plan == db.PlanPro {
-		return a.cfg.ProPublications
-	}
-	return a.cfg.FreePublications
-}
 
 func (a *App) monitorAddress(p db.Publication) string { return "m-" + p.Token + "@" + a.cfg.MailDomain }
 
@@ -87,17 +79,12 @@ func (a *App) ownPublication(w http.ResponseWriter, r *http.Request) (*db.User, 
 	return u, p, true
 }
 
-// planMessage explains why the user cannot add a publication, or is empty.
-func (a *App) planMessage(u *db.User, count int) string {
-	limit := a.publicationLimit(u)
+// limitMessage explains why the user cannot add a publication, or is empty.
+func (a *App) limitMessage(count int) string {
+	limit := a.cfg.Publications
 	switch {
 	case count < limit:
 		return ""
-	case u.Lapsed:
-		return fmt.Sprintf("This account's Pro plan has ended, so it cannot add newsletters. The ones it has stay listed and keep receiving mail, "+
-			"but SendScore no longer alerts on them or checks their schedule, and new issues are kept for %d days.", int(a.cfg.ReportTTL/(24*time.Hour)))
-	case limit == 0:
-		return "Monitoring newsletters is part of the Pro plan. This account is on the free plan, so it cannot add a newsletter yet. Test addresses and uploads work as before."
 	case limit == 1:
 		return "This account can monitor 1 newsletter, and it already does. Delete it to add another."
 	}
@@ -132,7 +119,7 @@ func (a *App) newsletters(w http.ResponseWriter, r *http.Request) {
 		rows = append(rows, row)
 	}
 	a.render(w, r, http.StatusOK, "newsletters", map[string]any{"Title": "Newsletters", "Rows": rows,
-		"PlanMessage": a.planMessage(u, len(pubs)), "Limit": a.publicationLimit(u), "PlanLink": a.planLink(u)})
+		"LimitMessage": a.limitMessage(len(pubs)), "Limit": a.cfg.Publications})
 }
 
 // formData is what the add and edit form shows.
@@ -163,8 +150,8 @@ func (a *App) newNewsletter(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		a.log.Error("publications", "err", err)
 	}
-	if msg := a.planMessage(u, len(pubs)); msg != "" {
-		a.render(w, r, http.StatusForbidden, "error", map[string]any{"Title": "Monitoring needs Pro", "Message": msg, "PlanLink": a.planLink(u)})
+	if msg := a.limitMessage(len(pubs)); msg != "" {
+		a.render(w, r, http.StatusForbidden, "error", map[string]any{"Title": "Newsletter limit reached", "Message": msg})
 		return
 	}
 	p := db.Publication{TimeZone: "UTC", GraceMinutes: DefaultGraceMinutes, AlertEmail: u.Email}
@@ -244,10 +231,10 @@ func (a *App) createNewsletter(w http.ResponseWriter, r *http.Request) {
 	// Alerts go to the account's own address until another one accepts them.
 	requested := p.AlertEmail
 	p.AlertEmail = u.Email
-	err := a.store.CreatePublication(r.Context(), &p, a.publicationLimit(u))
+	err := a.store.CreatePublication(r.Context(), &p, a.cfg.Publications)
 	if errors.Is(err, db.ErrLimit) {
 		pubs, _ := a.store.Publications(r.Context(), u.ID)
-		a.render(w, r, http.StatusForbidden, "error", map[string]any{"Title": "Monitoring needs Pro", "Message": a.planMessage(u, len(pubs)), "PlanLink": a.planLink(u)})
+		a.render(w, r, http.StatusForbidden, "error", map[string]any{"Title": "Newsletter limit reached", "Message": a.limitMessage(len(pubs))})
 		return
 	}
 	if err != nil {
