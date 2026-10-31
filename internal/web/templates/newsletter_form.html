@@ -16,6 +16,7 @@
       <datalist id="zones">{{range .Zones}}<option value="{{.}}">{{end}}</datalist>
       <label>Grace period in minutes, before an issue counts as missed<input type="number" name="grace_minutes" value="{{.P.GraceMinutes}}" min="0" max="{{.MaxGrace}}"></label>
       <label>Send alerts to<input type="email" name="alert_email" value="{{.P.AlertEmail}}" required></label>
+      {{if .P.AlertPending}}<label class="check"><input type="checkbox" name="cancel_pending"> Stop waiting for {{.P.AlertPending}} to accept alerts</label>{{end}}
       <label class="check"><input type="checkbox" name="paused"{{if .P.Paused}} checked{{end}}> Pause alerts (issues are still received and checked)</label>
       <button type="submit">Save</button>
     </form>

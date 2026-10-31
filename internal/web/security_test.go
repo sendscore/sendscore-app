@@ -1,15 +1,21 @@
 package web
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/sendscore/sendscore-app/internal/budget"
 	"github.com/sendscore/sendscore-app/internal/db"
+	"github.com/sendscore/sendscore/verdict"
 )
 
 func TestClosedSignupsLookTheSameAndMakeNoAccount(t *testing.T) {
@@ -30,14 +36,13 @@ func TestClosedSignupsLookTheSameAndMakeNoAccount(t *testing.T) {
 		t.Error("the sign-in page differs by whether the address has an account")
 	}
 	m := mailer(a)
-	if m.count() != 3 {
-		t.Fatalf("sent %d emails; a stranger must get one too, so timing says nothing", m.count())
+	if m.count() != 2 {
+		t.Fatalf("sent %d emails, want one each for the member and the listed address, and none to a stranger", m.count())
 	}
-	stranger := m.msgs[0]
-	if strings.Contains(stranger.Body, "/signin/verify") {
-		t.Errorf("a stranger got a link: %s", stranger.Body)
+	if m.msgs[0].To != "member@example.com" {
+		t.Errorf("first email went to %s", m.msgs[0].To)
 	}
-	for _, i := range []int{1, 2} {
+	for _, i := range []int{0, 1} {
 		if !strings.Contains(m.msgs[i].Body, "/signin/verify") {
 			t.Errorf("message %d has no link", i)
 		}
@@ -248,9 +253,124 @@ func TestOwnAddressNeedsNoConfirmationAndEditKeepsTheAddress(t *testing.T) {
 	if got.AlertEmail != u.Email || got.AlertPending != "x@example.net" {
 		t.Fatalf("after edit: %+v", got)
 	}
-	post(h, "/newsletters/"+p.ID, alertForm("Renamed", u.Email), session)
+	// Saving anything else leaves the emailed link working.
+	post(h, "/newsletters/"+p.ID, alertForm("Renamed again", u.Email), session)
+	if got, _ := store.PublicationByID(ctx, p.ID); got.AlertPending != "x@example.net" {
+		t.Errorf("an unrelated save withdrew the request: %+v", got)
+	}
+	cancel := alertForm("Renamed again", u.Email)
+	cancel.Set("cancel_pending", "on")
+	post(h, "/newsletters/"+p.ID, cancel, session)
 	if got, _ := store.PublicationByID(ctx, p.ID); got.AlertPending != "" {
 		t.Errorf("request not withdrawn: %+v", got)
+	}
+}
+
+func TestSigninsGoThroughTheQueue(t *testing.T) {
+	a, store, h := newApp(t, func(c *Config) {
+		c.InlineSignin, c.ClosedSignups, c.AllowedEmails, c.SigninEmailsPerHour = false, true, []string{"listed@example.com"}, 2
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	// Strangers get the page and use up nothing, even past the service's limit.
+	for i := range 5 {
+		req := request("POST", "/signin", strings.NewReader(url.Values{"email": {fmt.Sprintf("s%d@example.com", i)}, "csrf": {testCSRF}}.Encode()), "application/x-www-form-urlencoded", "")
+		req.RemoteAddr = fmt.Sprintf("192.0.%d.1:1234", i)
+		if w := serve(h, req); w.Code != 200 {
+			t.Fatalf("stranger %d = %d", i, w.Code)
+		}
+	}
+	if w := post(h, "/signin", url.Values{"email": {"listed@example.com"}}, ""); w.Code != 200 {
+		t.Fatalf("listed = %d", w.Code)
+	}
+	if n := mailer(a).count(); n != 0 {
+		t.Fatalf("%d emails went out before the queue ran", n)
+	}
+	done := make(chan struct{})
+	go func() { a.RunSignins(ctx); close(done) }()
+	cancel()
+	<-done
+	m := mailer(a)
+	if m.count() != 1 || m.msgs[0].To != "listed@example.com" {
+		t.Fatalf("sent %+v, want only the listed address", m.msgs)
+	}
+	if n, err := store.Count(context.Background(), "signin:all", db.Hour(store.Now())); err != nil || n != 1 {
+		t.Errorf("signin:all = %d %v, want only what was sent", n, err)
+	}
+}
+
+func TestAWaitOfZeroStillLooks(t *testing.T) {
+	a, store, _ := newApp(t)
+	ctx := context.Background()
+	addr, err := store.CreateAddress(ctx, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := store.Now().UTC()
+	saved := &db.Message{Token: addr.Token, Source: "smtp", ReceivedAt: now, ExpiresAt: now.Add(time.Hour), Raw: []byte("x"), Verdict: &verdict.Verdict{}}
+	if err := store.SaveMessage(ctx, saved); err != nil {
+		t.Fatal(err)
+	}
+	m, err := a.wait(ctx, "", addr, "", 0)
+	if err != nil || m == nil || m.ID != saved.ID {
+		t.Errorf("wait = %v %v", m, err)
+	}
+}
+
+func TestAnonymousUploadBelongsToItsBrowser(t *testing.T) {
+	_, _, h := newApp(t)
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	fw, _ := mw.CreateFormFile("message", "issue.eml")
+	fw.Write(sample(t))
+	mw.WriteField("csrf", testCSRF)
+	mw.Close()
+	w := postMultipart(h, "/upload", &body, mw)
+	if w.Code != http.StatusSeeOther {
+		t.Fatalf("upload = %d %s", w.Code, w.Body)
+	}
+	raw := w.Header().Get("Location") + "/raw"
+	if w := serve(h, request("GET", raw, nil, "", "")); w.Code != 200 {
+		t.Errorf("the uploader's browser = %d", w.Code)
+	}
+	if w := do(h, "GET", raw, nil, ""); w.Code != 404 {
+		t.Errorf("anyone else = %d", w.Code)
+	}
+	if w := do(h, "GET", w.Header().Get("Location"), nil, ""); w.Code != 200 {
+		t.Errorf("the report itself = %d", w.Code)
+	}
+}
+
+func TestUploadsShareTheMemoryBudget(t *testing.T) {
+	_, _, h := newApp(t, func(c *Config) { c.Memory = budget.New(10) })
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	fw, _ := mw.CreateFormFile("message", "issue.eml")
+	fw.Write(sample(t))
+	mw.WriteField("csrf", testCSRF)
+	mw.Close()
+	if w := postMultipart(h, "/upload", &body, mw); w.Code != http.StatusServiceUnavailable {
+		t.Errorf("upload over the budget = %d", w.Code)
+	}
+}
+
+func TestOneAccountsUploadsAreBounded(t *testing.T) {
+	_, _, h := newApp(t, func(c *Config) { c.AccountBytes = int64(len(sample(t))) * 3 / 2 })
+	for want := range []int{0, 1} {
+		var body bytes.Buffer
+		mw := multipart.NewWriter(&body)
+		fw, _ := mw.CreateFormFile("message", "issue.eml")
+		fw.Write(sample(t))
+		mw.WriteField("csrf", testCSRF)
+		mw.Close()
+		req := request("POST", "/upload", &body, mw.FormDataContentType(), "")
+		req.RemoteAddr = fmt.Sprintf("192.0.%d.1:1234", want)
+		w := serve(h, req)
+		if want == 0 && w.Code != http.StatusSeeOther {
+			t.Fatalf("first = %d", w.Code)
+		}
+		if want == 1 && w.Code != http.StatusTooManyRequests {
+			t.Errorf("second = %d", w.Code)
+		}
 	}
 }
 

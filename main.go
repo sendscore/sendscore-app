@@ -23,6 +23,7 @@ import (
 
 	"github.com/emersion/go-smtp"
 
+	"github.com/sendscore/sendscore-app/internal/budget"
 	"github.com/sendscore/sendscore-app/internal/db"
 	"github.com/sendscore/sendscore-app/internal/mail"
 	"github.com/sendscore/sendscore-app/internal/monitor"
@@ -74,21 +75,23 @@ func main() {
 	case ok:
 		mailer, alerter = ses, ses
 		log.Info("sign-in email and alerts via SES", "from", ses.From(), "alerts_from", ses.AlertFrom())
-	case secureCookies:
+	case secureCookies || !isLocal(baseURL):
 		// A production log must never hold working sign-in links.
-		log.Error("SES_ACCESS_KEY_ID and SES_SECRET_ACCESS_KEY are required when SENDSCORE_SECURE_COOKIES=true")
+		log.Error("SES_ACCESS_KEY_ID and SES_SECRET_ACCESS_KEY are required unless SENDSCORE_BASE_URL is local")
 		os.Exit(1)
 	default:
 		log.Warn("SES is not configured, so sign-in links and alerts are logged here instead of emailed")
 	}
 
-	store.RawKeep = time.Duration(getpos(log, "SENDSCORE_RAW_DAYS", 30)) * 24 * time.Hour
 	closedSignups, err := signupsClosed(os.Getenv("SENDSCORE_SIGNUPS"))
 	if err != nil {
 		log.Error(err.Error())
 		os.Exit(1)
 	}
 	historyDays := getpos(log, "SENDSCORE_HISTORY_DAYS", 365)
+	store.RawKeep = time.Duration(getpos(log, "SENDSCORE_RAW_DAYS", 30)) * 24 * time.Hour
+	// Alerts link to issues, so they are kept a little longer than those.
+	store.AlertKeep = time.Duration(historyDays+alertExtraDays) * 24 * time.Hour
 	mon := &monitor.Monitor{
 		Store: store, Mailer: alerter, BaseURL: baseURL, Log: log,
 		PerDay:       getpos(log, "SENDSCORE_ALERTS_PER_DAY", monitor.DefaultAlertsPerDay),
@@ -114,8 +117,15 @@ func main() {
 	// Links are fetched with the engine's safe client, which refuses
 	// non-public addresses and never follows unsubscribe or confirm links.
 	checkLinks := getbool(log, "SENDSCORE_CHECK_LINKS", true)
-	dailyBytes := getpos(log, "SENDSCORE_DAILY_MB", 1024) << 20
-	maxStorage := int64(getpos(log, "SENDSCORE_MAX_STORAGE_MB", 10240)) << 20
+	dailyBytes := getpos(log, "SENDSCORE_DAILY_MB", db.DefaultDailyBytes>>20) << 20
+	accountBytes := int64(getpos(log, "SENDSCORE_ACCOUNT_STORAGE_MB", db.DefaultAccountBytes>>20)) << 20
+	maxStorage := int64(getpos(log, "SENDSCORE_MAX_STORAGE_MB", db.DefaultMaxStorageBytes>>20)) << 20
+	bufferBytes := int64(getpos(log, "SENDSCORE_SMTP_BUFFER_MB", receiver.DefaultMaxBufferedBytes>>20)) << 20
+	if bufferBytes < receiver.MaxMessageBytes*budget.PerByte {
+		log.Error(fmt.Sprintf("SENDSCORE_SMTP_BUFFER_MB must be at least %d, or the largest message could never be checked", receiver.MaxMessageBytes*budget.PerByte>>20))
+		os.Exit(1)
+	}
+	memory := budget.New(bufferBytes)
 	started := time.Now()
 	app, err := web.New(web.Config{
 		Blocklists:      lists,
@@ -126,7 +136,9 @@ func main() {
 		ClosedSignups:   closedSignups,
 		AnonDailyTotal:  getpos(log, "SENDSCORE_ANON_DAILY_TOTAL", web.DefaultAnonDailyTotal),
 		DailyBytes:      dailyBytes,
+		AccountBytes:    accountBytes,
 		MaxStorageBytes: maxStorage,
+		Memory:          memory,
 		Health: func(ctx context.Context) error {
 			return checkHealth(ctx, mon.LastTick(), started, time.Now(), smtpAddr)
 		},
@@ -176,9 +188,10 @@ func main() {
 		MaxSessionsPerIP:   getpos(log, "SENDSCORE_SMTP_SESSIONS_PER_IP", receiver.DefaultMaxSessionsPerIP),
 
 		DailyBytes:        dailyBytes,
+		AccountBytes:      accountBytes,
 		AnonDailyMessages: getpos(log, "SENDSCORE_ANON_DAILY_MESSAGES", receiver.DefaultAnonDailyMessages),
 		MaxStorageBytes:   maxStorage,
-		MaxBufferedBytes:  int64(getpos(log, "SENDSCORE_SMTP_BUFFER_MB", receiver.DefaultMaxBufferedBytes>>20)) << 20,
+		Memory:            memory,
 		MaxAnalyzing:      getpos(log, "SENDSCORE_SMTP_ANALYZING", receiver.DefaultMaxAnalyzing),
 
 		PublicationDailyMessages: getpos(log, "SENDSCORE_PUBLICATION_DAILY_MESSAGES", receiver.DefaultPublicationDailyMessages),
@@ -215,17 +228,21 @@ func main() {
 	background.Go(func() { sweep(ctx, store, log) })
 	// The heartbeat: missed issues, and alerts waiting to be sent.
 	background.Go(func() { mon.Run(ctx) })
+	// Sign-in links, sent apart from the request.
+	background.Go(func() { app.RunSignins(ctx) })
 
 	<-ctx.Done()
 	// A second signal now stops the process at once.
 	stop()
 	// Open long polls answer not_received at once, so agents call again
 	// instead of seeing a reset. Uploads and SMTP sessions in DATA get
-	// shutdownGrace to finish their checks (45 seconds), save (10), and send
-	// any alert (10); a session still open after that, such as an idle one,
-	// is dropped when the process exits, and the sender retries. A process
-	// manager's stop timeout must allow for it. The heartbeat and the sweep
-	// finish before the database closes, so no send loses its status.
+	// shutdownGrace to finish. The slowest message waits for a turn (30
+	// seconds), is checked (45), saved (10), and sends an alert (10), so it
+	// can pass that; a session still open then is dropped when the process
+	// exits, and the sender retries, which loses nothing. A process manager's
+	// stop timeout must allow for shutdownGrace plus backgroundGrace. The
+	// heartbeat and the sweep finish before the database closes, so no send
+	// loses its status.
 	log.Info("shutting down")
 	app.StopWaits()
 	shutdown, cancel := context.WithTimeout(context.Background(), shutdownGrace)
@@ -242,6 +259,9 @@ func main() {
 		log.Warn("the heartbeat or the sweep did not stop in time")
 	}
 }
+
+// alertExtraDays is how much longer than an issue its alerts are kept.
+const alertExtraDays = 35
 
 // How long shutdown waits for sessions, then for the heartbeat and the sweep.
 // Together they stay under the 90 seconds compose.yaml gives the process.
@@ -326,13 +346,10 @@ func checkConfig(baseURL, mailDomain string, secureCookies bool) error {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return fmt.Errorf("SENDSCORE_BASE_URL must be a full URL such as https://sendscore.example.com, not %q", baseURL)
 	}
-	if !secureCookies {
-		return nil
-	}
-	if u.Scheme != "https" {
+	if secureCookies && u.Scheme != "https" {
 		return errors.New("SENDSCORE_SECURE_COOKIES needs an https SENDSCORE_BASE_URL, since a browser drops these cookies over http")
 	}
-	if mailDomain == "localhost" {
+	if !isLocal(baseURL) && mailDomain == "localhost" {
 		return errors.New("SENDSCORE_MAIL_DOMAIN is required in production: without it, test addresses end in @localhost and mail for your domain is refused")
 	}
 	return nil

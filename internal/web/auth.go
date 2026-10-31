@@ -340,46 +340,89 @@ func validEmail(s string) bool {
 	return err == nil && addr.Address == s && strings.Contains(s[strings.LastIndex(s, "@"):], ".")
 }
 
-// signin emails a sign-in link. The page says the same thing whether or
-// not the address has an account, so it cannot be used to find accounts.
+// signinRequest is a sign-in link waiting to be sent, with the counter of
+// sign-in emails it goes against.
+type signinRequest struct {
+	email, next, allKey string
+}
+
+// signin answers a request for a sign-in link. Whether the address may sign
+// in, and the email itself, are left to sendSignin behind a queue, so the page
+// and its timing are the same for everyone, and it cannot be used to find
+// accounts. An address that may not sign in gets no email at all, so nobody
+// can make this server send mail to strangers.
 func (a *App) signin(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
 	email := db.NormalizeEmail(r.PostFormValue("email"))
 	next := safeNext(r.PostFormValue("next"))
 	if !validEmail(email) {
 		a.render(w, r, http.StatusBadRequest, "signin", map[string]any{"Title": "Sign in", "Email": email, "Next": next, "Error": "Enter a full email address, such as you@example.com."})
 		return
 	}
-	if !a.takeSignin(w, r, email) {
+	allKey, ok := a.takeSignin(w, r, email)
+	if !ok {
 		return
 	}
-	allowed, err := a.mayHaveAccount(ctx, email)
-	if err != nil {
-		a.log.Error("account lookup", "err", err)
-		a.fail(w, r, http.StatusInternalServerError, "Could not start signing in. Try again in a minute.")
-		return
-	}
-	// An address that may not sign up is told so by email, not on this page,
-	// so the page and its timing say nothing about who has an account.
-	subject, body := "Sign in to SendScore", "This SendScore is not taking new accounts, so no sign-in link was made for this address. "+
-		"If you run it, add this address to SENDSCORE_ALLOWED_EMAILS.\n\nIf you did not ask to sign in, ignore this email.\n"
-	if allowed {
-		token, err := a.store.CreateLoginTokenNext(ctx, email, next)
-		if err != nil {
-			a.log.Error("create login token", "err", err)
-			a.fail(w, r, http.StatusInternalServerError, "Could not start signing in. Try again in a minute.")
-			return
+	req := signinRequest{email: email, next: next, allKey: allKey}
+	if a.cfg.InlineSignin {
+		a.sendSignin(req)
+	} else {
+		select {
+		case a.signins <- req:
+		default:
+			a.log.Error("sign-in queue is full, dropping a request")
 		}
-		link := a.cfg.BaseURL + "/signin/verify?t=" + token
-		body = "Use this link to sign in to SendScore. It works once and expires in 15 minutes.\n\n" + link +
-			"\n\nIf you did not ask to sign in, ignore this email. Nobody can sign in without the link.\n"
-	}
-	if err := a.cfg.Mailer.Send(ctx, email, subject, body); err != nil {
-		a.log.Error("send sign-in email", "err", err)
-		a.fail(w, r, http.StatusBadGateway, "The sign-in email could not be sent. Try again in a few minutes.")
-		return
 	}
 	a.render(w, r, http.StatusOK, "signin", map[string]any{"Title": "Check your email", "Sent": true, "Email": email})
+}
+
+// RunSignins sends queued sign-in links until ctx is done, then sends what is
+// left in the queue.
+func (a *App) RunSignins(ctx context.Context) {
+	for {
+		select {
+		case req := <-a.signins:
+			a.sendSignin(req)
+		case <-ctx.Done():
+			for {
+				select {
+				case req := <-a.signins:
+					a.sendSignin(req)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+// sendSignin emails a sign-in link to an address that may sign in. Only a
+// sent email counts against the service's limit, so strangers cannot use it
+// up. The page has already answered, so failures are logged.
+func (a *App) sendSignin(req signinRequest) {
+	ctx, cancel := context.WithTimeout(context.Background(), signinSendTimeout)
+	defer cancel()
+	allowed, err := a.mayHaveAccount(ctx, req.email)
+	if err != nil {
+		a.log.Error("account lookup", "err", err)
+		return
+	}
+	if !allowed {
+		return
+	}
+	if _, err := a.store.Take(ctx, req.allKey, db.Hour(a.store.Now()), a.cfg.SigninEmailsPerHour, 2*time.Hour); err != nil {
+		a.log.Error("sign-in email not sent", "err", err)
+		return
+	}
+	token, err := a.store.CreateLoginTokenNext(ctx, req.email, req.next)
+	if err != nil {
+		a.log.Error("create login token", "err", err)
+		return
+	}
+	body := "Use this link to sign in to SendScore. It works once and expires in 15 minutes.\n\n" + a.cfg.BaseURL + "/signin/verify?t=" + token +
+		"\n\nIf you did not ask to sign in, ignore this email. Nobody can sign in without the link.\n"
+	if err := a.cfg.Mailer.Send(ctx, req.email, "Sign in to SendScore", body); err != nil {
+		a.log.Error("send sign-in email", "err", err)
+	}
 }
 
 // mayHaveAccount reports whether an address may sign in: it has an account,
@@ -391,19 +434,21 @@ func (a *App) mayHaveAccount(ctx context.Context, email string) (bool, error) {
 	return a.store.HasAccount(ctx, email)
 }
 
-// takeSignin counts a sign-in email against four limits, and answers 429
-// when one is used up: the network per hour (an IPv6 address counts as its
-// /48, since a single host is often given that many), a wider network per
-// hour, the address per hour, and the whole service per hour
-// (SigninEmailsPerHour, which protects the sending reputation). The address
-// and service limits are kept per browser kind: a browser that has signed in
-// to this address before has its own allowance of each, so a stranger who
-// uses up the address's or the service's cannot lock its owner out of the
-// browsers they already use.
-func (a *App) takeSignin(w http.ResponseWriter, r *http.Request, email string) bool {
+// takeSignin counts a sign-in request against three limits, and answers 429
+// when one is used up, or when the whole service's limit is
+// (SigninEmailsPerHour, which protects the sending reputation): the network
+// per hour (an IPv6 address counts as its /48, since a single host is often
+// given that many), a wider network per hour, and the address per hour. The
+// service's limit is only looked at here, and it returns its counter for
+// sendSignin to take. The address and service limits are kept per browser
+// kind: a browser that has signed in to this address before has its own
+// allowance of each, so a stranger who uses up the address's or the service's
+// cannot lock its owner out of the browsers they already use.
+func (a *App) takeSignin(w http.ResponseWriter, r *http.Request, email string) (allKey string, ok bool) {
 	ctx := r.Context()
 	hour := db.Hour(a.store.Now())
-	emailKey, allKey := "signin:email:"+email, "signin:all"
+	emailKey := "signin:email:" + email
+	allKey = "signin:all"
 	if c, err := r.Cookie(a.cookie(browserCookie)); err == nil {
 		if ok, err := a.store.KnownBrowser(ctx, c.Value, email); err != nil {
 			a.log.Error("known browser", "err", err)
@@ -420,20 +465,29 @@ func (a *App) takeSignin(w http.ResponseWriter, r *http.Request, email string) b
 		{"signin:ip:" + a.clientNet(r, 48), signinPerHour, "Too many sign-in links were requested from this network in the last hour. Use the newest link you received, or try again in an hour."},
 		{"signin:net:" + a.clientNet(r, 32), signinPerNetwork, "Too many sign-in links were requested from this network in the last hour. Use the newest link you received, or try again in an hour."},
 		{emailKey, signinPerHour, "Too many sign-in links were requested for this address in the last hour. Use the newest link you received, or try again in an hour."},
-		{allKey, a.cfg.SigninEmailsPerHour, "SendScore is sending a lot of sign-in emails right now. Try again in a few minutes."},
 	}
 	// Every limit is checked before any is counted, so a request refused by
 	// one (such as a flood from one network) never uses up the others.
-	refuse := func(msg string) bool {
+	refuse := func(msg string) (string, bool) {
 		a.render(w, r, http.StatusTooManyRequests, "error", map[string]any{"Title": "Too many sign-in emails", "Message": msg})
-		return false
+		return "", false
+	}
+	failed := func(err error) (string, bool) {
+		a.log.Error("signin limit", "err", err)
+		a.fail(w, r, http.StatusInternalServerError, "Could not start signing in. Try again in a minute.")
+		return "", false
+	}
+	all, err := a.store.Count(ctx, allKey, hour)
+	if err != nil {
+		return failed(err)
+	}
+	if all >= a.cfg.SigninEmailsPerHour {
+		return refuse("SendScore is sending a lot of sign-in emails right now. Try again in a few minutes.")
 	}
 	for _, l := range limits {
 		n, err := a.store.Count(ctx, l.name, hour)
 		if err != nil {
-			a.log.Error("signin limit", "err", err)
-			a.fail(w, r, http.StatusInternalServerError, "Could not start signing in. Try again in a minute.")
-			return false
+			return failed(err)
 		}
 		if n >= l.limit {
 			return refuse(l.msg)
@@ -442,14 +496,12 @@ func (a *App) takeSignin(w http.ResponseWriter, r *http.Request, email string) b
 	for _, l := range limits {
 		if _, err := a.store.Take(ctx, l.name, hour, l.limit, 2*time.Hour); err != nil {
 			if !errors.Is(err, db.ErrLimit) {
-				a.log.Error("signin limit", "err", err)
-				a.fail(w, r, http.StatusInternalServerError, "Could not start signing in. Try again in a minute.")
-				return false
+				return failed(err)
 			}
 			return refuse(l.msg)
 		}
 	}
-	return true
+	return allKey, true
 }
 
 // verifyForm shows a button that signs in. Following the link only shows

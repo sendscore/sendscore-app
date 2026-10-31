@@ -415,7 +415,7 @@ func (a *App) updateNewsletter(w http.ResponseWriter, r *http.Request) {
 		if !a.requestAlertEmail(ctx, u, p.ID, requested) {
 			next += "?alert=limit"
 		}
-	case p.AlertPending != "":
+	case p.AlertPending != "" && r.PostFormValue("cancel_pending") != "":
 		if _, err := a.store.RequestAlertEmail(ctx, p.ID, u.ID, ""); err != nil {
 			a.log.Error("withdraw alert address", "err", err)
 		}

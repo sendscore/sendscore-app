@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sendscore/sendscore-app/internal/budget"
 	"github.com/sendscore/sendscore-app/internal/db"
 	"github.com/sendscore/sendscore-app/internal/mail"
 	"github.com/sendscore/sendscore/engine"
@@ -61,6 +62,9 @@ type Config struct {
 	SecureCookies bool
 	// Mailer sends sign-in links. It defaults to logging them.
 	Mailer mail.Sender
+	// InlineSignin sends sign-in links within the request, not through
+	// RunSignins (tests).
+	InlineSignin bool
 	// DailyTests and AnonDailyTests are the test addresses (and uploads) per
 	// UTC day for an account and for an anonymous IP.
 	DailyTests     int
@@ -83,11 +87,17 @@ type Config struct {
 	// AnonDailyTotal caps test addresses and uploads by all anonymous
 	// visitors together in a UTC day. It defaults to DefaultAnonDailyTotal.
 	AnonDailyTotal int
-	// DailyBytes is what one account, or anonymous uploads together, may
-	// store by upload in a UTC day, and MaxStorageBytes the database size at
-	// which uploads are refused. Both have defaults.
+	// DailyBytes is what one account, or anonymous senders together, may
+	// store in a UTC day, a count uploads share with received mail.
+	// AccountBytes is what one of them may have kept at once, and
+	// MaxStorageBytes the database size at which uploads are refused. All have
+	// defaults.
 	DailyBytes      int
+	AccountBytes    int64
 	MaxStorageBytes int64
+	// Memory bounds messages in memory, shared with the receiver. It defaults
+	// to a budget for the uploads alone.
+	Memory *budget.Budget
 	// TrustedProxies are the addresses X-Forwarded-For is believed from, with
 	// TrustProxy on. It defaults to loopback and private networks.
 	TrustedProxies []netip.Prefix
@@ -106,14 +116,15 @@ const (
 	maxUploads      = 4
 	// uploadsPerIP is how many of those one network may hold.
 	uploadsPerIP = 1
+	// signinQueue is how many sign-in requests may wait to be handled, more
+	// than the limit on one network sends in an hour.
+	signinQueue = 256
+	// signinSendTimeout bounds handling one, including the email.
+	signinSendTimeout = 30 * time.Second
 )
 
-// Defaults for the volume limits in Config.
-const (
-	DefaultAnonDailyTotal  = 100
-	DefaultDailyBytes      = 1 << 30
-	DefaultMaxStorageBytes = 10 << 30
-)
+// DefaultAnonDailyTotal is the default for Config.AnonDailyTotal.
+const DefaultAnonDailyTotal = 100
 
 // MaxUploadBytes is the largest upload checked, the same as the largest
 // message the receiver accepts.
@@ -127,6 +138,9 @@ type App struct {
 	store *db.Store
 	log   *slog.Logger
 	tmpl  map[string]*template.Template
+
+	// signins queues sign-in links for RunSignins.
+	signins chan signinRequest
 
 	// quit is closed by StopWaits, so long polls answer before shutdown.
 	quit     chan struct{}
@@ -173,16 +187,23 @@ func New(cfg Config, store *db.Store, log *slog.Logger) (*App, error) {
 		cfg.AnonDailyTotal = DefaultAnonDailyTotal
 	}
 	if cfg.DailyBytes == 0 {
-		cfg.DailyBytes = DefaultDailyBytes
+		cfg.DailyBytes = db.DefaultDailyBytes
 	}
 	if cfg.MaxStorageBytes == 0 {
-		cfg.MaxStorageBytes = DefaultMaxStorageBytes
+		cfg.MaxStorageBytes = db.DefaultMaxStorageBytes
+	}
+	if cfg.AccountBytes == 0 {
+		cfg.AccountBytes = db.DefaultAccountBytes
+	}
+	if cfg.Memory == nil {
+		cfg.Memory = budget.New(maxUploads * MaxUploadBytes * budget.PerByte)
 	}
 	if cfg.TrustedProxies == nil {
 		cfg.TrustedProxies = DefaultTrustedProxies()
 	}
 	a := &App{cfg: cfg, store: store, log: log, tmpl: map[string]*template.Template{}, quit: make(chan struct{}),
-		waits: map[string]int{}, uploads: make(chan struct{}, maxUploads), uploadIPs: map[string]int{}}
+		signins: make(chan signinRequest, signinQueue),
+		waits:   map[string]int{}, uploads: make(chan struct{}, maxUploads), uploadIPs: map[string]int{}}
 	funcs := template.FuncMap{
 		"lower":  strings.ToLower,
 		"status": func(s verdict.Status) string { return string(s) },
@@ -520,10 +541,24 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, http.StatusRequestEntityTooLarge, tooLargeMessage)
 		return
 	}
+	cost := int64(len(raw)) * budget.PerByte
+	if !a.cfg.Memory.Take(cost) {
+		a.fail(w, r, http.StatusServiceUnavailable, "SendScore is checking several messages right now. Try again in a minute.")
+		return
+	}
+	defer a.cfg.Memory.Release(cost)
 	u := userFrom(r.Context())
-	owner := "bytes:anon"
+	owner, ownerID := "bytes:anon", ""
 	if u != nil {
-		owner = "bytes:user:" + u.ID
+		owner, ownerID = "bytes:user:"+u.ID, u.ID
+	}
+	if stored, err := a.store.StoredBytes(r.Context(), ownerID); err != nil {
+		a.log.Error("stored bytes", "err", err)
+		a.fail(w, r, http.StatusInternalServerError, "Could not count this upload. Try again in a minute.")
+		return
+	} else if stored+int64(len(raw)) > a.cfg.AccountBytes {
+		a.fail(w, r, http.StatusTooManyRequests, "The storage for your messages is full. Older ones are removed as they expire.")
+		return
 	}
 	if _, err := a.store.TakeAll(r.Context(), []db.Cap{{Name: owner, Bucket: db.Day(a.store.Now()), Limit: a.cfg.DailyBytes, N: len(raw), Keep: 48 * time.Hour}}); err != nil {
 		if errors.Is(err, db.ErrLimit) {
@@ -562,6 +597,8 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 	if u != nil {
 		// A signed-in upload is the account's, so the API and MCP can read it.
 		m.UserID = u.ID
+	} else if c, _ := r.Context().Value(csrfKey).(string); c != "" {
+		m.Creator = db.HashToken(c)
 	}
 	if err := a.store.SaveMessage(r.Context(), m); err != nil {
 		a.log.Error("save upload", "err", err)
@@ -641,7 +678,8 @@ func (a *App) ownsAddress(r *http.Request, addr db.Address) bool {
 // ownsMessage reports whether the visitor may read a message's original. Its
 // headers name the address it was sent to, whose token opens every later
 // report and lets anyone send to it, so a shared report link must not lead
-// there. An anonymous upload has no address and no owner, so it stays open.
+// there. An anonymous upload belongs to the browser that made it, since a
+// saved email holds what the person sent it to and more.
 func (a *App) ownsMessage(r *http.Request, m *db.Message) bool {
 	ctx := r.Context()
 	if m.Token != "" {
@@ -652,7 +690,8 @@ func (a *App) ownsMessage(r *http.Request, m *db.Message) bool {
 		u := userFrom(ctx)
 		return u != nil && u.ID == m.UserID
 	}
-	return m.PublicationID == ""
+	c, _ := ctx.Value(csrfKey).(string)
+	return m.Creator != "" && c != "" && db.HashToken(c) == m.Creator
 }
 
 func (a *App) rawMessage(w http.ResponseWriter, r *http.Request) {
@@ -781,12 +820,14 @@ func (a *App) wait(ctx context.Context, userID string, addr db.Address, after st
 		return nil, err
 	}
 	defer release()
+	parent := ctx
 	ctx, cancel := context.WithTimeout(ctx, min(timeout, a.cfg.MaxWait))
 	defer cancel()
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
-		m, err := a.store.LatestForToken(ctx, addr.Token, after)
+		// On the request's context, so a timeout of zero still looks once.
+		m, err := a.store.LatestForToken(parent, addr.Token, after)
 		if err == nil || errors.Is(err, db.ErrUnknownAfter) {
 			return m, err
 		}

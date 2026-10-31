@@ -12,7 +12,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +22,7 @@ import (
 	"mime"
 	"net"
 	"net/mail"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,9 +30,11 @@ import (
 
 	"github.com/emersion/go-smtp"
 
+	"github.com/sendscore/sendscore-app/internal/budget"
 	"github.com/sendscore/sendscore-app/internal/db"
 	"github.com/sendscore/sendscore-app/internal/monitor"
 	"github.com/sendscore/sendscore/engine"
+	"github.com/sendscore/sendscore/verdict"
 )
 
 // MaxMessageBytes is the largest message accepted.
@@ -56,34 +61,42 @@ const (
 	dedupeWindow = 7 * 24 * time.Hour
 )
 
-// readTimeout bounds each read from a sender, and maxSessionTime one whole
-// connection, however busy, so a slot cannot be held forever with NOOPs
-// (variables for tests).
+// readTimeout bounds each read from a sender, maxSessionTime one whole
+// connection, however busy, and preRcptTime a connection that has named no
+// address yet, so a slot cannot be held with NOOPs by someone with no mail for
+// anyone here (variables for tests).
 var (
 	readTimeout    = 60 * time.Second
 	maxSessionTime = 20 * time.Minute
+	preRcptTime    = 2 * time.Minute
+)
+
+// netMultiple is how many connections a whole network gets, an IPv4 /24 or an
+// IPv6 /48, as a multiple of MaxSessionsPerIP. Mail systems send from several
+// addresses in a network, but one holder can have them all.
+const netMultiple = 4
+
+// Longest sender and HELO accepted, from RFC 5321's limits on a path and a
+// domain. The line limit is far higher, for message bodies.
+const (
+	maxSenderBytes = 320
+	maxHeloBytes   = 255
 )
 
 // Defaults for the volume limits in Config.
 const (
 	DefaultMessagesPerAddress = 20
 	DefaultDailyMessages      = 1000
-	DefaultMaxSessions        = 50
+	DefaultMaxSessions        = 200
 	DefaultMaxSessionsPerIP   = 5
 	// A monitoring address takes this many messages a UTC day, far more
 	// than any newsletter sends.
 	DefaultPublicationDailyMessages = 50
-	// DefaultDailyBytes is what one account, or anonymous senders together,
-	// may have stored in a UTC day, across test and monitoring addresses.
-	DefaultDailyBytes = 1 << 30
 	// DefaultAnonDailyMessages is what all anonymous test addresses accept
 	// in a UTC day, together.
 	DefaultAnonDailyMessages = 200
-	// DefaultMaxStorageBytes is the size of the database at which new mail
-	// is turned away with a temporary refusal.
-	DefaultMaxStorageBytes = 10 << 30
-	// DefaultMaxBufferedBytes bounds messages held in memory across all
-	// sessions, and DefaultMaxAnalyzing the messages checked at once.
+	// DefaultMaxBufferedBytes bounds messages in memory across all sessions
+	// and uploads, and DefaultMaxAnalyzing the messages checked at once.
 	DefaultMaxBufferedBytes = 256 << 20
 	DefaultMaxAnalyzing     = 8
 )
@@ -117,14 +130,18 @@ type Config struct {
 	// takes per UTC day. Zero means the default.
 	PublicationDailyMessages int
 	// DailyBytes is how much one account, or anonymous senders together, may
-	// have stored in a UTC day. AnonDailyMessages is what all anonymous
-	// addresses accept in a UTC day. MaxStorageBytes is the database size at
-	// which mail is refused. MaxBufferedBytes bounds messages in memory, and
-	// MaxAnalyzing the messages checked at once. Zero means the default.
+	// have stored in a UTC day, and AccountBytes how much they may have kept
+	// at once. AnonDailyMessages is what all anonymous addresses accept in a
+	// UTC day. MaxStorageBytes is the database size at which mail is refused.
+	// MaxBufferedBytes bounds messages in memory unless Memory, which uploads
+	// share, is set, and MaxAnalyzing the messages checked at once. Zero
+	// means the default.
 	DailyBytes        int
+	AccountBytes      int64
 	AnonDailyMessages int
 	MaxStorageBytes   int64
 	MaxBufferedBytes  int64
+	Memory            *budget.Budget
 	MaxAnalyzing      int
 	// HistoryTTL is how long a publication's messages are kept.
 	// Other publication messages are kept for ReportTTL.
@@ -147,7 +164,6 @@ type Receiver struct {
 	connMu sync.Mutex
 	conns  map[string]int // open connections per IP, and "" for the total
 
-	buffered  atomic.Int64  // bytes of messages held in memory
 	analyzing chan struct{} // a slot per message being checked
 }
 
@@ -172,16 +188,22 @@ func New(cfg Config, store *db.Store, log *slog.Logger) *Receiver {
 		cfg.HistoryTTL = cfg.ReportTTL
 	}
 	if cfg.DailyBytes == 0 {
-		cfg.DailyBytes = DefaultDailyBytes
+		cfg.DailyBytes = db.DefaultDailyBytes
+	}
+	if cfg.AccountBytes == 0 {
+		cfg.AccountBytes = db.DefaultAccountBytes
 	}
 	if cfg.AnonDailyMessages == 0 {
 		cfg.AnonDailyMessages = DefaultAnonDailyMessages
 	}
 	if cfg.MaxStorageBytes == 0 {
-		cfg.MaxStorageBytes = DefaultMaxStorageBytes
+		cfg.MaxStorageBytes = db.DefaultMaxStorageBytes
 	}
 	if cfg.MaxBufferedBytes == 0 {
 		cfg.MaxBufferedBytes = DefaultMaxBufferedBytes
+	}
+	if cfg.Memory == nil {
+		cfg.Memory = budget.New(cfg.MaxBufferedBytes)
 	}
 	if cfg.MaxAnalyzing == 0 {
 		cfg.MaxAnalyzing = DefaultMaxAnalyzing
@@ -219,8 +241,9 @@ func (r *Receiver) Serve(l net.Listener) error {
 	return r.server.Serve(&limitListener{Listener: l, r: r})
 }
 
-// limitListener turns away a connection past MaxSessions in all or
-// MaxSessionsPerIP from one address, with a 421 so the sender retries.
+// limitListener turns away a connection past MaxSessions in all,
+// MaxSessionsPerIP from one address, or netMultiple times that from one
+// network, with a 421 so the sender retries.
 type limitListener struct {
 	net.Listener
 	r *Receiver
@@ -232,12 +255,15 @@ func (l *limitListener) Accept() (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		ip := ""
+		ip, network := "", ""
 		if addr, ok := c.RemoteAddr().(*net.TCPAddr); ok {
-			ip = connKey(addr.IP)
+			ip, network = connKey(addr.IP), netKey(addr.IP)
 		}
-		if l.r.takeConn(ip) {
-			return &countedConn{Conn: c, timeout: l.r.readTimeout, end: time.Now().Add(l.r.sessionTime), release: func() { l.r.releaseConn(ip) }}, nil
+		if l.r.takeConn(ip, network) {
+			now := time.Now()
+			cc := &countedConn{Conn: c, timeout: l.r.readTimeout, full: now.Add(l.r.sessionTime), release: func() { l.r.releaseConn(ip, network) }}
+			cc.end.Store(minTime(now.Add(preRcptTime), cc.full).UnixNano())
+			return cc, nil
 		}
 		go func() {
 			_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
@@ -256,23 +282,35 @@ func connKey(ip net.IP) string {
 	return ip.Mask(net.CIDRMask(64, 128)).String() + "/64"
 }
 
-func (r *Receiver) takeConn(ip string) bool {
+// netKey is the wider network sessions are also counted against.
+func netKey(ip net.IP) string {
+	if v4 := ip.To4(); v4 != nil {
+		return v4.Mask(net.CIDRMask(24, 32)).String() + "/24"
+	}
+	return ip.Mask(net.CIDRMask(48, 128)).String() + "/48"
+}
+
+func (r *Receiver) takeConn(ip, network string) bool {
 	r.connMu.Lock()
 	defer r.connMu.Unlock()
-	if r.conns[""] >= r.cfg.MaxSessions || r.conns[ip] >= r.cfg.MaxSessionsPerIP {
+	if r.conns[""] >= r.cfg.MaxSessions || r.conns[ip] >= r.cfg.MaxSessionsPerIP ||
+		r.conns[network] >= netMultiple*r.cfg.MaxSessionsPerIP {
 		return false
 	}
 	r.conns[""]++
 	r.conns[ip]++
+	r.conns[network]++
 	return true
 }
 
-func (r *Receiver) releaseConn(ip string) {
+func (r *Receiver) releaseConn(ip, network string) {
 	r.connMu.Lock()
 	defer r.connMu.Unlock()
 	r.conns[""]--
-	if r.conns[ip]--; r.conns[ip] <= 0 {
-		delete(r.conns, ip)
+	for _, k := range []string{ip, network} {
+		if r.conns[k]--; r.conns[k] <= 0 {
+			delete(r.conns, k)
+		}
 	}
 }
 
@@ -280,29 +318,34 @@ func (r *Receiver) releaseConn(ip string) {
 // is arriving (bodyUntil is set), each read gets a fresh read deadline,
 // because go-smtp sets one only for the DATA line and its body reader fills
 // a whole buffer in one call. No read deadline ever passes end, which is what
-// bounds a whole session.
+// bounds a whole session; end starts at preRcptTime, and accepted moves it to
+// full.
 type countedConn struct {
 	net.Conn
 	once      sync.Once
 	release   func()
 	timeout   time.Duration
-	end       time.Time
+	full      time.Time
+	end       atomic.Int64 // Unix nanoseconds
 	bodyUntil atomic.Int64 // Unix nanoseconds, or 0
 }
 
 func (c *countedConn) Read(p []byte) (int, error) {
 	if end := c.bodyUntil.Load(); end != 0 {
-		_ = c.Conn.SetReadDeadline(minTime(minTime(time.Now().Add(c.timeout), time.Unix(0, end)), c.end))
+		_ = c.Conn.SetReadDeadline(minTime(minTime(time.Now().Add(c.timeout), time.Unix(0, end)), c.endTime()))
 	}
 	return c.Conn.Read(p)
 }
 
+func (c *countedConn) endTime() time.Time { return time.Unix(0, c.end.Load()) }
+
 // SetReadDeadline keeps every deadline go-smtp sets within the session.
 func (c *countedConn) SetReadDeadline(t time.Time) error {
+	end := c.endTime()
 	if t.IsZero() {
-		t = c.end
+		t = end
 	}
-	return c.Conn.SetReadDeadline(minTime(t, c.end))
+	return c.Conn.SetReadDeadline(minTime(t, end))
 }
 
 // SetDeadline is SetReadDeadline with a write deadline.
@@ -357,6 +400,13 @@ type session struct {
 	sent int // messages delivered in this session
 }
 
+// accepted gives a session that named a real address the full session time.
+func (s *session) accepted() {
+	if cc := counted(s.conn.Conn()); cc != nil {
+		cc.end.Store(cc.full.UnixNano())
+	}
+}
+
 func (s *session) Reset() {
 	s.from, s.token, s.owner, s.rcpt, s.pub = "", "", "", "", nil
 }
@@ -371,6 +421,8 @@ var errSessionFull = &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{
 var errTemporary = &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0}, Message: "Temporary failure, try again"}
 
 var errBusy = &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 2}, Message: "Too many messages are being checked right now, try again later"}
+
+var errAccountFull = &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 2, 2}, Message: "This account has no storage left for messages, try again later"}
 
 var errStorageFull = &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 3, 1}, Message: "This server is out of storage for messages, try again later"}
 
@@ -392,6 +444,10 @@ func (r *Receiver) storageFull(ctx context.Context) bool {
 func (s *session) Mail(from string, _ *smtp.MailOptions) error {
 	if s.sent >= messagesPerSession {
 		return errSessionFull
+	}
+	if len(from) > maxSenderBytes || len(s.conn.Hostname()) > maxHeloBytes {
+		s.from = ""
+		return errBadSender
 	}
 	// The sender is written into Return-Path, so refuse anything that could
 	// break that header. go-smtp lets a bare CR through, and unquotes a
@@ -454,6 +510,7 @@ func (s *session) Rcpt(to string, _ *smtp.RcptOptions) error {
 		// RFC 5321 has the client send the rest in another transaction.
 		return errOneRecipient
 	}
+	s.accepted()
 	return nil
 }
 
@@ -491,12 +548,14 @@ func (s *session) rcptPublication(to, token string) error {
 		return l.err
 	}
 	s.pub, s.owner, s.rcpt = &p, p.UserID, to
+	s.accepted()
 	return nil
 }
 
 // publicationLimit is the daily count a monitoring address's messages are
 // taken against. It does not count against the account's test messages, so
-// a burst of tests cannot cost an issue; the account's bytes cover both.
+// a burst of tests cannot cost an issue by count, though the account's bytes
+// cover both.
 func (r *Receiver) publicationLimit(pubID string) limit {
 	return limit{name: "messages:pub:" + pubID, bucket: db.Day(r.store.Now()), limit: r.cfg.PublicationDailyMessages, keep: 48 * time.Hour,
 		err: &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 2, 2},
@@ -541,27 +600,33 @@ func (r *Receiver) limits(token, owner string) []limit {
 			Message: "Test addresses have taken all they may for today, try again after midnight UTC"}})
 }
 
-// readBody reads a message into memory, charging it against
-// MaxBufferedBytes as it arrives, at twice its size since stamping copies it.
-// The charge stands until release is called.
-func (r *Receiver) readBody(rd io.Reader) ([]byte, func(), error) {
+// readBody reads a message into memory, charging the memory budget as it
+// arrives. The charge stands until release is called, and more can be added
+// to it through charge.
+func (r *Receiver) readBody(rd io.Reader) (raw []byte, charge func(int64) bool, release func(), err error) {
 	var buf bytes.Buffer
 	var charged int64
-	release := func() { r.buffered.Add(-charged) }
+	charge = func(n int64) bool {
+		if !r.cfg.Memory.Take(n) {
+			return false
+		}
+		charged += n
+		return true
+	}
+	release = sync.OnceFunc(func() { r.cfg.Memory.Release(charged) })
 	src := io.LimitReader(rd, MaxMessageBytes+1)
 	chunk := make([]byte, 64<<10)
 	for {
 		n, err := src.Read(chunk)
 		buf.Write(chunk[:n])
-		charged += 2 * int64(n)
-		if r.buffered.Add(2*int64(n)) > r.cfg.MaxBufferedBytes {
-			return nil, release, errBusy
+		if !charge(budget.ReadPerByte * int64(n)) {
+			return nil, charge, release, errBusy
 		}
 		if errors.Is(err, io.EOF) {
-			return buf.Bytes(), release, nil
+			return buf.Bytes(), charge, release, nil
 		}
 		if err != nil {
-			return nil, release, err
+			return nil, charge, release, err
 		}
 	}
 }
@@ -604,7 +669,7 @@ func (s *session) Data(rd io.Reader) error {
 	if cc != nil {
 		cc.bodyUntil.Store(time.Now().Add(maxBodyTime).UnixNano())
 	}
-	raw, release, err := s.r.readBody(rd)
+	raw, charge, release, err := s.r.readBody(rd)
 	defer release()
 	if cc != nil {
 		cc.bodyUntil.Store(0)
@@ -636,6 +701,12 @@ func (s *session) Data(rd io.Reader) error {
 	if s.r.storageFull(ctx) {
 		return errStorageFull
 	}
+	if stored, err := s.r.store.StoredBytes(ctx, s.owner); err != nil {
+		s.r.log.Error("stored bytes", "err", err)
+		return errTemporary
+	} else if stored+int64(len(raw)) > s.r.cfg.AccountBytes {
+		return errAccountFull
+	}
 	// A turn to be checked, held from here to the save, so a slow alert send
 	// after it holds no slot.
 	wait := time.NewTimer(analyzeWait)
@@ -646,6 +717,9 @@ func (s *session) Data(rd io.Reader) error {
 		defer endTurn()
 		turn = endTurn
 	case <-wait.C:
+		return errBusy
+	}
+	if !charge((budget.PerByte - budget.ReadPerByte) * int64(len(raw))) {
 		return errBusy
 	}
 	// The allowances count a message that arrived, all of them or none, so a
@@ -701,11 +775,22 @@ func (s *session) Data(rd io.Reader) error {
 	if s.pub != nil {
 		v.Publication = s.pub.ID
 	}
+	token := s.token
+	if s.pub != nil {
+		token = s.pub.Token
+	}
+	if err := redactRecipient(v, token, s.rcpt); err != nil {
+		s.r.log.Error("redact report", "err", err)
+		return errTemporary
+	}
 	if err := s.r.store.SaveMessage(sctx, m); err != nil {
 		s.r.log.Error("save message", "err", err)
 		return errTemporary
 	}
 	turn()
+	m.Raw = nil
+	stamped = nil
+	release()
 	s.r.log.Info("received", "report", m.ID, "from", s.from, "ip", m.RemoteIP, "verdict", v.Verdict, "publication", m.PublicationID)
 	if s.pub != nil && s.r.cfg.Monitor != nil {
 		// Its own deadline, covering an alert's send.
@@ -720,6 +805,34 @@ func (s *session) Data(rd io.Reader) error {
 	}
 	return nil
 }
+
+// redactRecipient removes the address a message was sent to from its verdict.
+// A report link is shared, and the address's token opens later reports and
+// takes mail, but a sender often personalizes unsubscribe links with it, and
+// those are shown as evidence. The token goes whatever surrounds it, and the
+// whole address in the base64 forms senders use.
+func redactRecipient(v *verdict.Verdict, token, rcpt string) error {
+	if token == "" {
+		return nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		b = bytes.ReplaceAll(b, []byte(enc.EncodeToString([]byte(rcpt))), []byte(redacted))
+	}
+	b = regexp.MustCompile("(?i)"+regexp.QuoteMeta(token)).ReplaceAll(b, []byte(redacted))
+	out := &verdict.Verdict{}
+	if err := json.Unmarshal(b, out); err != nil {
+		return err
+	}
+	*v = *out
+	return nil
+}
+
+// redacted stands in for a recipient's token in a stored verdict.
+const redacted = "redacted"
 
 // preparePublication fills in a publication's message before its checks:
 // the owner, how long it is kept, whether it is an issue or a signup

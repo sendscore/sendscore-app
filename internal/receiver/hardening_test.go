@@ -3,6 +3,8 @@ package receiver
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -293,5 +295,166 @@ func TestLongLineInAMessageIsAccepted(t *testing.T) {
 	msgs, err := store.PublicationMessages(context.Background(), p.ID, 10)
 	if err != nil || len(msgs) != 1 {
 		t.Fatalf("stored %d messages, err %v", len(msgs), err)
+	}
+}
+
+func TestWideNetworksShareALimit(t *testing.T) {
+	if a, b := netKey(net.ParseIP("2001:db8:1:2::1")), netKey(net.ParseIP("2001:db8:1:ffff::1")); a != b {
+		t.Errorf("one /48 has keys %q and %q", a, b)
+	}
+	if a, b := netKey(net.ParseIP("192.0.2.1")), netKey(net.ParseIP("192.0.2.200")); a != b {
+		t.Errorf("one /24 has keys %q and %q", a, b)
+	}
+	r := New(Config{MaxSessions: 100, MaxSessionsPerIP: 2}, nil, nil)
+	taken := 0
+	for i := range 20 {
+		ip := net.ParseIP(fmt.Sprintf("2001:db8:1:%x::1", i))
+		if r.takeConn(connKey(ip), netKey(ip)) {
+			taken++
+		}
+	}
+	if taken != netMultiple*2 {
+		t.Errorf("one /48 held %d sessions, want %d", taken, netMultiple*2)
+	}
+}
+
+func TestAnIdleSessionWithNoAddressIsCutShort(t *testing.T) {
+	old := preRcptTime
+	preRcptTime = 200 * time.Millisecond
+	defer func() { preRcptTime = old }()
+	_, addr := start(t)
+	c, err := smtp.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := c.Noop(); err != nil {
+			return // the server hung up
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Error("a session that named no address outlived preRcptTime")
+}
+
+func TestARealAddressGetsTheWholeSession(t *testing.T) {
+	old := preRcptTime
+	preRcptTime = 200 * time.Millisecond
+	defer func() { preRcptTime = old }()
+	store, addr := start(t)
+	a, err := store.CreateAddress(context.Background(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := smtp.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.Mail("b@real.test", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Rcpt("t-"+a.Token+"@in.test", nil); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if err := c.Noop(); err != nil {
+		t.Errorf("cut off after naming a real address: %v", err)
+	}
+}
+
+func TestLongSenderAndHeloAreRefused(t *testing.T) {
+	store, addr := start(t)
+	a, err := store.CreateAddress(context.Background(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	long := strings.Repeat("a", 400) + "@real.test"
+	if err := deliver(addr, long, "t-"+a.Token+"@in.test", sample(t)); smtpCode(err) != 501 {
+		t.Errorf("long sender: %v", err)
+	}
+	c, err := smtp.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if err := c.Hello(strings.Repeat("h", 300) + ".test"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Mail("b@real.test", nil); smtpCode(err) != 501 {
+		t.Errorf("long HELO: %v", err)
+	}
+}
+
+func TestOneAccountCannotFillTheServer(t *testing.T) {
+	store, addr := start(t, func(c *Config) { c.AccountBytes = 8 << 10 })
+	ctx := context.Background()
+	u := owner(t, store, "full@example.com")
+	p := publication(t, store, u, false)
+	to := "m-" + p.Token + "@in.test"
+	if err := deliver(addr, "bounce@real.test", to, numbered(t, 1)); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.StoredBytes(ctx, u.ID)
+	if err != nil || stored == 0 {
+		t.Fatalf("StoredBytes = %d %v", stored, err)
+	}
+	over := append(numbered(t, 2), bytes.Repeat([]byte("x\r\n"), 4<<10)...)
+	if err := deliver(addr, "bounce@real.test", to, over); smtpCode(err) != 452 {
+		t.Errorf("over the account's storage: %v", err)
+	}
+	// Nobody else is touched.
+	a, err := store.CreateAddress(ctx, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deliver(addr, "b@real.test", "t-"+a.Token+"@in.test", sample(t)); err != nil {
+		t.Errorf("another sender was refused: %v", err)
+	}
+}
+
+func TestStoredReportHidesTheRecipient(t *testing.T) {
+	store, addr := start(t)
+	a, err := store.CreateAddress(context.Background(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	to := "t-" + a.Token + "@in.test"
+	raw := []byte("From: a@b.test\r\nTo: " + to + "\r\nSubject: s\r\nList-Unsubscribe: <https://e.example/u?email=" + to + ">, <https://e.example/v?e=" +
+		base64.URLEncoding.EncodeToString([]byte(to)) + ">, <https://e.example/w?t=" + strings.ToUpper(a.Token) + ">\r\n\r\nhi\r\n")
+	if err := deliver(addr, "b@real.test", to, raw); err != nil {
+		t.Fatal(err)
+	}
+	m, err := store.LatestForToken(context.Background(), a.Token, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal(m.Verdict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "e.example") {
+		t.Fatalf("the unsubscribe evidence is not in the verdict, so this proves nothing: %s", b)
+	}
+	lower := strings.ToLower(string(b))
+	if strings.Contains(lower, a.Token) || strings.Contains(string(b), base64.URLEncoding.EncodeToString([]byte(to))) {
+		t.Errorf("the verdict holds the recipient: %s", b)
+	}
+}
+
+func TestAMessageIsChargedForItsChecks(t *testing.T) {
+	// Room to read the message, but not to check it.
+	raw := sample(t)
+	store, addr := start(t, func(c *Config) { c.MaxBufferedBytes = int64(len(raw)) * 5 })
+	a, err := store.CreateAddress(context.Background(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deliver(addr, "b@real.test", "t-"+a.Token+"@in.test", raw); smtpCode(err) != 451 {
+		t.Errorf("no memory for the checks: %v", err)
+	}
+	if n, err := store.Count(context.Background(), "messages:addr:"+a.Token, "all"); err != nil || n != 0 {
+		t.Errorf("a refused message counted: %d %v", n, err)
 	}
 }

@@ -67,6 +67,9 @@ func TestCheckConfig(t *testing.T) {
 		{"https://", "in.example.com", false, false},
 		{"https://s.example.com", "localhost", true, false},
 		{"http://127.0.0.1:3014", "in.example.com", true, false},
+		// A public http base URL gets the same check on its mail domain.
+		{"http://s.example.com", "localhost", false, false},
+		{"http://s.example.com", "in.example.com", false, true},
 	} {
 		if err := checkConfig(c.base, c.domain, c.secure); (err == nil) != c.ok {
 			t.Errorf("checkConfig(%q, %q, %v) = %v", c.base, c.domain, c.secure, err)

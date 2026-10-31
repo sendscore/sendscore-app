@@ -64,7 +64,7 @@ func newApp(t *testing.T, opts ...func(*Config)) (*App, *db.Store, http.Handler)
 	}
 	t.Cleanup(func() { store.Close() })
 	cfg := Config{BaseURL: "http://test", MailDomain: "in.test", AddressTTL: time.Hour, ReportTTL: time.Hour,
-		MaxWait: 2 * time.Second, Resolver: engine.OfflineResolver{}, Mailer: &sentMail{},
+		MaxWait: 2 * time.Second, Resolver: engine.OfflineResolver{}, Mailer: &sentMail{}, InlineSignin: true,
 		DailyTests: 25, AnonDailyTests: 5}
 	for _, o := range opts {
 		o(&cfg)

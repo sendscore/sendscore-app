@@ -47,6 +47,20 @@ type Store struct {
 	recipientKey []byte
 }
 
+// Defaults for what is stored, which the receiver and uploads share.
+const (
+	// DefaultDailyBytes is what one account, or anonymous senders together,
+	// may store in a UTC day.
+	DefaultDailyBytes = 1 << 30
+	// DefaultAccountBytes is the originals one account, or anonymous senders
+	// together, may have kept at once, so they cannot fill the server for
+	// everyone else.
+	DefaultAccountBytes = 2 << 30
+	// DefaultMaxStorageBytes is the size of the database at which new mail
+	// is turned away with a temporary refusal.
+	DefaultMaxStorageBytes = 10 << 30
+)
+
 // journalLimit is the size SQLite cuts the WAL back to after a checkpoint, so
 // a burst of large messages does not leave it at its high-water mark.
 const journalLimit = 64 << 20
@@ -167,6 +181,9 @@ func migrate(d *sql.DB) error {
 		`ALTER TABLE publications ADD COLUMN alert_confirm_expires INTEGER NOT NULL DEFAULT 0`,
 		// When a failed alert may be tried again (Unix seconds).
 		`ALTER TABLE alerts ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0`,
+		// The hash of the CSRF cookie of the browser that uploaded a message
+		// anonymously, so its original shows only to that browser.
+		`ALTER TABLE messages ADD COLUMN creator TEXT NOT NULL DEFAULT ''`,
 		// Bytes of the original, 0 once it is dropped.
 		`ALTER TABLE messages ADD COLUMN size INTEGER NOT NULL DEFAULT 0`,
 		// When a recipient's opt-out link was last put in an alert.
@@ -303,7 +320,10 @@ type Message struct {
 	SlotAt        time.Time
 	Late          bool
 	// Dedupe is the hash of a monitoring address's message as it arrived.
-	Dedupe     string
+	Dedupe string
+	// Creator is the hash of the CSRF cookie of the browser that uploaded a
+	// message anonymously, or empty.
+	Creator    string
 	Source     string
 	ReceivedAt time.Time
 	ExpiresAt  time.Time
@@ -349,9 +369,9 @@ func (s *Store) SaveMessage(ctx context.Context, m *Message) error {
 	}
 	defer tx.Rollback() //nolint:errcheck // a no-op after commit
 	if _, err = tx.ExecContext(ctx, `INSERT INTO messages
-		(id, token, user_id, publication_id, kind, slot_at, late, dedupe, source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, raw, size, verdict)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, x'', ?, ?)`,
-		m.ID, tok, uid, pub, m.Kind, slot, m.Late, m.Dedupe, m.Source, m.ReceivedAt.Unix(), m.ExpiresAt.Unix(), m.RemoteIP, m.Helo, m.MailFrom, m.RcptTo, tls, len(m.Raw), string(vj)); err != nil {
+		(id, token, user_id, publication_id, kind, slot_at, late, dedupe, creator, source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, raw, size, verdict)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, x'', ?, ?)`,
+		m.ID, tok, uid, pub, m.Kind, slot, m.Late, m.Dedupe, m.Creator, m.Source, m.ReceivedAt.Unix(), m.ExpiresAt.Unix(), m.RemoteIP, m.Helo, m.MailFrom, m.RcptTo, tls, len(m.Raw), string(vj)); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO message_raw (id, raw) VALUES (?, ?)`, m.ID, m.Raw); err != nil {
@@ -360,14 +380,14 @@ func (s *Store) SaveMessage(ctx context.Context, m *Message) error {
 	return tx.Commit()
 }
 
-const messageCols = `id, COALESCE(token, ''), COALESCE(user_id, ''), COALESCE(publication_id, ''), kind, slot_at, late, source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, verdict`
+const messageCols = `id, COALESCE(token, ''), COALESCE(user_id, ''), COALESCE(publication_id, ''), kind, slot_at, late, creator, source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, verdict`
 
 func scanMessage(row interface{ Scan(...any) error }) (*Message, error) {
 	m := &Message{}
 	var received, expires, slot int64
 	var tls sql.NullBool
 	var vj string
-	if err := row.Scan(&m.ID, &m.Token, &m.UserID, &m.PublicationID, &m.Kind, &slot, &m.Late, &m.Source, &received, &expires, &m.RemoteIP, &m.Helo, &m.MailFrom, &m.RcptTo, &tls, &vj); err != nil {
+	if err := row.Scan(&m.ID, &m.Token, &m.UserID, &m.PublicationID, &m.Kind, &slot, &m.Late, &m.Creator, &m.Source, &received, &expires, &m.RemoteIP, &m.Helo, &m.MailFrom, &m.RcptTo, &tls, &vj); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
