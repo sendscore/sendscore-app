@@ -290,7 +290,7 @@ func (m *Monitor) caps(p db.Publication) []db.Cap {
 	return []db.Cap{
 		{Name: "alerts:pub:" + p.ID, Bucket: day, Limit: orDefault(m.PerDay, DefaultAlertsPerDay), Keep: 48 * time.Hour},
 		{Name: "alerts:user:" + p.UserID, Bucket: day, Limit: orDefault(m.PerAccount, DefaultAlertsPerAccount), Keep: 48 * time.Hour},
-		{Name: "alerts:to:" + db.RecipientKey(p.AlertEmail), Bucket: day, Limit: orDefault(m.PerRecipient, DefaultAlertsPerRecipient), Keep: 48 * time.Hour},
+		{Name: "alerts:to:" + m.Store.RecipientKey(p.AlertEmail), Bucket: day, Limit: orDefault(m.PerRecipient, DefaultAlertsPerRecipient), Keep: 48 * time.Hour},
 		{Name: "alerts:all", Bucket: hour, Limit: orDefault(m.PerHour, DefaultAlertsPerHour), Keep: 2 * time.Hour},
 	}
 }

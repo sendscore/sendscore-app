@@ -107,8 +107,9 @@ func TestDeleteUserRemovesEveryRow(t *testing.T) {
 	u := fillAccount(t, s, "gone@example.com")
 	filled := tableCounts(t, s)
 	for table, n := range before {
-		// Opt-outs hold no address and belong to no account.
-		if table == "alert_recipients" {
+		// Opt-outs hold no address and belong to no account, and settings
+		// belong to the database.
+		if table == "alert_recipients" || table == "settings" {
 			continue
 		}
 		if filled[table] <= n {

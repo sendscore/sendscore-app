@@ -4,10 +4,13 @@ package db
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	_ "embed"
 	"encoding/base32"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,6 +40,11 @@ type Store struct {
 	// RawKeep is how long Sweep keeps the original of a message; the verdict
 	// stays until the message expires. Zero keeps it as long as the message.
 	RawKeep time.Duration
+	// AlertKeep is how long Sweep keeps alerts, and the record of a recipient
+	// that did not opt out. Zero means DefaultAlertKeep.
+	AlertKeep time.Duration
+	// recipientKey keys the hash of alert recipients.
+	recipientKey []byte
 }
 
 // journalLimit is the size SQLite cuts the WAL back to after a checkpoint, so
@@ -44,17 +52,18 @@ type Store struct {
 const journalLimit = 64 << 20
 
 // Open opens (creating if needed) the SQLite database at path, with WAL, a
-// busy timeout, foreign keys, immediate transactions, and synchronous=NORMAL,
-// which is safe with WAL and spares an fsync on every commit. The file holds
-// raw mail, so it is readable by its owner only, and SQLite gives the -wal
-// and -shm files the same mode.
+// busy timeout, foreign keys, immediate transactions, synchronous=NORMAL,
+// which is safe with WAL and spares an fsync on every commit, and
+// secure_delete, so deleted mail is overwritten and not just unlinked. The
+// file holds raw mail, so it is readable by its owner only, and SQLite gives
+// the -wal and -shm files the same mode.
 func Open(path string) (*Store, error) {
 	if err := private(path); err != nil {
 		return nil, fmt.Errorf("db permissions: %w", err)
 	}
 	dsn := fmt.Sprintf(
-		"file:%s?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(on)&_pragma=synchronous(NORMAL)&_pragma=journal_size_limit(%d)",
-		path, journalLimit,
+		"file:%s?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(on)&_pragma=synchronous(NORMAL)&_pragma=secure_delete(on)&_pragma=journal_size_limit(%d)",
+		uriPath.Replace(path), journalLimit,
 	)
 	d, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -71,7 +80,34 @@ func Open(path string) (*Store, error) {
 	if err := migrate(d); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
-	return &Store{DB: d, Now: time.Now}, nil
+	key, err := recipientKey(d)
+	if err != nil {
+		return nil, fmt.Errorf("recipient key: %w", err)
+	}
+	return &Store{DB: d, Now: time.Now, recipientKey: key}, nil
+}
+
+// uriPath escapes what would end the path in a SQLite URI filename, so the
+// file opened is the file private secured.
+var uriPath = strings.NewReplacer("%", "%25", "?", "%3f", "#", "%23")
+
+// recipientKey returns this database's key for hashing alert recipients,
+// making it the first time. With a key, a list of addresses cannot be hashed
+// ahead of time, or compared across instances.
+func recipientKey(d *sql.DB) ([]byte, error) {
+	if _, err := d.Exec(`INSERT OR IGNORE INTO settings (name, value) VALUES ('recipient_key', randomblob(32))`); err != nil {
+		return nil, err
+	}
+	var key []byte
+	err := d.QueryRow(`SELECT value FROM settings WHERE name = 'recipient_key'`).Scan(&key)
+	return key, err
+}
+
+// recipientHash is the keyed hash an alert recipient is stored under.
+func (s *Store) recipientHash(email string) string {
+	h := hmac.New(sha256.New, s.recipientKey)
+	h.Write([]byte(NormalizeEmail(email)))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // private creates the database file if needed, and makes it and any -wal and
@@ -92,8 +128,10 @@ func private(path string) error {
 	return nil
 }
 
-// migrate adds the columns that came after a table was first created. Each
-// change is additive, and a column that is already there is left alone.
+// migrate adds the columns that came after a table was first created, and a
+// column that is already there is left alone. It then removes what billing
+// left in an older database, and moves any original still in messages to
+// message_raw, where Sweep drops it.
 func migrate(d *sql.DB) error {
 	alters := []string{
 		// The account an address was made for; NULL for anonymous addresses.
@@ -129,6 +167,10 @@ func migrate(d *sql.DB) error {
 		`ALTER TABLE publications ADD COLUMN alert_confirm_expires INTEGER NOT NULL DEFAULT 0`,
 		// When a failed alert may be tried again (Unix seconds).
 		`ALTER TABLE alerts ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0`,
+		// Bytes of the original, 0 once it is dropped.
+		`ALTER TABLE messages ADD COLUMN size INTEGER NOT NULL DEFAULT 0`,
+		// When a recipient's opt-out link was last put in an alert.
+		`ALTER TABLE alert_recipients ADD COLUMN last_used INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, a := range alters {
 		if _, err := d.Exec(a); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -150,6 +192,19 @@ func migrate(d *sql.DB) error {
 		if _, err := d.Exec(idx); err != nil {
 			return err
 		}
+	}
+	for _, q := range []string{
+		`DROP TABLE IF EXISTS creem_events`,
+		`DROP TABLE IF EXISTS subscriptions`,
+		`INSERT OR IGNORE INTO message_raw (id, raw) SELECT id, raw FROM messages WHERE length(raw) > 0`,
+		`UPDATE messages SET size = length(raw), raw = x'' WHERE length(raw) > 0`,
+	} {
+		if _, err := d.Exec(q); err != nil {
+			return err
+		}
+	}
+	if _, err := d.Exec(`ALTER TABLE users DROP COLUMN plan`); err != nil && !strings.Contains(err.Error(), "no such column") {
+		return err
 	}
 	return nil
 }
@@ -294,9 +349,9 @@ func (s *Store) SaveMessage(ctx context.Context, m *Message) error {
 	}
 	defer tx.Rollback() //nolint:errcheck // a no-op after commit
 	if _, err = tx.ExecContext(ctx, `INSERT INTO messages
-		(id, token, user_id, publication_id, kind, slot_at, late, dedupe, source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, raw, verdict)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, x'', ?)`,
-		m.ID, tok, uid, pub, m.Kind, slot, m.Late, m.Dedupe, m.Source, m.ReceivedAt.Unix(), m.ExpiresAt.Unix(), m.RemoteIP, m.Helo, m.MailFrom, m.RcptTo, tls, string(vj)); err != nil {
+		(id, token, user_id, publication_id, kind, slot_at, late, dedupe, source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, raw, size, verdict)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, x'', ?, ?)`,
+		m.ID, tok, uid, pub, m.Kind, slot, m.Late, m.Dedupe, m.Source, m.ReceivedAt.Unix(), m.ExpiresAt.Unix(), m.RemoteIP, m.Helo, m.MailFrom, m.RcptTo, tls, len(m.Raw), string(vj)); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO message_raw (id, raw) VALUES (?, ?)`, m.ID, m.Raw); err != nil {
@@ -354,16 +409,28 @@ func (s *Store) MessageForUser(ctx context.Context, id, userID string) (*Message
 // RawByID returns the raw message of a report that has not expired.
 func (s *Store) RawByID(ctx context.Context, id string) ([]byte, error) {
 	var raw []byte
-	err := s.DB.QueryRowContext(ctx, `SELECT COALESCE((SELECT raw FROM message_raw WHERE id = m.id), m.raw)
-		FROM messages m WHERE m.id = ? AND m.expires_at > ?`, id, s.Now().Unix()).Scan(&raw)
+	// No row once dropped after SENDSCORE_RAW_DAYS; the report itself stays.
+	err := s.DB.QueryRowContext(ctx, `SELECT r.raw FROM message_raw r JOIN messages m ON m.id = r.id
+		WHERE r.id = ? AND m.expires_at > ?`, id, s.Now().Unix()).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
-	if err == nil && len(raw) == 0 {
-		// Dropped after SENDSCORE_RAW_DAYS; the report itself stays.
-		return nil, ErrNotFound
-	}
 	return raw, err
+}
+
+// StoredBytes is the size of the originals kept for an account, or with
+// userID empty, for anonymous test addresses and uploads together.
+func (s *Store) StoredBytes(ctx context.Context, userID string) (int64, error) {
+	var n int64
+	q := `SELECT COALESCE(SUM(size), 0) FROM messages WHERE user_id = ?1 OR token IN (SELECT token FROM addresses WHERE user_id = ?1)`
+	if userID == "" {
+		q = `SELECT COALESCE(SUM(size), 0) FROM messages WHERE user_id IS NULL AND publication_id IS NULL
+			AND (token IS NULL OR token IN (SELECT token FROM addresses WHERE user_id IS NULL))`
+		err := s.DB.QueryRowContext(ctx, q).Scan(&n)
+		return n, err
+	}
+	err := s.DB.QueryRowContext(ctx, q, userID).Scan(&n)
+	return n, err
 }
 
 // MessageByDedupe returns a publication's message with this hash received
@@ -431,8 +498,9 @@ const AddressGrace = time.Hour
 // Sweep deletes expired messages, addresses that expired more than
 // AddressGrace ago and have no messages left, originals older than RawKeep,
 // and expired sign-in links, sessions, usage counters, OAuth codes and
-// tokens, known browsers, and alerts older than AlertKeep. A step that fails
-// does not stop the ones after it; the errors come back together.
+// tokens, known browsers, alerts older than AlertKeep, and recipients unused
+// for as long who did not opt out. A step that fails does not stop the ones
+// after it; the errors come back together.
 func (s *Store) Sweep(ctx context.Context) (int64, error) {
 	now := s.Now()
 	var errs []error
@@ -451,12 +519,17 @@ func (s *Store) Sweep(ctx context.Context) (int64, error) {
 	if s.RawKeep > 0 {
 		cutoff := now.Add(-s.RawKeep).Unix()
 		exec(`DELETE FROM message_raw WHERE id IN (SELECT id FROM messages WHERE received_at <= ?)`, cutoff)
+		exec(`UPDATE messages SET size = 0 WHERE received_at <= ? AND size != 0`, cutoff)
 	}
 	for _, table := range []string{"login_tokens", "sessions", "counters", "oauth_codes", "oauth_tokens", "known_browsers"} {
 		exec(`DELETE FROM `+table+` WHERE expires_at <= ?`, now.Unix())
 	}
-	// Alerts are kept a little longer than the longest history.
-	exec(`DELETE FROM alerts WHERE created_at <= ?`, now.Add(-AlertKeep).Unix())
+	keep := s.AlertKeep
+	if keep == 0 {
+		keep = DefaultAlertKeep
+	}
+	exec(`DELETE FROM alerts WHERE created_at <= ?`, now.Add(-keep).Unix())
+	exec(`DELETE FROM alert_recipients WHERE stopped_at = 0 AND MAX(created_at, last_used) <= ?`, now.Add(-keep).Unix())
 	return n, errors.Join(errs...)
 }
 
@@ -470,13 +543,22 @@ func (s *Store) SizeBytes(ctx context.Context) (int64, error) {
 }
 
 // Backup writes a consistent copy of the database to a new file, while the
-// app keeps running. It refuses a path that already exists.
+// app keeps running. It refuses a path that already exists. The file is made
+// first, readable by its owner only, so no copy of the mail is ever open to
+// others while it is written, and a failed backup leaves nothing behind.
 func (s *Store) Backup(ctx context.Context, path string) error {
-	if _, err := os.Stat(path); err == nil {
-		return fmt.Errorf("%s already exists", path)
-	}
-	if _, err := s.DB.ExecContext(ctx, `VACUUM INTO ?`, path); err != nil {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("%s already exists", path)
+		}
 		return err
 	}
-	return os.Chmod(path, 0o600)
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if _, err := s.DB.ExecContext(ctx, `VACUUM INTO ?`, path); err != nil {
+		return errors.Join(err, os.Remove(path))
+	}
+	return nil
 }

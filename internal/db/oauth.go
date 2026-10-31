@@ -275,7 +275,7 @@ func (s *Store) UserByOAuthToken(ctx context.Context, token string) (User, error
 	if err != nil {
 		return User{}, err
 	}
-	return scanUser(s.DB.QueryRowContext(ctx, `SELECT `+userCols+` FROM `+userTable+`
+	return scanUser(s.DB.QueryRowContext(ctx, `SELECT `+userCols+` FROM users u
 		JOIN oauth_tokens t ON t.user_id = u.id WHERE t.token_hash = ?`, hash))
 }
 

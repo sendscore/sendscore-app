@@ -263,7 +263,7 @@ func (a *App) requestAlertEmail(ctx context.Context, u *db.User, pubID, email st
 	now := a.store.Now()
 	if _, err := a.store.TakeAll(ctx, []db.Cap{
 		{Name: "alert-confirm:user:" + u.ID, Bucket: db.Hour(now), Limit: alertConfirmsPerUser, Keep: 2 * time.Hour},
-		{Name: "alert-confirm:to:" + db.RecipientKey(email), Bucket: db.Day(now), Limit: alertConfirmsPerTo, Keep: 48 * time.Hour},
+		{Name: "alert-confirm:to:" + a.store.RecipientKey(email), Bucket: db.Day(now), Limit: alertConfirmsPerTo, Keep: 48 * time.Hour},
 		{Name: "alert-confirm:all", Bucket: db.Hour(now), Limit: a.cfg.SigninEmailsPerHour, Keep: 2 * time.Hour},
 	}); err != nil {
 		if !errors.Is(err, db.ErrLimit) {

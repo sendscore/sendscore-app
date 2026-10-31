@@ -14,8 +14,8 @@ const (
 	KindSignup = "signup"
 )
 
-// AlertKeep is how long alerts are kept.
-const AlertKeep = 400 * 24 * time.Hour
+// DefaultAlertKeep is how long alerts are kept without Store.AlertKeep.
+const DefaultAlertKeep = 400 * 24 * time.Hour
 
 // Publication is a monitored newsletter.
 type Publication struct {
@@ -269,24 +269,22 @@ func (s *Store) ConfirmAlertEmail(ctx context.Context, token string) (string, er
 	if err != nil {
 		return "", err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE alert_recipients SET stopped_at = 0 WHERE email_hash = ?`, recipientHash(email)); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE alert_recipients SET stopped_at = 0 WHERE email_hash = ?`, s.recipientHash(email)); err != nil {
 		return "", err
 	}
 	return email, tx.Commit()
 }
 
-func recipientHash(email string) string { return HashToken(NormalizeEmail(email)) }
-
 // RecipientKey names an alert recipient in a usage counter, without the
 // address.
-func RecipientKey(email string) string { return recipientHash(email)[:32] }
+func (s *Store) RecipientKey(email string) string { return s.recipientHash(email)[:32] }
 
 // AlertStopToken returns the token for the opt-out link of an address,
 // making one the first time.
 func (s *Store) AlertStopToken(ctx context.Context, email string) (string, error) {
-	hash := recipientHash(email)
-	if _, err := s.DB.ExecContext(ctx, `INSERT INTO alert_recipients (token, email_hash, created_at) VALUES (?, ?, ?)
-		ON CONFLICT(email_hash) DO NOTHING`, NewToken(32), hash, s.Now().Unix()); err != nil {
+	hash, now := s.recipientHash(email), s.Now().Unix()
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO alert_recipients (token, email_hash, created_at, last_used) VALUES (?, ?, ?, ?)
+		ON CONFLICT(email_hash) DO UPDATE SET last_used = excluded.last_used`, NewToken(32), hash, now, now); err != nil {
 		return "", err
 	}
 	var token string
@@ -321,7 +319,7 @@ func (s *Store) StopAlerts(ctx context.Context, token string) error {
 // AlertsStopped reports whether an address opted out of alerts.
 func (s *Store) AlertsStopped(ctx context.Context, email string) (bool, error) {
 	var n int
-	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM alert_recipients WHERE email_hash = ? AND stopped_at != 0`, recipientHash(email)).Scan(&n)
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM alert_recipients WHERE email_hash = ? AND stopped_at != 0`, s.recipientHash(email)).Scan(&n)
 	return n > 0, err
 }
 

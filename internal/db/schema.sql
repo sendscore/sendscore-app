@@ -189,13 +189,19 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE UNIQUE INDEX IF NOT EXISTS alerts_once ON alerts(publication_id, kind, key);
 CREATE INDEX IF NOT EXISTS alerts_status ON alerts(status);
 
--- Everyone alerts have been addressed to, by the hash of the address, so an
--- opt-out holds across accounts and outlives them without keeping the
--- address. token goes in each alert's opt-out link. stopped_at is 0 unless the
--- recipient opted out.
+-- Alert recipients, by a keyed hash of the address, so an opt-out holds across
+-- accounts and outlives them without keeping the address. token goes in each
+-- alert's opt-out link. stopped_at is 0 unless the recipient opted out. Sweep
+-- removes a recipient who did not opt out once it has been idle long enough.
 CREATE TABLE IF NOT EXISTS alert_recipients (
 	token       TEXT PRIMARY KEY,
 	email_hash  TEXT NOT NULL UNIQUE,
 	created_at  INTEGER NOT NULL,
 	stopped_at  INTEGER NOT NULL DEFAULT 0
+);
+
+-- Values made once for a database.
+CREATE TABLE IF NOT EXISTS settings (
+	name  TEXT PRIMARY KEY,
+	value BLOB NOT NULL
 );

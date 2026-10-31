@@ -28,11 +28,8 @@ const APITokenPrefix = "ss_live_"
 // bits of a 256-bit sign-in or session token.
 const selectorLen = 12
 
-// The columns and table scanUser reads.
-const (
-	userCols  = `u.id, u.email, u.created_at`
-	userTable = `users u`
-)
+// userCols are the columns scanUser reads, from users u.
+const userCols = `u.id, u.email, u.created_at`
 
 // User is an account.
 type User struct {
@@ -149,7 +146,7 @@ func (s *Store) ConsumeLoginToken(ctx context.Context, token string) (User, stri
 		"usr_"+NewToken(10), email, now.Unix()); err != nil {
 		return User{}, "", err
 	}
-	u, err := scanUser(tx.QueryRowContext(ctx, `SELECT `+userCols+` FROM `+userTable+` WHERE u.email = ?`, email))
+	u, err := scanUser(tx.QueryRowContext(ctx, `SELECT `+userCols+` FROM users u WHERE u.email = ?`, email))
 	if err != nil {
 		return User{}, "", err
 	}
@@ -213,7 +210,7 @@ func (s *Store) UserBySession(ctx context.Context, token string) (User, error) {
 	if err != nil {
 		return User{}, err
 	}
-	return scanUser(s.DB.QueryRowContext(ctx, `SELECT `+userCols+` FROM `+userTable+` WHERE u.id = ?`, uid))
+	return scanUser(s.DB.QueryRowContext(ctx, `SELECT `+userCols+` FROM users u WHERE u.id = ?`, uid))
 }
 
 // DeleteSession ends a session (sign out).
@@ -289,7 +286,7 @@ func (s *Store) UserByAPIToken(ctx context.Context, token string) (User, error) 
 	if err != nil {
 		return User{}, err
 	}
-	u, err := scanUser(s.DB.QueryRowContext(ctx, `SELECT `+userCols+` FROM `+userTable+` JOIN api_tokens t ON t.user_id = u.id WHERE t.id = ?`, id))
+	u, err := scanUser(s.DB.QueryRowContext(ctx, `SELECT `+userCols+` FROM users u JOIN api_tokens t ON t.user_id = u.id WHERE t.id = ?`, id))
 	if err != nil {
 		return User{}, err
 	}
@@ -412,6 +409,29 @@ func (s *Store) DeleteUser(ctx context.Context, userID string) error {
 	if err != nil {
 		return err
 	}
+	// An opt-out outlives the account, but the record of who else it alerted
+	// does not.
+	recipients := []string{email}
+	rows, err := tx.QueryContext(ctx, `SELECT alert_email FROM publications WHERE user_id = ?`, userID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var to string
+		if err := rows.Scan(&to); err != nil {
+			rows.Close()
+			return err
+		}
+		recipients = append(recipients, to)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, to := range recipients {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM alert_recipients WHERE email_hash = ? AND stopped_at = 0`, s.recipientHash(to)); err != nil {
+			return err
+		}
+	}
 	for _, q := range []struct {
 		query string
 		args  []any
@@ -431,8 +451,6 @@ func (s *Store) DeleteUser(ctx context.Context, userID string) error {
 		// Counters about an account are named <what>:user:<id>. Ids are
 		// base32 with a prefix, so they hold no GLOB wildcard.
 		{`DELETE FROM counters WHERE name GLOB '*:user:' || ?`, []any{userID}},
-		// The body can hold the customer's email and is not needed once the
-		// event has no account.
 		{`DELETE FROM users WHERE id = ?`, []any{userID}},
 	} {
 		if _, err := tx.ExecContext(ctx, q.query, q.args...); err != nil {
