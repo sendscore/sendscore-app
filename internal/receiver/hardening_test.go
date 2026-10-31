@@ -216,7 +216,9 @@ func TestMessagesInMemoryAreBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	big := append(sample(t), bytes.Repeat([]byte("x"), 8<<10)...)
+	// Short lines, since a line over the SMTP limit drops the connection,
+	// which can reset it before the reply is read.
+	big := append(sample(t), bytes.Repeat([]byte("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n"), 300)...)
 	if err := deliver(addr, "b@real.test", "t-"+a.Token+"@in.test", big); smtpCode(err) != 451 {
 		t.Errorf("over the memory budget: %v", err)
 	}
