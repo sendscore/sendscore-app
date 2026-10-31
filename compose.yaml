@@ -1,5 +1,5 @@
 # An example deployment. Put a reverse proxy with TLS (Caddy, nginx, or
-# similar) in front of port 3014, and set SENDSCORE_TRUST_PROXY=1 in .env.
+# similar) in front of port 3014, and set SENDSCORE_TRUST_PROXY=true in .env.
 # Port 25 on the host is the SMTP receiver, so the domain's MX record must
 # point at this host.
 services:

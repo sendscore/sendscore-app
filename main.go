@@ -120,7 +120,7 @@ func main() {
 		// Behind a proxy every visitor would share the proxy's address, so
 		// one person could use up the sign-in and anonymous limits for all.
 		log.Warn("WARNING: SENDSCORE_BASE_URL is public but SENDSCORE_TRUST_PROXY is not set. Behind a reverse proxy every visitor then counts as the proxy's IP, " +
-			"and one person can use up the sign-in and anonymous limits for everyone. Set SENDSCORE_TRUST_PROXY=1 behind a proxy, and only then.")
+			"and one person can use up the sign-in and anonymous limits for everyone. Set SENDSCORE_TRUST_PROXY=true behind a proxy, and only then.")
 	}
 
 	lists := blocklists(log)
