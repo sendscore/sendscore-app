@@ -4,6 +4,11 @@
   <div>
     <h1>{{if .View.Subject}}{{.View.Subject}}{{else}}(no subject){{end}}</h1>
     <p class="muted">From {{.View.From}} · received {{local .M.ReceivedAt .P.TimeZone}} for <a href="/newsletters/{{.P.ID}}">{{.P.Name}}</a> · <a href="/r/{{.M.ID}}">report</a></p>
+    <form method="post" action="/newsletters/{{.P.ID}}/messages/{{.M.ID}}/kind">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      {{if eq .M.Kind "signup"}}<p class="muted">SendScore took this for a signup message, so it is not compared or counted as an issue. <button type="submit" name="kind" value="issue" class="secondary">Count it as an issue</button></p>
+      {{else}}<p class="muted"><button type="submit" name="kind" value="signup" class="secondary">This is a signup message, not an issue</button></p>{{end}}
+    </form>
     <p class="notice">This is a safe view. It shows the text and the links of the message without its layout, images, or anything that could run. SendScore never opens confirmation, preference, or unsubscribe links, so to confirm a subscription, find the confirmation link below and open it yourself.</p>
   </div>
 </section>

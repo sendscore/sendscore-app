@@ -80,6 +80,7 @@ func TestOAuthRegistrationLimits(t *testing.T) {
 	_, _, h := newApp(t, func(c *Config) { c.RegistrationsPerHour = 2; c.TrustProxy = true })
 	for i, ip := range []string{"198.51.100.1", "198.51.100.2", "198.51.100.3"} {
 		r := request("POST", "/oauth/register", strings.NewReader(`{"redirect_uris":["`+testRedirect+`"]}`), "application/json", "")
+		r.RemoteAddr = "127.0.0.1:1234"
 		r.Header.Set("X-Forwarded-For", ip)
 		w := serve(h, r)
 		if want := map[bool]int{true: 201, false: 429}[i < 2]; w.Code != want {

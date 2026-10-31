@@ -1,0 +1,26 @@
+{{define "content"}}
+<section class="sheet">
+  <p class="label">Alerts</p>
+  <div>
+    <h1>{{.Title}}</h1>
+    {{if eq .Mode "confirm"}}
+    <p>A SendScore account asked to send newsletter alerts to <strong>{{.Email}}</strong>. Only accept if you expected this.</p>
+    <form method="post" action="/alerts/confirm" class="form">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input type="hidden" name="t" value="{{.Token}}">
+      <button type="submit">Send alerts to this address</button>
+    </form>
+    {{else if eq .Mode "confirmed"}}
+    <p>Alerts now go to <strong>{{.Email}}</strong>. Each one has a link to stop them.</p>
+    {{else if eq .Mode "stop"}}
+    <p>This stops every alert this SendScore would send to your address, from every account.</p>
+    <form method="post" action="/alerts/stop/{{.Token}}" class="form">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <button type="submit">Stop these alerts</button>
+    </form>
+    {{else}}
+    <p>This address gets no more alerts from this SendScore. Confirming a new request for it would start them again.</p>
+    {{end}}
+  </div>
+</section>
+{{end}}

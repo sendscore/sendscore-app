@@ -33,7 +33,7 @@ const (
 	maxClientName      = 120
 	maxRedirectURIs    = 8
 	maxRedirectURI     = 400
-	registrationsPerIP = 120 // an hour
+	registrationsPerIP = 20 // an hour, per network
 )
 
 // maxConnectedApps is how many apps one account may connect at once.
@@ -92,14 +92,15 @@ func (a *App) authorizationServer(w http.ResponseWriter, r *http.Request) {
 		"code_challenge_methods_supported":               []string{"S256"},
 		"token_endpoint_auth_methods_supported":          []string{"none"},
 		"authorization_response_iss_parameter_supported": true,
-		"service_documentation":                          "https://sendscore.ai",
+		"service_documentation":                          "https://github.com/sendscore/sendscore-app",
 	})
 }
 
 // serverCard describes the connector to clients before they connect.
 func (a *App) serverCard(w http.ResponseWriter, r *http.Request) {
+	b := a.cfg.BaseURL
 	publicJSON(w, map[string]any{
-		"serverInfo": map[string]any{"name": "sendscore", "title": "SendScore", "homepage": "https://sendscore.ai"},
+		"serverInfo": map[string]any{"name": "sendscore", "title": "SendScore", "homepage": b},
 		"transport":  map[string]any{"type": "streamable-http", "url": a.mcpResource()},
 		"authentication": map[string]any{
 			"required": true, "schemes": []string{"oauth2", "bearer"},
@@ -118,9 +119,15 @@ var notAnApp = map[string]bool{"javascript": true, "data": true, "blob": true, "
 
 var schemeRE = regexp.MustCompile(`^[a-z][a-z0-9+.-]*$`)
 
+// appSchemes are the private-use schemes of known MCP clients that predate
+// the reverse domain form RFC 8252 section 7.1 asks for.
+var appSchemes = map[string]bool{"cursor": true, "vscode": true, "vscode-insiders": true, "windsurf": true, "zed": true}
+
 // validRedirect reports whether a code may be sent to uri: https, http on
-// loopback (RFC 8252 section 7.3), or a native app's private-use scheme such
-// as cursor:// or vscode:// (section 7.1). Fragments, wildcards, and
+// loopback (RFC 8252 section 7.3), or a native app's private-use scheme:
+// reverse domain, such as com.example.app:/cb (section 7.1), or a known client
+// such as cursor://. Any other scheme could start an unrelated program on
+// the user's machine, even from Deny. Fragments, wildcards, and
 // characters that could break the consent page's CSP are refused.
 func validRedirect(uri string) bool {
 	if uri == "" || len(uri) > maxRedirectURI || strings.ContainsAny(uri, "#*,;'\"\\ ") {
@@ -142,7 +149,8 @@ func validRedirect(uri string) bool {
 		h := u.Hostname()
 		return h == "127.0.0.1" || h == "localhost" || h == "::1"
 	}
-	return schemeRE.MatchString(u.Scheme) && !notAnApp[u.Scheme] && len(uri) > len(u.Scheme)+1
+	return schemeRE.MatchString(u.Scheme) && !notAnApp[u.Scheme] && len(uri) > len(u.Scheme)+1 &&
+		(strings.Contains(u.Scheme, ".") || appSchemes[u.Scheme])
 }
 
 // formActionSource is the CSP source that lets the consent form's redirect

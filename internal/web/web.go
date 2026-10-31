@@ -4,6 +4,7 @@ package web
 
 import (
 	"context"
+	"database/sql"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -80,6 +82,22 @@ type Config struct {
 	FreePublications int
 	// ProEmails are granted Pro when they sign in, whatever billing says.
 	ProEmails []string
+	// ClosedSignups lets only ProEmails make a new account. Accounts that
+	// exist still sign in, and the sign-in page says the same to everyone.
+	ClosedSignups bool
+	// AnonDailyTotal caps test addresses and uploads by all anonymous
+	// visitors together in a UTC day. It defaults to DefaultAnonDailyTotal.
+	AnonDailyTotal int
+	// DailyBytes is what one account, or anonymous uploads together, may
+	// store by upload in a UTC day, and MaxStorageBytes the database size at
+	// which uploads are refused. Both have defaults.
+	DailyBytes      int
+	MaxStorageBytes int64
+	// TrustedProxies are the addresses X-Forwarded-For is believed from, with
+	// TrustProxy on. It defaults to loopback and private networks.
+	TrustedProxies []netip.Prefix
+	// Health adds checks to /healthz, such as the heartbeat's age.
+	Health func(context.Context) error
 	// Billing sells Pro through Creem. Nil turns billing off, as on a
 	// self-hosted instance: no plan section, no checkout, and no webhook.
 	Billing *billing.Client
@@ -94,6 +112,15 @@ const (
 	maxWaitsPerUser = 5
 	maxWaits        = 200
 	maxUploads      = 4
+	// uploadsPerIP is how many of those one network may hold.
+	uploadsPerIP = 1
+)
+
+// Defaults for the volume limits in Config.
+const (
+	DefaultAnonDailyTotal  = 100
+	DefaultDailyBytes      = 1 << 30
+	DefaultMaxStorageBytes = 10 << 30
 )
 
 // MaxUploadBytes is the largest upload checked, the same as the largest
@@ -116,8 +143,10 @@ type App struct {
 	// waits counts open long polls per user ("" is the total).
 	waitMu sync.Mutex
 	waits  map[string]int
-	// uploads holds a slot per upload being read or checked.
-	uploads chan struct{}
+	// uploads holds a slot per upload being read or checked, and uploadIPs
+	// counts them per network, under waitMu.
+	uploads   chan struct{}
+	uploadIPs map[string]int
 	// billingMu applies one Creem event at a time.
 	billingMu sync.Mutex
 }
@@ -150,8 +179,20 @@ func New(cfg Config, store *db.Store, log *slog.Logger) (*App, error) {
 	if cfg.HistoryDays == 0 {
 		cfg.HistoryDays = 365
 	}
+	if cfg.AnonDailyTotal == 0 {
+		cfg.AnonDailyTotal = DefaultAnonDailyTotal
+	}
+	if cfg.DailyBytes == 0 {
+		cfg.DailyBytes = DefaultDailyBytes
+	}
+	if cfg.MaxStorageBytes == 0 {
+		cfg.MaxStorageBytes = DefaultMaxStorageBytes
+	}
+	if cfg.TrustedProxies == nil {
+		cfg.TrustedProxies = DefaultTrustedProxies()
+	}
 	a := &App{cfg: cfg, store: store, log: log, tmpl: map[string]*template.Template{}, quit: make(chan struct{}),
-		waits: map[string]int{}, uploads: make(chan struct{}, maxUploads)}
+		waits: map[string]int{}, uploads: make(chan struct{}, maxUploads), uploadIPs: map[string]int{}}
 	funcs := template.FuncMap{
 		"lower":  strings.ToLower,
 		"status": func(s verdict.Status) string { return string(s) },
@@ -180,7 +221,7 @@ func New(cfg Config, store *db.Store, log *slog.Logger) (*App, error) {
 		"termsURL":   func() string { return cfg.TermsURL },
 	}
 	for _, page := range []string{"home", "address", "report", "upload", "error", "signin", "account", "consent",
-		"newsletters", "newsletter", "newsletter_form", "newsletter_delete", "message", "account_delete"} {
+		"newsletters", "newsletter", "newsletter_form", "newsletter_delete", "message", "account_delete", "alerts"} {
 		t, err := template.New("layout.html").Funcs(funcs).ParseFS(templateFS, "templates/layout.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, err
@@ -202,6 +243,7 @@ func (a *App) Routes() http.Handler {
 	// Every POST form goes through a.form, which checks the CSRF token.
 	const formLimit = 64 << 10
 	mux.HandleFunc("GET /{$}", a.home)
+	mux.HandleFunc("GET /healthz", a.healthz)
 	mux.HandleFunc("POST /test", a.form(formLimit, a.createAddressPage))
 	mux.HandleFunc("GET /t/{token}", a.addressPage)
 	mux.HandleFunc("GET /upload", a.uploadForm)
@@ -243,6 +285,12 @@ func (a *App) Routes() http.Handler {
 	mux.HandleFunc("GET /newsletters/{id}/delete", a.deleteNewsletterForm)
 	mux.HandleFunc("POST /newsletters/{id}/delete", a.form(formLimit, a.deleteNewsletter))
 	mux.HandleFunc("GET /newsletters/{id}/messages/{mid}", a.messageView)
+	mux.HandleFunc("POST /newsletters/{id}/messages/{mid}/kind", a.form(formLimit, a.messageKind))
+	// Pages an alert's recipient opens, who has no account here.
+	mux.HandleFunc("GET /alerts/confirm", a.alertConfirmForm)
+	mux.HandleFunc("POST /alerts/confirm", a.form(formLimit, a.alertConfirm))
+	mux.HandleFunc("GET /alerts/stop/{token}", a.alertStopForm)
+	mux.HandleFunc("POST /alerts/stop/{token}", a.form(formLimit, a.alertStop))
 
 	// OAuth for the MCP connector (see oauth.go).
 	mux.Handle("/.well-known/oauth-protected-resource", cors(http.HandlerFunc(a.protectedResource)))
@@ -323,13 +371,41 @@ func (a *App) home(w http.ResponseWriter, r *http.Request) {
 	a.render(w, r, http.StatusOK, "home", map[string]any{"Title": "Check a newsletter", "Deleted": deleted})
 }
 
+// healthz answers 200 when the database answers and cfg.Health passes, and
+// 503 otherwise, saying no more than that to the public.
+func (a *App) healthz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	err := a.store.DB.QueryRowContext(ctx, `SELECT 1 FROM users LIMIT 1`).Scan(new(int))
+	if errors.Is(err, sql.ErrNoRows) {
+		err = nil
+	}
+	if err == nil && a.cfg.Health != nil {
+		err = a.cfg.Health(ctx)
+	}
+	if err != nil {
+		a.log.Error("health check", "err", err)
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "failing"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// testRefused answers a takeTest error: the allowance page, or a plain
+// failure, since a broken database is not a used-up allowance.
+func (a *App) testRefused(w http.ResponseWriter, r *http.Request, limit int, err error) {
+	if errors.Is(err, db.ErrLimit) {
+		a.limitPage(w, r, limit)
+		return
+	}
+	a.log.Error("count test", "err", err)
+	a.fail(w, r, http.StatusInternalServerError, "Could not count this test. Try again in a minute.")
+}
+
 func (a *App) createAddressPage(w http.ResponseWriter, r *http.Request) {
 	u := userFrom(r.Context())
 	if limit, err := a.takeTest(r.Context(), u, a.clientIP(r)); err != nil {
-		if !errors.Is(err, db.ErrLimit) {
-			a.log.Error("count test", "err", err)
-		}
-		a.limitPage(w, r, limit)
+		a.testRefused(w, r, limit, err)
 		return
 	}
 	// An address belongs to the account, or for an anonymous visitor, to
@@ -384,31 +460,59 @@ func (a *App) uploadForm(w http.ResponseWriter, r *http.Request) {
 }
 
 // uploadGate runs before an upload's body is read. It refuses a post from
-// another site, a visitor whose daily allowance is used up, and an upload
-// while maxUploads others are being read or checked, so a flood of large
-// bodies costs neither memory nor disk. The allowance is only looked at
-// here; upload counts it once the file has been read.
+// another site, an upload while the network has another in progress or
+// maxUploads others are being read or checked, and a visitor whose daily
+// allowance is used up, so a flood of large bodies costs neither memory nor
+// disk. The allowance is counted here, so a body that never arrives is not
+// free.
 func (a *App) uploadGate(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !a.sameOrigin(r) || !a.hasCSRFCookie(r) {
 			a.fail(w, r, http.StatusForbidden, formExpired)
 			return
 		}
-		name, limit := a.testCounter(userFrom(r.Context()), a.clientIP(r))
-		if n, err := a.store.Count(r.Context(), name, db.Day(a.store.Now())); err != nil {
-			a.log.Error("count test", "err", err)
-		} else if n >= limit {
-			a.limitPage(w, r, limit)
-			return
-		}
-		select {
-		case a.uploads <- struct{}{}:
-			defer func() { <-a.uploads }()
-		default:
+		ip := a.clientIP(r)
+		if !a.takeUploadSlot(ip) {
 			a.fail(w, r, http.StatusServiceUnavailable, "SendScore is checking several uploads right now. Try again in a minute.")
 			return
 		}
+		defer a.releaseUploadSlot(ip)
+		if n, err := a.store.SizeBytes(r.Context()); err != nil {
+			a.log.Error("database size", "err", err)
+		} else if n >= a.cfg.MaxStorageBytes {
+			a.log.Error("refusing uploads: the database reached SENDSCORE_MAX_STORAGE_MB", "bytes", n)
+			a.fail(w, r, http.StatusServiceUnavailable, "This SendScore is out of storage for messages. Try again later.")
+			return
+		}
+		if limit, err := a.takeTest(r.Context(), userFrom(r.Context()), ip); err != nil {
+			a.testRefused(w, r, limit, err)
+			return
+		}
 		h(w, r)
+	}
+}
+
+func (a *App) takeUploadSlot(ip string) bool {
+	a.waitMu.Lock()
+	defer a.waitMu.Unlock()
+	if a.uploadIPs[ip] >= uploadsPerIP {
+		return false
+	}
+	select {
+	case a.uploads <- struct{}{}:
+		a.uploadIPs[ip]++
+		return true
+	default:
+		return false
+	}
+}
+
+func (a *App) releaseUploadSlot(ip string) {
+	a.waitMu.Lock()
+	defer a.waitMu.Unlock()
+	<-a.uploads
+	if a.uploadIPs[ip]--; a.uploadIPs[ip] <= 0 {
+		delete(a.uploadIPs, ip)
 	}
 }
 
@@ -435,11 +539,17 @@ func (a *App) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := userFrom(r.Context())
-	if limit, err := a.takeTest(r.Context(), u, a.clientIP(r)); err != nil {
-		if !errors.Is(err, db.ErrLimit) {
-			a.log.Error("count test", "err", err)
+	owner := "bytes:anon"
+	if u != nil {
+		owner = "bytes:user:" + u.ID
+	}
+	if _, err := a.store.TakeAll(r.Context(), []db.Cap{{Name: owner, Bucket: db.Day(a.store.Now()), Limit: a.cfg.DailyBytes, N: len(raw), Keep: 48 * time.Hour}}); err != nil {
+		if errors.Is(err, db.ErrLimit) {
+			a.fail(w, r, http.StatusTooManyRequests, "Today's storage for uploads is used up. The allowance starts again at midnight UTC.")
+			return
 		}
-		a.limitPage(w, r, limit)
+		a.log.Error("count upload", "err", err)
+		a.fail(w, r, http.StatusInternalServerError, "Could not count this upload. Try again in a minute.")
 		return
 	}
 	env := engine.Envelope{MailFrom: strings.TrimSpace(r.FormValue("mail_from"))}
@@ -517,7 +627,7 @@ func (a *App) reportPage(w http.ResponseWriter, r *http.Request) {
 			secs = append(secs, section{Name: s.name, Checks: cs})
 		}
 	}
-	data := map[string]any{"Title": m.Verdict.Message.Subject, "M": m, "V": m.Verdict, "Sections": secs}
+	data := map[string]any{"Title": m.Verdict.Message.Subject, "M": m, "V": m.Verdict, "Sections": secs, "ShowRaw": a.ownsMessage(r, m)}
 	// Only whoever made the address sees it and the link to send again,
 	// since a report link is shared and the address takes mail from anyone.
 	if m.Token != "" {
@@ -546,8 +656,30 @@ func (a *App) ownsAddress(r *http.Request, addr db.Address) bool {
 	return addr.Creator != "" && c != "" && db.HashToken(c) == addr.Creator
 }
 
+// ownsMessage reports whether the visitor may read a message's original. Its
+// headers name the address it was sent to, whose token opens every later
+// report and lets anyone send to it, so a shared report link must not lead
+// there. An anonymous upload has no address and no owner, so it stays open.
+func (a *App) ownsMessage(r *http.Request, m *db.Message) bool {
+	ctx := r.Context()
+	if m.Token != "" {
+		addr, err := a.store.AnyAddressByToken(ctx, m.Token)
+		return err == nil && a.ownsAddress(r, addr)
+	}
+	if m.UserID != "" {
+		u := userFrom(ctx)
+		return u != nil && u.ID == m.UserID
+	}
+	return m.PublicationID == ""
+}
+
 func (a *App) rawMessage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	m, err := a.store.MessageByID(r.Context(), id)
+	if err != nil || !a.ownsMessage(r, m) {
+		http.NotFound(w, r)
+		return
+	}
 	raw, err := a.store.RawByID(r.Context(), id)
 	if err != nil {
 		http.NotFound(w, r)

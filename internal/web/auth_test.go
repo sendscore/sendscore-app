@@ -395,8 +395,23 @@ func TestClientIPFromProxy(t *testing.T) {
 		t.Errorf("trusted proxy: ip = %q, want the entry the proxy added", ip)
 	}
 	r.Header.Set("X-Forwarded-For", "2001:db8:1:2:3:4:5:6")
-	if ip := a.clientIP(r); ip != "2001:db8:1:2::/64" {
+	if ip := a.clientIP(r); ip != "2001:db8:1::/48" {
 		t.Errorf("ipv6 = %q", ip)
+	}
+	// Not an address: the header is ignored, not used as a counter name.
+	r.Header.Set("X-Forwarded-For", "anything-goes")
+	if ip := a.clientIP(r); ip != "127.0.0.1" {
+		t.Errorf("junk header: ip = %q", ip)
+	}
+	// Proxies in the chain are skipped, and what comes before them is forged.
+	r.Header.Set("X-Forwarded-For", "6.6.6.6, 203.0.113.9, 10.0.0.2")
+	if ip := a.clientIP(r); ip != "203.0.113.9" {
+		t.Errorf("chain: ip = %q", ip)
+	}
+	// A connection that is not from a trusted proxy cannot set the header.
+	r.RemoteAddr = "198.51.100.5:4000"
+	if ip := a.clientIP(r); ip != "198.51.100.5" {
+		t.Errorf("direct connection: ip = %q, a client chose its own", ip)
 	}
 }
 

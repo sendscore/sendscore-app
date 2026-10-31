@@ -316,11 +316,16 @@ func TestWaitAfter(t *testing.T) {
 	if w := apiDo(h, "GET", wait+"&after=rpt_other", tok); w.Code != 400 {
 		t.Errorf("wait after an unknown report = %d %s", w.Code, w.Body)
 	}
-	if w := do(h, "GET", "/r/"+second.ID+"/raw", nil, ""); w.Code != 200 || !strings.Contains(w.Body.String(), "Shooting into the sun") {
-		t.Errorf("raw = %d", w.Code)
+	// The original names the address, so it is for the owner, not for
+	// whoever was given the report link.
+	if w := do(h, "GET", "/r/"+second.ID+"/raw", nil, ""); w.Code != 404 {
+		t.Errorf("raw for a stranger = %d", w.Code)
 	}
 	// The report page offers its owner a link to wait for the next send.
 	_, session, _ := newUser(t, store, "after@example.com")
+	if w := serve(h, request("GET", "/r/"+second.ID+"/raw", nil, "", session)); w.Code != 200 || !strings.Contains(w.Body.String(), "Shooting into the sun") {
+		t.Errorf("raw for the owner = %d", w.Code)
+	}
 	if w := serve(h, request("GET", "/r/"+second.ID, nil, "", session)); !strings.Contains(w.Body.String(), "/t/"+addr.Token+"?after="+second.ID) {
 		t.Error("report page has no link to wait for the next send")
 	}

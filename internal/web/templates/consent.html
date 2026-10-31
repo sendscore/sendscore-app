@@ -3,7 +3,7 @@
   <p class="label">Connect</p>
   <div>
     <h1>Allow {{.Name}} to use SendScore?</h1>
-    <p>{{.Name}} will act as <strong>{{.User.Email}}</strong>. It can create test addresses, wait for the emails sent to them, and read their reports, and each address counts against your daily allowance. It cannot see your other addresses, your API tokens, or your account settings.</p>
+    <p>{{.Name}} will act as <strong>{{.User.Email}}</strong>. It can create test addresses, wait for the emails sent to them, and read any report in your account, and each address counts against your daily allowance. It can also list your monitored newsletters, with their monitoring and alert addresses and latest issues. It cannot see your API tokens or change your account settings.</p>
     <p>If you allow it, SendScore sends you back to <code>{{.Req.RedirectURI}}</code>.</p>
     <p class="muted">Only allow it if you started connecting this app yourself. You can disconnect it at any time from your account page.</p>
     <form method="post" action="/oauth/authorize" class="consent">

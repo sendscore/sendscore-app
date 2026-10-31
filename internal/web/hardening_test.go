@@ -151,6 +151,7 @@ func TestSignedInUploadBelongsToTheAccount(t *testing.T) {
 func signinFrom(h http.Handler, ip, email string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
 	body := url.Values{"csrf": {testCSRF}, "email": {email}}.Encode()
 	r := request("POST", "/signin", strings.NewReader(body), "application/x-www-form-urlencoded", "")
+	r.RemoteAddr = "127.0.0.1:1234"
 	r.Header.Set("X-Forwarded-For", ip)
 	for _, c := range cookies {
 		r.AddCookie(c)

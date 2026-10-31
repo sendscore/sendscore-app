@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/mail"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strconv"
@@ -29,8 +30,12 @@ const (
 	browserCookie = "ss_browser"
 )
 
-// Sign-in emails allowed per address and per network in an hour.
-const signinPerHour = 5
+// Sign-in emails allowed per address and per network in an hour, and per
+// wider network (an IPv6 /32, so a host with many /48s gains little).
+const (
+	signinPerHour    = 5
+	signinPerNetwork = 20
+)
 
 // knownBrowserTTL is how long a browser that signed in is remembered.
 const knownBrowserTTL = 365 * 24 * time.Hour
@@ -62,7 +67,7 @@ func withUser(ctx context.Context, u *db.User) context.Context {
 func (a *App) session(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if p := r.URL.Path; strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/assets/") || strings.HasPrefix(p, "/.well-known/") ||
-			p == "/oauth/token" || p == "/oauth/register" {
+			p == "/oauth/token" || p == "/oauth/register" || p == "/healthz" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -73,7 +78,11 @@ func (a *App) session(next http.Handler) http.Handler {
 			case err == nil:
 				ctx = withUser(ctx, &u)
 			case !errors.Is(err, db.ErrNotFound):
+				// Not the same as signed out, which would send someone to sign
+				// in again over a database hiccup.
 				a.log.Error("session lookup", "err", err)
+				http.Error(w, "SendScore could not load your session. Try again in a minute.", http.StatusServiceUnavailable)
+				return
 			}
 		}
 		token := ""
@@ -173,11 +182,50 @@ func (a *App) sameOrigin(r *http.Request) bool {
 	return err == nil && u.Scheme == b.Scheme && u.Host == b.Host
 }
 
-// clientIP is the address limits are counted against. Behind a proxy
-// (SENDSCORE_TRUST_PROXY=1) it is the last X-Forwarded-For entry, the one
-// the proxy added; earlier entries come from the client and can be forged.
-// An IPv6 address counts as its /64, since one machine usually has many.
-func (a *App) clientIP(r *http.Request) string { return a.clientNet(r, 64) }
+// DefaultTrustedProxies are the addresses a reverse proxy normally connects
+// from: this machine, and the private networks a container sees it on.
+func DefaultTrustedProxies() []netip.Prefix {
+	var out []netip.Prefix
+	for _, s := range []string{"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"} {
+		out = append(out, netip.MustParsePrefix(s))
+	}
+	return out
+}
+
+func (a *App) trustedProxy(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	return slices.ContainsFunc(a.cfg.TrustedProxies, func(p netip.Prefix) bool { return p.Contains(ip) })
+}
+
+// forwardedFor is the client a trusted proxy reports: the last
+// X-Forwarded-For entry that is not itself a trusted proxy. Entries before it
+// come from the client and can be forged. It is ok only when the request came
+// from a trusted proxy and the entries are addresses.
+func (a *App) forwardedFor(r *http.Request, remote string) (string, bool) {
+	from, err := netip.ParseAddr(remote)
+	if !a.cfg.TrustProxy || err != nil || !a.trustedProxy(from) {
+		return "", false
+	}
+	parts := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	last := ""
+	for i := len(parts) - 1; i >= 0; i-- {
+		s := strings.TrimSpace(parts[i])
+		ip, err := netip.ParseAddr(s)
+		if err != nil {
+			return "", false
+		}
+		last = s
+		if !a.trustedProxy(ip) {
+			break
+		}
+	}
+	return last, true
+}
+
+// clientIP is the address limits are counted against: the connection's, or
+// behind a trusted proxy, the client it reports. An IPv6 address counts as
+// its /48, since one site is usually given that many.
+func (a *App) clientIP(r *http.Request) string { return a.clientNet(r, 48) }
 
 // clientNet is clientIP with IPv6 counted per prefix of the given length.
 func (a *App) clientNet(r *http.Request, v6bits int) string {
@@ -185,11 +233,8 @@ func (a *App) clientNet(r *http.Request, v6bits int) string {
 	if host, _, err := net.SplitHostPort(raw); err == nil {
 		raw = host
 	}
-	if a.cfg.TrustProxy {
-		if vals := r.Header.Values("X-Forwarded-For"); len(vals) > 0 {
-			parts := strings.Split(vals[len(vals)-1], ",")
-			raw = strings.TrimSpace(parts[len(parts)-1])
-		}
+	if fwd, ok := a.forwardedFor(r, raw); ok {
+		raw = fwd
 	}
 	ip := net.ParseIP(raw)
 	if ip == nil {
@@ -202,11 +247,16 @@ func (a *App) clientNet(r *http.Request, v6bits int) string {
 }
 
 // takeTest counts one test address or upload against the user's daily
-// allowance, or the IP's when nobody is signed in. It returns the limit and
-// db.ErrLimit when the allowance is used up.
+// allowance, or when nobody is signed in, the IP's and that of all anonymous
+// visitors together. It returns the limit and db.ErrLimit when one is used up.
 func (a *App) takeTest(ctx context.Context, u *db.User, ip string) (int, error) {
 	name, limit := a.testCounter(u, ip)
-	_, err := a.store.Take(ctx, name, db.Day(a.store.Now()), limit, 48*time.Hour)
+	day := db.Day(a.store.Now())
+	caps := []db.Cap{{Name: name, Bucket: day, Limit: limit, Keep: 48 * time.Hour}}
+	if u == nil {
+		caps = append(caps, db.Cap{Name: "tests:anon:all", Bucket: day, Limit: a.cfg.AnonDailyTotal, Keep: 48 * time.Hour})
+	}
+	_, err := a.store.TakeAll(ctx, caps)
 	return limit, err
 }
 
@@ -229,7 +279,11 @@ func (a *App) dailyLimit(u *db.User) int {
 // limitPage explains a used-up daily allowance.
 func (a *App) limitPage(w http.ResponseWriter, r *http.Request, limit int) {
 	msg := fmt.Sprintf("You have used all %d of today's test addresses. The allowance starts again at midnight UTC.", limit)
-	if userFrom(r.Context()) == nil {
+	switch {
+	case userFrom(r.Context()) != nil:
+	case limit == 0:
+		msg = "This SendScore does not offer tests without an account. Sign in to run one."
+	default:
 		msg = fmt.Sprintf("This network has used all %d of today's free tests. Sign in for %d a day, or come back after midnight UTC.", limit, a.cfg.FreeDailyTests)
 	}
 	a.render(w, r, http.StatusTooManyRequests, "error", map[string]any{"Title": "Daily limit reached", "Message": msg})
@@ -307,16 +361,28 @@ func (a *App) signin(w http.ResponseWriter, r *http.Request) {
 	if !a.takeSignin(w, r, email) {
 		return
 	}
-	token, err := a.store.CreateLoginTokenNext(ctx, email, next)
+	allowed, err := a.mayHaveAccount(ctx, email)
 	if err != nil {
-		a.log.Error("create login token", "err", err)
+		a.log.Error("account lookup", "err", err)
 		a.fail(w, r, http.StatusInternalServerError, "Could not start signing in. Try again in a minute.")
 		return
 	}
-	link := a.cfg.BaseURL + "/signin/verify?t=" + token
-	body := "Use this link to sign in to SendScore. It works once and expires in 15 minutes.\n\n" + link +
-		"\n\nIf you did not ask to sign in, ignore this email. Nobody can sign in without the link.\n"
-	if err := a.cfg.Mailer.Send(ctx, email, "Sign in to SendScore", body); err != nil {
+	// An address that may not sign up is told so by email, not on this page,
+	// so the page and its timing say nothing about who has an account.
+	subject, body := "Sign in to SendScore", "This SendScore is not taking new accounts, so no sign-in link was made for this address. "+
+		"If you run it, add this address to SENDSCORE_PRO_EMAILS.\n\nIf you did not ask to sign in, ignore this email.\n"
+	if allowed {
+		token, err := a.store.CreateLoginTokenNext(ctx, email, next)
+		if err != nil {
+			a.log.Error("create login token", "err", err)
+			a.fail(w, r, http.StatusInternalServerError, "Could not start signing in. Try again in a minute.")
+			return
+		}
+		link := a.cfg.BaseURL + "/signin/verify?t=" + token
+		body = "Use this link to sign in to SendScore. It works once and expires in 15 minutes.\n\n" + link +
+			"\n\nIf you did not ask to sign in, ignore this email. Nobody can sign in without the link.\n"
+	}
+	if err := a.cfg.Mailer.Send(ctx, email, subject, body); err != nil {
 		a.log.Error("send sign-in email", "err", err)
 		a.fail(w, r, http.StatusBadGateway, "The sign-in email could not be sent. Try again in a few minutes.")
 		return
@@ -324,23 +390,34 @@ func (a *App) signin(w http.ResponseWriter, r *http.Request) {
 	a.render(w, r, http.StatusOK, "signin", map[string]any{"Title": "Check your email", "Sent": true, "Email": email})
 }
 
-// takeSignin counts a sign-in email against three limits, and answers 429
+// mayHaveAccount reports whether an address may sign in: it has an account,
+// sign-ups are open, or the operator listed it.
+func (a *App) mayHaveAccount(ctx context.Context, email string) (bool, error) {
+	if !a.cfg.ClosedSignups || slices.Contains(a.cfg.ProEmails, email) {
+		return true, nil
+	}
+	return a.store.HasAccount(ctx, email)
+}
+
+// takeSignin counts a sign-in email against four limits, and answers 429
 // when one is used up: the network per hour (an IPv6 address counts as its
-// /48, since a single host is often given that many), the address per hour,
-// and the whole service per hour (SigninEmailsPerHour, which protects the
-// sending reputation). The address limit is kept per browser kind: a
-// browser that has signed in to this address before has its own allowance,
-// so a stranger who uses up the address's allowance cannot lock its owner
-// out of the browsers they already use.
+// /48, since a single host is often given that many), a wider network per
+// hour, the address per hour, and the whole service per hour
+// (SigninEmailsPerHour, which protects the sending reputation). The address
+// and service limits are kept per browser kind: a browser that has signed in
+// to this address before has its own allowance of each, so a stranger who
+// uses up the address's or the service's cannot lock its owner out of the
+// browsers they already use.
 func (a *App) takeSignin(w http.ResponseWriter, r *http.Request, email string) bool {
 	ctx := r.Context()
 	hour := db.Hour(a.store.Now())
-	emailKey := "signin:email:" + email
+	emailKey, allKey := "signin:email:"+email, "signin:all"
 	if c, err := r.Cookie(a.cookie(browserCookie)); err == nil {
 		if ok, err := a.store.KnownBrowser(ctx, c.Value, email); err != nil {
 			a.log.Error("known browser", "err", err)
 		} else if ok {
 			emailKey += ":known:" + db.HashToken(c.Value)[:16]
+			allKey += ":known"
 		}
 	}
 	limits := []struct {
@@ -349,8 +426,9 @@ func (a *App) takeSignin(w http.ResponseWriter, r *http.Request, email string) b
 		msg   string
 	}{
 		{"signin:ip:" + a.clientNet(r, 48), signinPerHour, "Too many sign-in links were requested from this network in the last hour. Use the newest link you received, or try again in an hour."},
+		{"signin:net:" + a.clientNet(r, 32), signinPerNetwork, "Too many sign-in links were requested from this network in the last hour. Use the newest link you received, or try again in an hour."},
 		{emailKey, signinPerHour, "Too many sign-in links were requested for this address in the last hour. Use the newest link you received, or try again in an hour."},
-		{"signin:all", a.cfg.SigninEmailsPerHour, "SendScore is sending a lot of sign-in emails right now. Try again in a few minutes."},
+		{allKey, a.cfg.SigninEmailsPerHour, "SendScore is sending a lot of sign-in emails right now. Try again in a few minutes."},
 	}
 	// Every limit is checked before any is counted, so a request refused by
 	// one (such as a flood from one network) never uses up the others.
@@ -362,6 +440,8 @@ func (a *App) takeSignin(w http.ResponseWriter, r *http.Request, email string) b
 		n, err := a.store.Count(ctx, l.name, hour)
 		if err != nil {
 			a.log.Error("signin limit", "err", err)
+			a.fail(w, r, http.StatusInternalServerError, "Could not start signing in. Try again in a minute.")
+			return false
 		}
 		if n >= l.limit {
 			return refuse(l.msg)
@@ -371,6 +451,8 @@ func (a *App) takeSignin(w http.ResponseWriter, r *http.Request, email string) b
 		if _, err := a.store.Take(ctx, l.name, hour, l.limit, 2*time.Hour); err != nil {
 			if !errors.Is(err, db.ErrLimit) {
 				a.log.Error("signin limit", "err", err)
+				a.fail(w, r, http.StatusInternalServerError, "Could not start signing in. Try again in a minute.")
+				return false
 			}
 			return refuse(l.msg)
 		}

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -204,6 +205,8 @@ func readPublication(r *http.Request, p *db.Publication, u *db.User) string {
 		return "Give the newsletter a name, such as the one readers see."
 	case utf8.RuneCountInString(p.Name) > 100:
 		return "Keep the name to 100 characters or fewer."
+	case strings.IndexFunc(p.Name, unicode.IsControl) >= 0:
+		return "Keep the name to one line of ordinary text."
 	case !validZone(p.TimeZone):
 		return "The time zone is not one SendScore knows. Use an IANA name such as America/Toronto or Europe/London."
 	case !validEmail(p.AlertEmail):
@@ -238,6 +241,9 @@ func (a *App) createNewsletter(w http.ResponseWriter, r *http.Request) {
 		a.render(w, r, http.StatusBadRequest, "newsletter_form", a.formData(p, "Add a newsletter", "/newsletters", msg))
 		return
 	}
+	// Alerts go to the account's own address until another one accepts them.
+	requested := p.AlertEmail
+	p.AlertEmail = u.Email
 	err := a.store.CreatePublication(r.Context(), &p, a.publicationLimit(u))
 	if errors.Is(err, db.ErrLimit) {
 		pubs, _ := a.store.Publications(r.Context(), u.ID)
@@ -249,7 +255,106 @@ func (a *App) createNewsletter(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, http.StatusInternalServerError, "Could not add the newsletter.")
 		return
 	}
-	http.Redirect(w, r, "/newsletters/"+p.ID, http.StatusSeeOther)
+	next := "/newsletters/" + p.ID
+	if requested != u.Email && !a.requestAlertEmail(r.Context(), u, p.ID, requested) {
+		next += "?alert=limit"
+	}
+	http.Redirect(w, r, next, http.StatusSeeOther)
+}
+
+// alertConfirms are hourly limits on confirmation emails, which go to an
+// address someone typed: per account, and per day for one address.
+const (
+	alertConfirmsPerUser = 5
+	alertConfirmsPerTo   = 3
+)
+
+// requestAlertEmail asks an address to accept a publication's alerts, since
+// an alert goes out from the operator's sending account with text from a
+// message anyone can send. It returns false when no email went out.
+func (a *App) requestAlertEmail(ctx context.Context, u *db.User, pubID, email string) bool {
+	now := a.store.Now()
+	if _, err := a.store.TakeAll(ctx, []db.Cap{
+		{Name: "alert-confirm:user:" + u.ID, Bucket: db.Hour(now), Limit: alertConfirmsPerUser, Keep: 2 * time.Hour},
+		{Name: "alert-confirm:to:" + db.RecipientKey(email), Bucket: db.Day(now), Limit: alertConfirmsPerTo, Keep: 48 * time.Hour},
+		{Name: "alert-confirm:all", Bucket: db.Hour(now), Limit: a.cfg.SigninEmailsPerHour, Keep: 2 * time.Hour},
+	}); err != nil {
+		if !errors.Is(err, db.ErrLimit) {
+			a.log.Error("alert confirmation limit", "err", err)
+		}
+		return false
+	}
+	token, err := a.store.RequestAlertEmail(ctx, pubID, u.ID, email)
+	if err != nil {
+		a.log.Error("request alert address", "err", err)
+		return false
+	}
+	// Fixed text: nothing a user typed reaches a stranger's inbox here.
+	body := "A SendScore account at " + a.cfg.BaseURL + " asked to send newsletter alerts to this address.\n\n" +
+		"To accept them, open this link within 24 hours:\n\n" + a.cfg.BaseURL + "/alerts/confirm?t=" + token +
+		"\n\nIf you did not expect this, ignore this email, and no alert will be sent to you.\n"
+	if err := a.cfg.Mailer.Send(ctx, email, "Confirm SendScore alerts", body); err != nil {
+		a.log.Error("send alert confirmation", "err", err)
+		if _, err := a.store.RequestAlertEmail(ctx, pubID, u.ID, ""); err != nil {
+			a.log.Error("withdraw alert address", "err", err)
+		}
+		return false
+	}
+	return true
+}
+
+func (a *App) alertConfirmForm(w http.ResponseWriter, r *http.Request) {
+	t := r.URL.Query().Get("t")
+	w.Header().Set("Cache-Control", "no-store")
+	email, err := a.store.PeekAlertConfirm(r.Context(), t)
+	if err != nil {
+		if !errors.Is(err, db.ErrNotFound) {
+			a.log.Error("peek alert confirmation", "err", err)
+		}
+		a.fail(w, r, http.StatusNotFound, "This link has expired or was already used.")
+		return
+	}
+	// Only a button here, so a mail scanner that opens links confirms nothing.
+	a.render(w, r, http.StatusOK, "alerts", map[string]any{"Title": "Accept alerts?", "Mode": "confirm", "Email": email, "Token": t})
+}
+
+func (a *App) alertConfirm(w http.ResponseWriter, r *http.Request) {
+	email, err := a.store.ConfirmAlertEmail(r.Context(), r.PostFormValue("t"))
+	if err != nil {
+		if !errors.Is(err, db.ErrNotFound) {
+			a.log.Error("confirm alert address", "err", err)
+		}
+		a.fail(w, r, http.StatusNotFound, "This link has expired or was already used.")
+		return
+	}
+	a.render(w, r, http.StatusOK, "alerts", map[string]any{"Title": "Alerts accepted", "Mode": "confirmed", "Email": email})
+}
+
+func (a *App) alertStopForm(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	w.Header().Set("Cache-Control", "no-store")
+	known, err := a.store.AlertStopKnown(r.Context(), token)
+	if err != nil {
+		a.log.Error("alert opt-out", "err", err)
+	}
+	if err != nil || !known {
+		a.fail(w, r, http.StatusNotFound, "This link is not valid.")
+		return
+	}
+	a.render(w, r, http.StatusOK, "alerts", map[string]any{"Title": "Stop alerts?", "Mode": "stop", "Token": token})
+}
+
+func (a *App) alertStop(w http.ResponseWriter, r *http.Request) {
+	if err := a.store.StopAlerts(r.Context(), r.PathValue("token")); err != nil {
+		if !errors.Is(err, db.ErrNotFound) {
+			a.log.Error("alert opt-out", "err", err)
+			a.fail(w, r, http.StatusInternalServerError, "Could not stop the alerts. Try again in a minute.")
+			return
+		}
+		a.fail(w, r, http.StatusNotFound, "This link is not valid.")
+		return
+	}
+	a.render(w, r, http.StatusOK, "alerts", map[string]any{"Title": "Alerts stopped", "Mode": "stopped"})
 }
 
 func (a *App) newsletter(w http.ResponseWriter, r *http.Request) {
@@ -261,9 +366,16 @@ func (a *App) newsletter(w http.ResponseWriter, r *http.Request) {
 	msgs, err := a.store.PublicationMessages(ctx, p.ID, timelineLength)
 	if err != nil {
 		a.log.Error("publication messages", "err", err)
+		a.fail(w, r, http.StatusInternalServerError, "Could not load this newsletter's issues.")
+		return
 	}
 	data := map[string]any{"Title": p.Name, "P": p, "Address": a.monitorAddress(p), "Schedule": monitor.Describe(p),
-		"Messages": msgs, "HistoryDays": a.cfg.HistoryDays}
+		"Messages": msgs, "HistoryDays": a.cfg.HistoryDays, "AlertLimit": r.URL.Query().Get("alert") == "limit"}
+	if stopped, err := a.store.AlertsStopped(ctx, p.AlertEmail); err != nil {
+		a.log.Error("alert opt-out", "err", err)
+	} else {
+		data["AlertStopped"] = stopped
+	}
 	if al, err := a.store.LastSentAlert(ctx, p.ID); err == nil {
 		data["LastAlert"] = al
 	}
@@ -286,16 +398,42 @@ func (a *App) updateNewsletter(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	ctx := r.Context()
+	current := p.AlertEmail
 	if msg := readPublication(r, &p, u); msg != "" {
 		a.render(w, r, http.StatusBadRequest, "newsletter_form", a.formData(p, "Edit "+p.Name, "/newsletters/"+p.ID, msg))
 		return
 	}
-	if err := a.store.UpdatePublication(r.Context(), &p); err != nil {
+	// A new address waits for its owner to accept, and so does one that opted
+	// out. The account's own address is proven by signing in.
+	requested := p.AlertEmail
+	stopped, err := a.store.AlertsStopped(ctx, requested)
+	if err != nil {
+		a.log.Error("alert opt-out", "err", err)
+		a.fail(w, r, http.StatusInternalServerError, "Could not save the newsletter.")
+		return
+	}
+	confirm := stopped || (requested != current && requested != u.Email)
+	if confirm {
+		p.AlertEmail = current
+	}
+	if err := a.store.UpdatePublication(ctx, &p); err != nil {
 		a.log.Error("update publication", "err", err)
 		a.fail(w, r, http.StatusInternalServerError, "Could not save the newsletter.")
 		return
 	}
-	http.Redirect(w, r, "/newsletters/"+p.ID, http.StatusSeeOther)
+	next := "/newsletters/" + p.ID
+	switch {
+	case confirm:
+		if !a.requestAlertEmail(ctx, u, p.ID, requested) {
+			next += "?alert=limit"
+		}
+	case p.AlertPending != "":
+		if _, err := a.store.RequestAlertEmail(ctx, p.ID, u.ID, ""); err != nil {
+			a.log.Error("withdraw alert address", "err", err)
+		}
+	}
+	http.Redirect(w, r, next, http.StatusSeeOther)
 }
 
 // deleteNewsletterForm asks before deleting, on its own page, so nothing is
@@ -351,6 +489,37 @@ func (a *App) messageView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.render(w, r, http.StatusOK, "message", map[string]any{"Title": v.Subject, "P": p, "M": m, "View": v})
+}
+
+// messageKind corrects whether a message is an issue or a signup message,
+// for when the subject misled SendScore.
+func (a *App) messageKind(w http.ResponseWriter, r *http.Request) {
+	_, p, ok := a.ownPublication(w, r)
+	if !ok {
+		return
+	}
+	ctx := r.Context()
+	m, err := a.store.MessageByID(ctx, r.PathValue("mid"))
+	if err != nil || m.PublicationID != p.ID {
+		a.fail(w, r, http.StatusNotFound, "This message does not exist, or it has expired.")
+		return
+	}
+	kind := r.PostFormValue("kind")
+	if kind != db.KindIssue && kind != db.KindSignup {
+		a.fail(w, r, http.StatusBadRequest, "That is not a kind of message.")
+		return
+	}
+	var slot time.Time
+	late := false
+	if s, ok := monitor.ScheduleOf(p); ok && kind == db.KindIssue {
+		slot, late = s.Place(m.ReceivedAt)
+	}
+	if err := a.store.SetMessageKind(ctx, p.ID, m.ID, kind, slot, late); err != nil {
+		a.log.Error("set message kind", "err", err)
+		a.fail(w, r, http.StatusInternalServerError, "Could not change the message.")
+		return
+	}
+	http.Redirect(w, r, "/newsletters/"+p.ID+"/messages/"+m.ID, http.StatusSeeOther)
 }
 
 // API
@@ -462,6 +631,8 @@ func (a *App) apiPublicationByID(w http.ResponseWriter, r *http.Request) {
 	msgs, err := a.store.PublicationMessages(ctx, p.ID, apiReports)
 	if err != nil {
 		a.log.Error("publication messages", "err", err)
+		apiError(w, http.StatusInternalServerError, "could not list the reports")
+		return
 	}
 	out.Reports = []apiIssue{}
 	for _, m := range msgs {
