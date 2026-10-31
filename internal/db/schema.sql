@@ -6,8 +6,9 @@ CREATE TABLE IF NOT EXISTS addresses (
 	expires_at  INTEGER NOT NULL
 );
 
--- One received (or uploaded) message and its verdict. raw is kept so a
--- report can be re-run when the engine changes; it is deleted with the row.
+-- One received (or uploaded) message and its verdict. New rows keep the
+-- original message in message_raw and leave raw empty, since SQLite walks a
+-- large raw to reach the verdict after it.
 CREATE TABLE IF NOT EXISTS messages (
 	id           TEXT PRIMARY KEY,
 	token        TEXT REFERENCES addresses(token) ON DELETE CASCADE,
@@ -24,6 +25,13 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS messages_token ON messages(token, received_at);
 CREATE INDEX IF NOT EXISTS messages_expires ON messages(expires_at);
+
+-- The original message of a report, for the raw and message views. Kept for
+-- SENDSCORE_RAW_DAYS at most, then dropped while the verdict stays.
+CREATE TABLE IF NOT EXISTS message_raw (
+	id   TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+	raw  BLOB NOT NULL
+);
 
 -- Accounts. Sign-in is by emailed link, so there are no passwords. plan is
 -- "pro" only for an account the operator granted Pro (SENDSCORE_PRO_EMAILS),
@@ -164,7 +172,7 @@ CREATE INDEX IF NOT EXISTS publications_user ON publications(user_id, created_at
 -- Alerts, written before they are sent so a restart never sends one twice.
 -- key is what the alert is about (report:<id> or slot:<unix>), and the
 -- unique index makes each one once only. status is pending, sending, sent,
--- failed, or capped (over the daily cap, never sent).
+-- failed, capped (over a cap, never sent), or stopped (the recipient opted out).
 CREATE TABLE IF NOT EXISTS alerts (
 	id              TEXT PRIMARY KEY,
 	publication_id  TEXT NOT NULL REFERENCES publications(id) ON DELETE CASCADE,
@@ -184,6 +192,17 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS alerts_once ON alerts(publication_id, kind, key);
 CREATE INDEX IF NOT EXISTS alerts_status ON alerts(status);
+
+-- Everyone alerts have been addressed to, by the hash of the address, so an
+-- opt-out holds across accounts and outlives them without keeping the
+-- address. token goes in each alert's opt-out link. stopped_at is 0 unless the
+-- recipient opted out.
+CREATE TABLE IF NOT EXISTS alert_recipients (
+	token       TEXT PRIMARY KEY,
+	email_hash  TEXT NOT NULL UNIQUE,
+	created_at  INTEGER NOT NULL,
+	stopped_at  INTEGER NOT NULL DEFAULT 0
+);
 
 -- The Creem subscription behind an account's paid plan, kept up to date by
 -- Creem's webhooks and by nothing else. status is empty until an event says

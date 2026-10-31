@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -33,15 +34,32 @@ var ErrUnknownAfter = errors.New("unknown after report")
 type Store struct {
 	DB  *sql.DB
 	Now func() time.Time
+	// AllPro gives every account Pro while it is set, for an instance with
+	// billing off. It is read when a plan is read and never written to
+	// users.plan, so a restart without billing settings changes nothing that
+	// outlives the restart.
+	AllPro bool
+	// RawKeep is how long Sweep keeps the original of a message; the verdict
+	// stays until the message expires. Zero keeps it as long as the message.
+	RawKeep time.Duration
 }
 
-// Open opens (creating if needed) the SQLite database at path, with the same
-// pragmas as Preflight: WAL, a busy timeout, foreign keys, and immediate
-// transactions.
+// journalLimit is the size SQLite cuts the WAL back to after a checkpoint, so
+// a burst of large messages does not leave it at its high-water mark.
+const journalLimit = 64 << 20
+
+// Open opens (creating if needed) the SQLite database at path, with WAL, a
+// busy timeout, foreign keys, immediate transactions, and synchronous=NORMAL,
+// which is safe with WAL and spares an fsync on every commit. The file holds
+// raw mail, so it is readable by its owner only, and SQLite gives the -wal
+// and -shm files the same mode.
 func Open(path string) (*Store, error) {
+	if err := private(path); err != nil {
+		return nil, fmt.Errorf("db permissions: %w", err)
+	}
 	dsn := fmt.Sprintf(
-		"file:%s?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(on)",
-		path,
+		"file:%s?_txlock=immediate&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(on)&_pragma=synchronous(NORMAL)&_pragma=journal_size_limit(%d)",
+		path, journalLimit,
 	)
 	d, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -59,6 +77,24 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	return &Store{DB: d, Now: time.Now}, nil
+}
+
+// private creates the database file if needed, and makes it and any -wal and
+// -shm files readable by their owner only.
+func private(path string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
 }
 
 // migrate adds the columns that came after a table was first created. Each
@@ -88,6 +124,19 @@ func migrate(d *sql.DB) error {
 		`ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE messages ADD COLUMN slot_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE messages ADD COLUMN late INTEGER NOT NULL DEFAULT 0`,
+		// The hash of a monitoring address's message, so a sender's retry of
+		// one already saved is not stored or compared a second time.
+		`ALTER TABLE messages ADD COLUMN dedupe TEXT NOT NULL DEFAULT ''`,
+		// An alert address waiting for its owner to confirm it, and the hash
+		// and expiry of the link that does.
+		`ALTER TABLE publications ADD COLUMN alert_pending TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE publications ADD COLUMN alert_confirm_hash TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE publications ADD COLUMN alert_confirm_expires INTEGER NOT NULL DEFAULT 0`,
+		// When a failed alert may be tried again (Unix seconds).
+		`ALTER TABLE alerts ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0`,
+		// Set once a Creem event was applied. Rows from before the column
+		// were applied or given back, so they default to set.
+		`ALTER TABLE creem_events ADD COLUMN applied INTEGER NOT NULL DEFAULT 1`,
 	}
 	for _, a := range alters {
 		if _, err := d.Exec(a); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
@@ -102,6 +151,9 @@ func migrate(d *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS oauth_tokens_client ON oauth_tokens(client_id)`,
 		`CREATE INDEX IF NOT EXISTS oauth_codes_client ON oauth_codes(client_id)`,
 		`CREATE INDEX IF NOT EXISTS messages_publication ON messages(publication_id, received_at)`,
+		`CREATE INDEX IF NOT EXISTS messages_dedupe ON messages(publication_id, dedupe) WHERE dedupe != ''`,
+		`CREATE INDEX IF NOT EXISTS messages_received ON messages(received_at)`,
+		`CREATE INDEX IF NOT EXISTS publications_confirm ON publications(alert_confirm_hash) WHERE alert_confirm_hash != ''`,
 	} {
 		if _, err := d.Exec(idx); err != nil {
 			return err
@@ -203,16 +255,18 @@ type Message struct {
 	Kind          string
 	SlotAt        time.Time
 	Late          bool
-	Source        string
-	ReceivedAt    time.Time
-	ExpiresAt     time.Time
-	RemoteIP      string
-	Helo          string
-	MailFrom      string
-	RcptTo        string
-	TLS           *bool
-	// Raw is written by SaveMessage but never loaded by the queries that
-	// read a message, since it can be 25 MB; RawByID loads it.
+	// Dedupe is the hash of a monitoring address's message as it arrived.
+	Dedupe     string
+	Source     string
+	ReceivedAt time.Time
+	ExpiresAt  time.Time
+	RemoteIP   string
+	Helo       string
+	MailFrom   string
+	RcptTo     string
+	TLS        *bool
+	// Raw is written by SaveMessage to message_raw and never loaded by the
+	// queries that read a message, since it can be 25 MB; RawByID loads it.
 	Raw     []byte
 	Verdict *verdict.Verdict
 }
@@ -242,11 +296,21 @@ func (s *Store) SaveMessage(ctx context.Context, m *Message) error {
 	if m.TLS != nil {
 		tls = *m.TLS
 	}
-	_, err = s.DB.ExecContext(ctx, `INSERT INTO messages
-		(id, token, user_id, publication_id, kind, slot_at, late, source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, raw, verdict)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.ID, tok, uid, pub, m.Kind, slot, m.Late, m.Source, m.ReceivedAt.Unix(), m.ExpiresAt.Unix(), m.RemoteIP, m.Helo, m.MailFrom, m.RcptTo, tls, m.Raw, string(vj))
-	return err
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // a no-op after commit
+	if _, err = tx.ExecContext(ctx, `INSERT INTO messages
+		(id, token, user_id, publication_id, kind, slot_at, late, dedupe, source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, raw, verdict)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, x'', ?)`,
+		m.ID, tok, uid, pub, m.Kind, slot, m.Late, m.Dedupe, m.Source, m.ReceivedAt.Unix(), m.ExpiresAt.Unix(), m.RemoteIP, m.Helo, m.MailFrom, m.RcptTo, tls, string(vj)); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO message_raw (id, raw) VALUES (?, ?)`, m.ID, m.Raw); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 const messageCols = `id, COALESCE(token, ''), COALESCE(user_id, ''), COALESCE(publication_id, ''), kind, slot_at, late, source, received_at, expires_at, remote_ip, helo, mail_from, rcpt_to, tls, verdict`
@@ -298,11 +362,50 @@ func (s *Store) MessageForUser(ctx context.Context, id, userID string) (*Message
 // RawByID returns the raw message of a report that has not expired.
 func (s *Store) RawByID(ctx context.Context, id string) ([]byte, error) {
 	var raw []byte
-	err := s.DB.QueryRowContext(ctx, `SELECT raw FROM messages WHERE id = ? AND expires_at > ?`, id, s.Now().Unix()).Scan(&raw)
+	err := s.DB.QueryRowContext(ctx, `SELECT COALESCE((SELECT raw FROM message_raw WHERE id = m.id), m.raw)
+		FROM messages m WHERE m.id = ? AND m.expires_at > ?`, id, s.Now().Unix()).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
+	if err == nil && len(raw) == 0 {
+		// Dropped after SENDSCORE_RAW_DAYS; the report itself stays.
+		return nil, ErrNotFound
+	}
 	return raw, err
+}
+
+// MessageByDedupe returns a publication's message with this hash received
+// since a time, or ErrNotFound.
+func (s *Store) MessageByDedupe(ctx context.Context, pubID, hash string, since time.Time) (*Message, error) {
+	return scanMessage(s.DB.QueryRowContext(ctx, `SELECT `+messageCols+` FROM messages
+		WHERE publication_id = ? AND dedupe = ? AND received_at >= ? AND expires_at > ? ORDER BY rowid LIMIT 1`,
+		pubID, hash, since.Unix(), s.Now().Unix()))
+}
+
+// IssueBefore returns the publication's newest issue saved before the
+// message id, or ErrNotFound.
+func (s *Store) IssueBefore(ctx context.Context, pubID, id string) (*Message, error) {
+	return scanMessage(s.DB.QueryRowContext(ctx, `SELECT `+messageCols+` FROM messages
+		WHERE publication_id = ? AND kind = ? AND expires_at > ?
+		AND rowid < (SELECT rowid FROM messages WHERE id = ?) ORDER BY rowid DESC LIMIT 1`,
+		pubID, KindIssue, s.Now().Unix(), id))
+}
+
+// SetMessageKind corrects whether a publication's message is an issue or a
+// signup message, with the slot it counts for.
+func (s *Store) SetMessageKind(ctx context.Context, pubID, id, kind string, slot time.Time, late bool) error {
+	var at int64
+	if !slot.IsZero() {
+		at = slot.Unix()
+	}
+	res, err := s.DB.ExecContext(ctx, `UPDATE messages SET kind = ?, slot_at = ?, late = ? WHERE id = ? AND publication_id = ?`, kind, at, late, id, pubID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 // LatestForToken returns the newest message received at a test address.
@@ -334,29 +437,54 @@ func (s *Store) LatestForToken(ctx context.Context, token, after string) (*Messa
 const AddressGrace = time.Hour
 
 // Sweep deletes expired messages, addresses that expired more than
-// AddressGrace ago and have no messages left, and expired sign-in links,
-// sessions, usage counters, OAuth codes and tokens, known browsers, and
-// alerts older than AlertKeep.
+// AddressGrace ago and have no messages left, originals older than RawKeep,
+// and expired sign-in links, sessions, usage counters, OAuth codes and
+// tokens, known browsers, and alerts older than AlertKeep. A step that fails
+// does not stop the ones after it; the errors come back together.
 func (s *Store) Sweep(ctx context.Context) (int64, error) {
 	now := s.Now()
-	res, err := s.DB.ExecContext(ctx, `DELETE FROM messages WHERE expires_at <= ?`, now.Unix())
-	if err != nil {
-		return 0, err
+	var errs []error
+	exec := func(q string, args ...any) int64 {
+		res, err := s.DB.ExecContext(ctx, q, args...)
+		if err != nil {
+			errs = append(errs, err)
+			return 0
+		}
+		n, _ := res.RowsAffected()
+		return n
 	}
-	n, _ := res.RowsAffected()
-	_, err = s.DB.ExecContext(ctx, `DELETE FROM addresses WHERE expires_at <= ?
+	n := exec(`DELETE FROM messages WHERE expires_at <= ?`, now.Unix())
+	exec(`DELETE FROM addresses WHERE expires_at <= ?
 		AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.token = addresses.token)`, now.Add(-AddressGrace).Unix())
-	if err != nil {
-		return n, err
+	if s.RawKeep > 0 {
+		cutoff := now.Add(-s.RawKeep).Unix()
+		exec(`DELETE FROM message_raw WHERE id IN (SELECT id FROM messages WHERE received_at <= ?)`, cutoff)
 	}
 	for _, table := range []string{"login_tokens", "sessions", "counters", "oauth_codes", "oauth_tokens", "known_browsers"} {
-		if _, err := s.DB.ExecContext(ctx, `DELETE FROM `+table+` WHERE expires_at <= ?`, now.Unix()); err != nil {
-			return n, err
-		}
+		exec(`DELETE FROM `+table+` WHERE expires_at <= ?`, now.Unix())
 	}
 	// Alerts are kept a little longer than the longest history.
-	if _, err := s.DB.ExecContext(ctx, `DELETE FROM alerts WHERE created_at <= ?`, now.Add(-AlertKeep).Unix()); err != nil {
-		return n, err
+	exec(`DELETE FROM alerts WHERE created_at <= ?`, now.Add(-AlertKeep).Unix())
+	return n, errors.Join(errs...)
+}
+
+// SizeBytes is how much of the database is in use. It does not count pages
+// that are free for reuse, so a sweep brings it back down.
+func (s *Store) SizeBytes(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.DB.QueryRowContext(ctx, `SELECT (page_count - freelist_count) * page_size
+		FROM pragma_page_count(), pragma_freelist_count(), pragma_page_size()`).Scan(&n)
+	return n, err
+}
+
+// Backup writes a consistent copy of the database to a new file, while the
+// app keeps running. It refuses a path that already exists.
+func (s *Store) Backup(ctx context.Context, path string) error {
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("%s already exists", path)
 	}
-	return n, nil
+	if _, err := s.DB.ExecContext(ctx, `VACUUM INTO ?`, path); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
 }

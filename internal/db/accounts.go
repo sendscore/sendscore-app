@@ -152,7 +152,7 @@ func (s *Store) ConsumeLoginToken(ctx context.Context, token string) (User, stri
 		"usr_"+NewToken(10), email, now.Unix()); err != nil {
 		return User{}, "", err
 	}
-	u, err := scanUser(tx.QueryRowContext(ctx, `SELECT `+userCols+` FROM `+userTable+` WHERE u.email = ?`, email))
+	u, err := scanUser(tx.QueryRowContext(ctx, `SELECT `+s.userCols()+` FROM `+userTable+` WHERE u.email = ?`, email))
 	if err != nil {
 		return User{}, "", err
 	}
@@ -216,7 +216,7 @@ func (s *Store) UserBySession(ctx context.Context, token string) (User, error) {
 	if err != nil {
 		return User{}, err
 	}
-	return scanUser(s.DB.QueryRowContext(ctx, `SELECT `+userCols+` FROM `+userTable+` WHERE u.id = ?`, uid))
+	return scanUser(s.DB.QueryRowContext(ctx, `SELECT `+s.userCols()+` FROM `+userTable+` WHERE u.id = ?`, uid))
 }
 
 // DeleteSession ends a session (sign out).
@@ -288,23 +288,29 @@ func (s *Store) UserByAPIToken(ctx context.Context, token string) (User, error) 
 	if !strings.HasPrefix(token, APITokenPrefix) {
 		return User{}, ErrNotFound
 	}
-	tx, err := s.DB.BeginTx(ctx, nil)
+	id, err := match(ctx, s.DB, `SELECT id, token_hash FROM api_tokens WHERE selector = ?`, token)
 	if err != nil {
 		return User{}, err
 	}
-	defer tx.Rollback() //nolint:errcheck // a no-op after commit
-	id, err := match(ctx, tx, `SELECT id, token_hash FROM api_tokens WHERE selector = ?`, token)
+	u, err := scanUser(s.DB.QueryRowContext(ctx, `SELECT `+s.userCols()+` FROM `+userTable+` JOIN api_tokens t ON t.user_id = u.id WHERE t.id = ?`, id))
 	if err != nil {
 		return User{}, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE api_tokens SET last_used_at = ? WHERE id = ?`, s.Now().Unix(), id); err != nil {
-		return User{}, err
-	}
-	u, err := scanUser(tx.QueryRowContext(ctx, `SELECT `+userCols+` FROM `+userTable+` JOIN api_tokens t ON t.user_id = u.id WHERE t.id = ?`, id))
-	if err != nil {
-		return User{}, err
-	}
-	return u, tx.Commit()
+	// At most a write a minute per token, so reading never queues behind
+	// writers. A failure only leaves "last used" a little old.
+	now := s.Now().Unix()
+	_, _ = s.DB.ExecContext(ctx, `UPDATE api_tokens SET last_used_at = ? WHERE id = ? AND last_used_at <= ?`, now, id, now-tokenUseGranularity)
+	return u, nil
+}
+
+// tokenUseGranularity is how often, in seconds, a token's last use is written.
+const tokenUseGranularity = 60
+
+// HasAccount reports whether an address has an account.
+func (s *Store) HasAccount(ctx context.Context, email string) (bool, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM users WHERE email = ?`, NormalizeEmail(email)).Scan(&n)
+	return n > 0, err
 }
 
 // Day is the UTC day bucket for daily limits.
@@ -332,6 +338,51 @@ func (s *Store) Take(ctx context.Context, name, bucket string, limit int, keep t
 	return n, err
 }
 
+// Cap is one limit TakeAll counts against. N is how much to count, 1 when it
+// is zero, such as the bytes of a message.
+type Cap struct {
+	Name, Bucket string
+	Limit, N     int
+	Keep         time.Duration
+}
+
+// TakeAll counts every cap, or none of them: it returns the index of the
+// first cap that has no room, with ErrLimit, and counts nothing. So a request
+// refused by one limit never uses up another.
+func (s *Store) TakeAll(ctx context.Context, caps []Cap) (int, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return -1, err
+	}
+	defer tx.Rollback() //nolint:errcheck // a no-op after commit
+	i, err := s.takeAll(ctx, tx, caps)
+	if err != nil {
+		return i, err
+	}
+	return -1, tx.Commit()
+}
+
+func (s *Store) takeAll(ctx context.Context, tx *sql.Tx, caps []Cap) (int, error) {
+	for i, c := range caps {
+		var n int
+		err := tx.QueryRowContext(ctx, `SELECT count FROM counters WHERE name = ? AND bucket = ?`, c.Name, c.Bucket).Scan(&n)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return -1, err
+		}
+		if n+max(c.N, 1) > c.Limit {
+			return i, ErrLimit
+		}
+	}
+	for _, c := range caps {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO counters (name, bucket, count, expires_at) VALUES (?, ?, ?, ?)
+			ON CONFLICT(name, bucket) DO UPDATE SET count = count + excluded.count`,
+			c.Name, c.Bucket, max(c.N, 1), s.Now().Add(c.Keep).Unix()); err != nil {
+			return -1, err
+		}
+	}
+	return -1, nil
+}
+
 // Count returns how many uses of name are counted in bucket.
 func (s *Store) Count(ctx context.Context, name, bucket string) (int, error) {
 	var n int
@@ -349,7 +400,7 @@ func (s *Store) Count(ctx context.Context, name, bucket string) (int, error) {
 // tokens, usage counters, and subscription. The messages are deleted by
 // hand rather than left to the foreign keys, which would keep an upload as
 // an anonymous row. Creem events are kept, since they are the payment
-// record, with the account taken off them. OAuth clients are shared
+// record, with the account and their payload taken off them. OAuth clients are shared
 // registrations with no owner, so they stay. An unknown id is ErrNotFound.
 func (s *Store) DeleteUser(ctx context.Context, userID string) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
@@ -385,7 +436,9 @@ func (s *Store) DeleteUser(ctx context.Context, userID string) error {
 		// base32 with a prefix, so they hold no GLOB wildcard.
 		{`DELETE FROM counters WHERE name GLOB '*:user:' || ?`, []any{userID}},
 		{`DELETE FROM subscriptions WHERE user_id = ?`, []any{userID}},
-		{`UPDATE creem_events SET user_id = NULL WHERE user_id = ?`, []any{userID}},
+		// The body can hold the customer's email and is not needed once the
+		// event has no account.
+		{`UPDATE creem_events SET user_id = NULL, body = '{}' WHERE user_id = ?`, []any{userID}},
 		{`DELETE FROM users WHERE id = ?`, []any{userID}},
 	} {
 		if _, err := tx.ExecContext(ctx, q.query, q.args...); err != nil {

@@ -426,11 +426,10 @@ func (a *App) verify(w http.ResponseWriter, r *http.Request) {
 	localRedirect(w, next)
 }
 
-// promote grants Pro as an account signs in, when its address is listed in
-// ProEmails or billing is off. An instance that sells nothing has no reason
-// to hold its own accounts to the free limits.
+// promote grants Pro to an address listed in ProEmails as it signs in,
+// whatever billing says.
 func (a *App) promote(ctx context.Context, u *db.User) {
-	if u.Comped || (a.cfg.Billing != nil && !slices.Contains(a.cfg.ProEmails, u.Email)) {
+	if u.Comped || !slices.Contains(a.cfg.ProEmails, u.Email) {
 		return
 	}
 	if err := a.store.SetPlan(ctx, u.ID, db.PlanPro); err != nil {

@@ -246,6 +246,11 @@ func (a *App) creemWebhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Could not apply", http.StatusInternalServerError)
 		return
 	}
+	// A stop before this line leaves the event unapplied on record, so
+	// Creem's retry applies it again, which the event mark makes harmless.
+	if err := a.store.MarkCreemEventApplied(ctx, ev.ID); err != nil {
+		a.log.Error("mark creem event applied", "event", ev.ID, "err", err)
+	}
 	io.WriteString(w, msg)
 }
 

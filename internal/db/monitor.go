@@ -14,8 +14,9 @@ const (
 	KindSignup = "signup"
 )
 
-// Plans. Every account is free until a subscription in good standing (or
-// SENDSCORE_PRO_EMAILS) makes it pro.
+// Plans. With billing on, an account is free until a subscription in good
+// standing (or SENDSCORE_PRO_EMAILS) makes it pro. With billing off, every
+// account is pro (see Store.AllPro).
 const (
 	PlanFree = "free"
 	PlanPro  = "pro"
@@ -38,6 +39,9 @@ type Publication struct {
 	TimeZone     string
 	GraceMinutes int
 	AlertEmail   string
+	// AlertPending is an address waiting for its owner to confirm it. Alerts
+	// keep going to AlertEmail until then.
+	AlertPending string
 	Paused       bool
 	// WatchSince is when the schedule last changed or alerts were last
 	// turned on; a slot due before it is never reported missed.
@@ -53,13 +57,13 @@ type Publication struct {
 // Scheduled reports whether the publication has an expected schedule.
 func (p Publication) Scheduled() bool { return p.Days != 0 && p.At != "" }
 
-const publicationCols = `id, user_id, name, token, days, at, time_zone, grace_minutes, alert_email, paused, watch_since, created_at`
+const publicationCols = `id, user_id, name, token, days, at, time_zone, grace_minutes, alert_email, alert_pending, paused, watch_since, created_at`
 
 func scanPublication(row interface{ Scan(...any) error }, extra ...any) (Publication, error) {
 	var p Publication
 	var since, created int64
 	err := row.Scan(append([]any{&p.ID, &p.UserID, &p.Name, &p.Token, &p.Days, &p.At, &p.TimeZone, &p.GraceMinutes,
-		&p.AlertEmail, &p.Paused, &since, &created}, extra...)...)
+		&p.AlertEmail, &p.AlertPending, &p.Paused, &since, &created}, extra...)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, ErrNotFound
 	}
@@ -74,7 +78,7 @@ func (s *Store) CreatePublication(ctx context.Context, p *Publication, max int) 
 	now := s.Now().UTC().Truncate(time.Second)
 	p.ID, p.Token, p.CreatedAt, p.WatchSince = "pub_"+NewToken(8), NewToken(10), now, now
 	res, err := s.DB.ExecContext(ctx, `INSERT INTO publications (`+publicationCols+`)
-		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM publications WHERE user_id = ?) < ?`,
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ? WHERE (SELECT COUNT(*) FROM publications WHERE user_id = ?) < ?`,
 		p.ID, p.UserID, p.Name, p.Token, p.Days, p.At, p.TimeZone, p.GraceMinutes, p.AlertEmail, p.Paused,
 		now.Unix(), now.Unix(), p.UserID, max)
 	if err != nil {
@@ -151,7 +155,7 @@ func (s *Store) PublicationByID(ctx context.Context, id string) (Publication, er
 func (s *Store) PublicationByToken(ctx context.Context, token string) (Publication, error) {
 	var plan string
 	var lapsed bool
-	p, err := scanPublication(s.DB.QueryRowContext(ctx, `SELECT `+prefixed("p.", publicationCols)+`, `+planExpr+`, `+lapsedExpr+`
+	p, err := scanPublication(s.DB.QueryRowContext(ctx, `SELECT `+prefixed("p.", publicationCols)+`, `+s.planExpr()+`, `+s.lapsedExpr()+`
 		FROM publications p JOIN users u ON u.id = p.user_id LEFT JOIN subscriptions s ON s.user_id = u.id
 		WHERE p.token = ?`, strings.ToLower(token)), &plan, &lapsed)
 	p.OwnerPlan, p.OwnerLapsed = plan, lapsed
@@ -176,7 +180,7 @@ func (s *Store) Publications(ctx context.Context, userID string) ([]Publication,
 func (s *Store) ScheduledPublications(ctx context.Context) ([]Publication, error) {
 	return s.queryPublications(ctx, `SELECT `+prefixed("p.", publicationCols)+`
 		FROM publications p JOIN users u ON u.id = p.user_id LEFT JOIN subscriptions s ON s.user_id = u.id
-		WHERE p.days != 0 AND p.at != '' AND p.paused = 0 AND NOT `+lapsedExpr+` ORDER BY p.rowid`)
+		WHERE p.days != 0 AND p.at != '' AND p.paused = 0 AND NOT `+s.lapsedExpr()+` ORDER BY p.rowid`)
 }
 
 func (s *Store) queryPublications(ctx context.Context, q string, args ...any) ([]Publication, error) {
@@ -264,14 +268,114 @@ func (s *Store) PromoteEmails(ctx context.Context, emails []string) (int64, erro
 	return total, nil
 }
 
-// PromoteAll grants every account Pro and returns how many changed. It is for
-// an instance with billing off, where no plan is for sale.
-func (s *Store) PromoteAll(ctx context.Context) (int64, error) {
-	res, err := s.DB.ExecContext(ctx, `UPDATE users SET plan = ? WHERE plan != ?`, PlanPro, PlanPro)
-	if err != nil {
-		return 0, err
+// AlertConfirmTTL is how long a link confirming an alert address works.
+const AlertConfirmTTL = 24 * time.Hour
+
+// RequestAlertEmail records an alert address waiting for confirmation and
+// returns the token for the link. Another request replaces it. An empty email
+// withdraws the request and returns no token.
+func (s *Store) RequestAlertEmail(ctx context.Context, id, userID, email string) (string, error) {
+	token, hash, expires := "", "", int64(0)
+	if email != "" {
+		token = NewToken(32)
+		hash, expires = HashToken(token), s.Now().Add(AlertConfirmTTL).Unix()
 	}
-	return res.RowsAffected()
+	res, err := s.DB.ExecContext(ctx, `UPDATE publications SET alert_pending = ?, alert_confirm_hash = ?, alert_confirm_expires = ?
+		WHERE id = ? AND user_id = ?`, email, hash, expires, id, userID)
+	if err != nil {
+		return "", err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return "", ErrNotFound
+	}
+	return token, nil
+}
+
+// PeekAlertConfirm returns the address a confirmation link is for, without
+// using it up, or ErrNotFound.
+func (s *Store) PeekAlertConfirm(ctx context.Context, token string) (string, error) {
+	var email string
+	err := s.DB.QueryRowContext(ctx, `SELECT alert_pending FROM publications
+		WHERE alert_confirm_hash = ? AND alert_confirm_expires > ?`, HashToken(token), s.Now().Unix()).Scan(&email)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return email, err
+}
+
+// ConfirmAlertEmail makes a pending address the publication's alert address,
+// and lifts any opt-out, since its owner just asked for these alerts. It
+// returns ErrNotFound for a link that is unknown, expired, or used.
+func (s *Store) ConfirmAlertEmail(ctx context.Context, token string) (string, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback() //nolint:errcheck // a no-op after commit
+	var email string
+	err = tx.QueryRowContext(ctx, `UPDATE publications SET alert_email = alert_pending, alert_pending = '', alert_confirm_hash = '',
+		alert_confirm_expires = 0 WHERE alert_confirm_hash = ? AND alert_confirm_expires > ? RETURNING alert_email`,
+		HashToken(token), s.Now().Unix()).Scan(&email)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE alert_recipients SET stopped_at = 0 WHERE email_hash = ?`, recipientHash(email)); err != nil {
+		return "", err
+	}
+	return email, tx.Commit()
+}
+
+func recipientHash(email string) string { return HashToken(NormalizeEmail(email)) }
+
+// RecipientKey names an alert recipient in a usage counter, without the
+// address.
+func RecipientKey(email string) string { return recipientHash(email)[:32] }
+
+// AlertStopToken returns the token for the opt-out link of an address,
+// making one the first time.
+func (s *Store) AlertStopToken(ctx context.Context, email string) (string, error) {
+	hash := recipientHash(email)
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO alert_recipients (token, email_hash, created_at) VALUES (?, ?, ?)
+		ON CONFLICT(email_hash) DO NOTHING`, NewToken(32), hash, s.Now().Unix()); err != nil {
+		return "", err
+	}
+	var token string
+	err := s.DB.QueryRowContext(ctx, `SELECT token FROM alert_recipients WHERE email_hash = ?`, hash).Scan(&token)
+	return token, err
+}
+
+// AlertStopKnown reports whether an opt-out token is real.
+func (s *Store) AlertStopKnown(ctx context.Context, token string) (bool, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM alert_recipients WHERE token = ?`, token).Scan(&n)
+	return n > 0, err
+}
+
+// StopAlerts opts the token's address out of every alert from this instance.
+// It returns ErrNotFound for an unknown token.
+func (s *Store) StopAlerts(ctx context.Context, token string) error {
+	res, err := s.DB.ExecContext(ctx, `UPDATE alert_recipients SET stopped_at = ? WHERE token = ? AND stopped_at = 0`, s.Now().Unix(), token)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		if known, err := s.AlertStopKnown(ctx, token); err != nil {
+			return err
+		} else if !known {
+			return ErrNotFound
+		}
+	}
+	return nil
+}
+
+// AlertsStopped reports whether an address opted out of alerts.
+func (s *Store) AlertsStopped(ctx context.Context, email string) (bool, error) {
+	var n int
+	err := s.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM alert_recipients WHERE email_hash = ? AND stopped_at != 0`, recipientHash(email)).Scan(&n)
+	return n > 0, err
 }
 
 // Alert statuses.
@@ -281,6 +385,7 @@ const (
 	AlertSent    = "sent"
 	AlertFailed  = "failed"
 	AlertCapped  = "capped"
+	AlertStopped = "stopped"
 )
 
 // Alert is one alert email, stored before it is sent.
@@ -318,19 +423,36 @@ func scanAlert(row interface{ Scan(...any) error }) (Alert, error) {
 	return a, err
 }
 
-// AddAlert stores a pending alert, assigning its ID. It returns false when an
-// alert of the same kind and key already exists for the publication, which
-// is how each alert is sent once.
-func (s *Store) AddAlert(ctx context.Context, a *Alert) (bool, error) {
+// AddAlert stores an alert, assigning its ID. It returns false when an alert
+// of the same kind and key already exists for the publication, which is how
+// each alert is sent once. A new alert is counted against caps in the same
+// transaction: it is stored pending, or capped when one has no room, so no
+// crash or heartbeat can see one that was never counted.
+func (s *Store) AddAlert(ctx context.Context, a *Alert, caps ...Cap) (bool, error) {
 	a.ID, a.Status, a.CreatedAt = "alr_"+NewToken(8), AlertPending, s.Now().UTC().Truncate(time.Second)
-	res, err := s.DB.ExecContext(ctx, `INSERT INTO alerts (id, publication_id, kind, key, report_id, to_addr, subject, text_body, html_body, status, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(publication_id, kind, key) DO NOTHING`,
-		a.ID, a.PublicationID, a.Kind, a.Key, a.ReportID, a.To, a.Subject, a.Text, a.HTML, a.Status, a.CreatedAt.Unix())
+	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
-	n, err := res.RowsAffected()
-	return n == 1, err
+	defer tx.Rollback() //nolint:errcheck // a no-op after commit
+	var dup int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM alerts WHERE publication_id = ? AND kind = ? AND key = ?`, a.PublicationID, a.Kind, a.Key).Scan(&dup); err != nil {
+		return false, err
+	}
+	if dup > 0 {
+		return false, nil
+	}
+	if _, err := s.takeAll(ctx, tx, caps); errors.Is(err, ErrLimit) {
+		a.Status = AlertCapped
+	} else if err != nil {
+		return false, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO alerts (id, publication_id, kind, key, report_id, to_addr, subject, text_body, html_body, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID, a.PublicationID, a.Kind, a.Key, a.ReportID, a.To, a.Subject, a.Text, a.HTML, a.Status, a.CreatedAt.Unix()); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 // HasAlert reports whether an alert of this kind and key exists.
@@ -350,6 +472,12 @@ func (s *Store) SetAlertStatus(ctx context.Context, id, status, errText string) 
 	return err
 }
 
+// RetryAlert puts a claimed alert back to pending, to be tried at next.
+func (s *Store) RetryAlert(ctx context.Context, id, errText string, next time.Time) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE alerts SET status = ?, error = ?, next_attempt_at = ? WHERE id = ?`, AlertPending, errText, next.Unix(), id)
+	return err
+}
+
 // ClaimAlert marks a pending alert as sending and returns it, or ErrNotFound
 // when it is not pending (another sender has it, or it is done). Only the
 // caller that claims an alert sends it.
@@ -358,9 +486,10 @@ func (s *Store) ClaimAlert(ctx context.Context, id string) (Alert, error) {
 		WHERE id = ? AND status = ? RETURNING `+alertCols, AlertSending, s.Now().Unix(), id, AlertPending))
 }
 
-// PendingAlerts lists alerts waiting to be sent (or retried), oldest first.
+// PendingAlerts lists alerts due to be sent (or retried), oldest first.
 func (s *Store) PendingAlerts(ctx context.Context, limit int) ([]Alert, error) {
-	return s.queryAlerts(ctx, `SELECT `+alertCols+` FROM alerts WHERE status = ? ORDER BY created_at, rowid LIMIT ?`, AlertPending, limit)
+	return s.queryAlerts(ctx, `SELECT `+alertCols+` FROM alerts WHERE status = ? AND next_attempt_at <= ? ORDER BY created_at, rowid LIMIT ?`,
+		AlertPending, s.Now().Unix(), limit)
 }
 
 // FailStaleAlerts marks alerts claimed before cutoff and never finished as

@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,7 +68,7 @@ func fillAccount(t *testing.T, s *Store, email string) User {
 		must(err)
 	}
 	must(s.PutSubscription(ctx, Subscription{UserID: u.ID, CustomerID: "cust_" + u.ID, SubscriptionID: "sub_" + u.ID, Status: SubActive}))
-	_, err = s.RecordCreemEvent(ctx, CreemEvent{ID: "evt_" + u.ID, Kind: "subscription.paid", UserID: u.ID, Body: "{}"})
+	_, err = s.RecordCreemEvent(ctx, CreemEvent{ID: "evt_" + u.ID, Kind: "subscription.paid", UserID: u.ID, Body: `{"customer":{"email":"gone@example.com"}}`})
 	must(err)
 	return u
 }
@@ -110,6 +111,10 @@ func TestDeleteUserRemovesEveryRow(t *testing.T) {
 	u := fillAccount(t, s, "gone@example.com")
 	filled := tableCounts(t, s)
 	for table, n := range before {
+		// Opt-outs hold no address and belong to no account.
+		if table == "alert_recipients" {
+			continue
+		}
 		if filled[table] <= n {
 			t.Errorf("the fill left %s empty for the account, so the test does not cover it", table)
 		}
@@ -131,7 +136,7 @@ func TestDeleteUserRemovesEveryRow(t *testing.T) {
 		}
 	}
 	e, err := s.CreemEventByID(ctx, "evt_"+u.ID)
-	if err != nil || e.UserID != "" {
+	if err != nil || e.UserID != "" || strings.Contains(e.Body, "@") {
 		t.Errorf("creem event = %+v %v, want kept with no account", e, err)
 	}
 	if ok, _ := s.UserIDExists(ctx, u.ID); ok {

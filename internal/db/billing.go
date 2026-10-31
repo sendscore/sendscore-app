@@ -24,23 +24,35 @@ func GoodStanding(status string) bool { return status == SubActive || status == 
 // Pro when the operator granted it (users.plan) or its subscription is in
 // good standing. It is lapsed when it is not Pro and its subscription ended,
 // which is what stops its newsletters' alerts and heartbeat.
-const (
-	planExpr   = `CASE WHEN u.plan = 'pro' OR s.status IN ('active', 'past_due') THEN 'pro' ELSE 'free' END`
-	compedExpr = `u.plan = 'pro'`
-	lapsedExpr = `(u.plan != 'pro' AND COALESCE(s.status IN ('paused', 'cancelled'), 0))`
-)
+// With AllPro every account is Pro and none is lapsed, whatever it holds.
+func (s *Store) planExpr() string {
+	if s.AllPro {
+		return `'pro'`
+	}
+	return `CASE WHEN u.plan = 'pro' OR s.status IN ('active', 'past_due') THEN 'pro' ELSE 'free' END`
+}
+
+func (s *Store) lapsedExpr() string {
+	if s.AllPro {
+		return `0`
+	}
+	return `(u.plan != 'pro' AND COALESCE(s.status IN ('paused', 'cancelled'), 0))`
+}
+
+const compedExpr = `u.plan = 'pro'`
 
 // userCols and userTable read a User with the plan in effect.
-const (
-	userCols  = `u.id, u.email, ` + planExpr + `, ` + compedExpr + `, ` + lapsedExpr + `, u.created_at`
-	userTable = `users u LEFT JOIN subscriptions s ON s.user_id = u.id`
-)
+func (s *Store) userCols() string {
+	return `u.id, u.email, ` + s.planExpr() + `, ` + compedExpr + `, ` + s.lapsedExpr() + `, u.created_at`
+}
+
+const userTable = `users u LEFT JOIN subscriptions s ON s.user_id = u.id`
 
 // PlanOf returns the plan in effect for a user id, or PlanFree for an id
 // with no account.
 func (s *Store) PlanOf(ctx context.Context, userID string) (string, error) {
 	var plan string
-	err := s.DB.QueryRowContext(ctx, `SELECT `+planExpr+` FROM `+userTable+` WHERE u.id = ?`, userID).Scan(&plan)
+	err := s.DB.QueryRowContext(ctx, `SELECT `+s.planExpr()+` FROM `+userTable+` WHERE u.id = ?`, userID).Scan(&plan)
 	if errors.Is(err, sql.ErrNoRows) {
 		return PlanFree, nil
 	}
@@ -149,8 +161,11 @@ type CreemEvent struct {
 	Body       string
 }
 
-// RecordCreemEvent stores an event and reports whether it is new. The id is
-// the primary key, so of two deliveries of one event only one is new.
+// RecordCreemEvent stores an event and reports whether it should be applied:
+// it is new, or it was recorded and never marked applied, as when the process
+// stopped in between. The id is the primary key, so an event already applied
+// is never applied again. Applying one twice is harmless, because the
+// subscription's event mark orders them.
 func (s *Store) RecordCreemEvent(ctx context.Context, e CreemEvent) (bool, error) {
 	var uid, at any
 	if e.UserID != "" {
@@ -163,13 +178,25 @@ func (s *Store) RecordCreemEvent(ctx context.Context, e CreemEvent) (bool, error
 	if len(body) > MaxEventBody {
 		body = body[:MaxEventBody]
 	}
-	res, err := s.DB.ExecContext(ctx, `INSERT INTO creem_events (id, kind, user_id, received_at, event_at, body)
-		VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING`, e.ID, e.Kind, uid, s.Now().Unix(), at, body)
+	res, err := s.DB.ExecContext(ctx, `INSERT INTO creem_events (id, kind, user_id, received_at, event_at, body, applied)
+		VALUES (?, ?, ?, ?, ?, ?, 0) ON CONFLICT(id) DO NOTHING`, e.ID, e.Kind, uid, s.Now().Unix(), at, body)
 	if err != nil {
 		return false, err
 	}
-	n, err := res.RowsAffected()
-	return n == 1, err
+	if n, err := res.RowsAffected(); err != nil || n == 1 {
+		return n == 1, err
+	}
+	var applied bool
+	if err := s.DB.QueryRowContext(ctx, `SELECT applied FROM creem_events WHERE id = ?`, e.ID).Scan(&applied); err != nil {
+		return false, err
+	}
+	return !applied, nil
+}
+
+// MarkCreemEventApplied records that an event's effect is in the database.
+func (s *Store) MarkCreemEventApplied(ctx context.Context, id string) error {
+	_, err := s.DB.ExecContext(ctx, `UPDATE creem_events SET applied = 1 WHERE id = ?`, id)
+	return err
 }
 
 // ForgetCreemEvent deletes a recorded event, so a retry of one that could

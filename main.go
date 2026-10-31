@@ -85,16 +85,10 @@ func main() {
 	} else if n > 0 {
 		log.Info("accounts moved to the pro plan", "count", n)
 	}
-	// Without billing nothing is for sale, so nobody is held to the free limits.
+	// Without billing nothing is for sale, so nobody is held to the free
+	// limits. This is read with each plan and never written to an account.
 	billingClient := creem(log)
-	if billingClient == nil {
-		if n, err := store.PromoteAll(context.Background()); err != nil {
-			log.Error("pro accounts", "err", err)
-			os.Exit(1)
-		} else if n > 0 {
-			log.Info("accounts moved to the pro plan", "count", n)
-		}
-	}
+	store.AllPro = billingClient == nil
 	historyDays := getpos(log, "SENDSCORE_HISTORY_DAYS", 365)
 	mon := &monitor.Monitor{
 		Store: store, Mailer: alerter, BaseURL: baseURL, Log: log,
