@@ -34,4 +34,6 @@ USER nonroot:nonroot
 # The app gives open sessions up to a minute on SIGTERM, so stop with a
 # timeout over 60 seconds (docker stop -t 90, or stop_grace_period: 90s).
 STOPSIGNAL SIGTERM
+# The image has no shell or curl, so the binary checks itself.
+HEALTHCHECK --interval=30s --timeout=6s --start-period=15s CMD ["/usr/local/bin/sendscore-app", "healthcheck"]
 ENTRYPOINT ["/usr/local/bin/sendscore-app"]

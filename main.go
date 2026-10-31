@@ -7,8 +7,11 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -33,6 +36,9 @@ func main() {
 	loadDotEnv(".env.local")
 	loadDotEnv(".env")
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	if len(os.Args) > 1 {
+		os.Exit(command(os.Args[1:], os.Stdout, os.Stderr))
+	}
 
 	dbPath := getenv("SENDSCORE_DB", "sendscore.db")
 	store, err := db.Open(dbPath)
@@ -54,8 +60,8 @@ func main() {
 		log.Error(err.Error())
 		os.Exit(1)
 	}
-	if secureCookies && os.Getenv("SENDSCORE_BASE_URL") == "" {
-		log.Error("SENDSCORE_BASE_URL is required when SENDSCORE_SECURE_COOKIES=true")
+	if err := checkConfig(baseURL, mailDomain, secureCookies); err != nil {
+		log.Error(err.Error())
 		os.Exit(1)
 	}
 
@@ -89,6 +95,12 @@ func main() {
 	// limits. This is read with each plan and never written to an account.
 	billingClient := creem(log)
 	store.AllPro = billingClient == nil
+	store.RawKeep = time.Duration(getpos(log, "SENDSCORE_RAW_DAYS", 30)) * 24 * time.Hour
+	closedSignups, err := signupsClosed(os.Getenv("SENDSCORE_SIGNUPS"), billingClient != nil)
+	if err != nil {
+		log.Error(err.Error())
+		os.Exit(1)
+	}
 	historyDays := getpos(log, "SENDSCORE_HISTORY_DAYS", 365)
 	mon := &monitor.Monitor{
 		Store: store, Mailer: alerter, BaseURL: baseURL, Log: log,
@@ -98,7 +110,12 @@ func main() {
 		PerHour:      getpos(log, "SENDSCORE_ALERTS_PER_HOUR", monitor.DefaultAlertsPerHour),
 	}
 
-	trustProxy := os.Getenv("SENDSCORE_TRUST_PROXY") == "1"
+	trustProxy := getbool(log, "SENDSCORE_TRUST_PROXY", false)
+	trustedProxies, err := parseProxies(os.Getenv("SENDSCORE_TRUSTED_PROXIES"))
+	if err != nil {
+		log.Error(err.Error())
+		os.Exit(1)
+	}
 	if needsProxyWarning(baseURL, trustProxy) {
 		// Behind a proxy every visitor would share the proxy's address, so
 		// one person could use up the sign-in and anonymous limits for all.
@@ -106,20 +123,31 @@ func main() {
 			"and one person can use up the sign-in and anonymous limits for everyone. Set SENDSCORE_TRUST_PROXY=1 behind a proxy, and only then.")
 	}
 
-	lists := blocklists()
+	lists := blocklists(log)
 	// Links are fetched with the engine's safe client, which refuses
 	// non-public addresses and never follows unsubscribe or confirm links.
-	checkLinks := os.Getenv("SENDSCORE_CHECK_LINKS") != "0"
+	checkLinks := getbool(log, "SENDSCORE_CHECK_LINKS", true)
+	dailyBytes := getpos(log, "SENDSCORE_DAILY_MB", 1024) << 20
+	maxStorage := int64(getpos(log, "SENDSCORE_MAX_STORAGE_MB", 10240)) << 20
+	started := time.Now()
 	app, err := web.New(web.Config{
-		Blocklists:           lists,
-		CheckLinks:           checkLinks,
-		BehindProxy:          !isLocal(baseURL),
-		TrustProxy:           trustProxy,
+		Blocklists:      lists,
+		CheckLinks:      checkLinks,
+		BehindProxy:     !isLocal(baseURL),
+		TrustProxy:      trustProxy,
+		TrustedProxies:  trustedProxies,
+		ClosedSignups:   closedSignups,
+		AnonDailyTotal:  getpos(log, "SENDSCORE_ANON_DAILY_TOTAL", web.DefaultAnonDailyTotal),
+		DailyBytes:      dailyBytes,
+		MaxStorageBytes: maxStorage,
+		Health: func(ctx context.Context) error {
+			return checkHealth(ctx, mon.LastTick(), started, time.Now(), smtpAddr)
+		},
 		SecureCookies:        secureCookies,
 		Mailer:               mailer,
 		FreeDailyTests:       getint(log, "SENDSCORE_FREE_DAILY_TESTS", 25),
 		ProDailyTests:        getpos(log, "SENDSCORE_PRO_DAILY_TESTS", web.DefaultProDailyTests),
-		AnonDailyTests:       getint(log, "SENDSCORE_ANON_DAILY_TESTS", 5),
+		AnonDailyTests:       getint(log, "SENDSCORE_ANON_DAILY_TESTS", anonDefault(closedSignups, isLocal(baseURL))),
 		SigninEmailsPerHour:  getpos(log, "SENDSCORE_SIGNIN_EMAILS_PER_HOUR", 200),
 		RegistrationsPerHour: getpos(log, "SENDSCORE_OAUTH_REGISTRATIONS_PER_HOUR", 600),
 		ProPublications:      getpos(log, "SENDSCORE_PRO_PUBLICATIONS", web.DefaultProPublications),
@@ -164,6 +192,12 @@ func main() {
 		MaxSessions:        getpos(log, "SENDSCORE_SMTP_SESSIONS", receiver.DefaultMaxSessions),
 		MaxSessionsPerIP:   getpos(log, "SENDSCORE_SMTP_SESSIONS_PER_IP", receiver.DefaultMaxSessionsPerIP),
 
+		DailyBytes:        dailyBytes,
+		AnonDailyMessages: getpos(log, "SENDSCORE_ANON_DAILY_MESSAGES", receiver.DefaultAnonDailyMessages),
+		MaxStorageBytes:   maxStorage,
+		MaxBufferedBytes:  int64(getpos(log, "SENDSCORE_SMTP_BUFFER_MB", receiver.DefaultMaxBufferedBytes>>20)) << 20,
+		MaxAnalyzing:      getpos(log, "SENDSCORE_SMTP_ANALYZING", receiver.DefaultMaxAnalyzing),
+
 		PublicationDailyMessages: getpos(log, "SENDSCORE_PUBLICATION_DAILY_MESSAGES", receiver.DefaultPublicationDailyMessages),
 		HistoryTTL:               time.Duration(historyDays) * 24 * time.Hour,
 		Monitor:                  mon,
@@ -194,26 +228,176 @@ func main() {
 			os.Exit(1)
 		}
 	}()
-	go sweep(ctx, store, log)
+	var background sync.WaitGroup
+	background.Go(func() { sweep(ctx, store, log) })
 	// The heartbeat: missed issues, and alerts waiting to be sent.
-	go mon.Run(ctx)
+	background.Go(func() { mon.Run(ctx) })
 
 	<-ctx.Done()
+	// A second signal now stops the process at once.
+	stop()
 	// Open long polls answer not_received at once, so agents call again
-	// instead of seeing a reset. Uploads and SMTP sessions in DATA get up to
-	// a minute to finish their checks (45 seconds) and save; a session
-	// still open after that, such as an idle one, is dropped, and the sender
-	// retries. A process manager's stop timeout must allow for that minute.
+	// instead of seeing a reset. Uploads and SMTP sessions in DATA get
+	// shutdownGrace to finish their checks (45 seconds), save (10), and send
+	// any alert (10); a session still open after that, such as an idle one,
+	// is dropped when the process exits, and the sender retries. A process
+	// manager's stop timeout must allow for it. The heartbeat and the sweep
+	// finish before the database closes, so no send loses its status.
 	log.Info("shutting down")
 	app.StopWaits()
-	shutdown, cancel := context.WithTimeout(context.Background(), time.Minute)
+	shutdown, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); _ = srv.Shutdown(shutdown) }()
-	go func() { defer wg.Done(); _ = rcv.Shutdown(shutdown) }()
+	wg.Go(func() { _ = srv.Shutdown(shutdown) })
+	wg.Go(func() { _ = rcv.Shutdown(shutdown) })
 	wg.Wait()
-	_ = rcv.Close()
+	done := make(chan struct{})
+	go func() { background.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(backgroundGrace):
+		log.Warn("the heartbeat or the sweep did not stop in time")
+	}
+}
+
+// How long shutdown waits for sessions, then for the heartbeat and the sweep.
+// Together they stay under the 90 seconds compose.yaml gives the process.
+const (
+	shutdownGrace   = 70 * time.Second
+	backgroundGrace = 15 * time.Second
+)
+
+// maxTickAge is how long the heartbeat may go quiet before /healthz fails.
+const maxTickAge = 5 * time.Minute
+
+// checkHealth is what /healthz adds to the database check: the heartbeat ran
+// recently, and the SMTP listener takes connections.
+func checkHealth(ctx context.Context, last, started, now time.Time, smtpAddr string) error {
+	if last.IsZero() {
+		last = started
+	}
+	if age := now.Sub(last); age > maxTickAge {
+		return fmt.Errorf("the heartbeat last ran %s ago", age.Round(time.Second))
+	}
+	d := net.Dialer{Timeout: 2 * time.Second}
+	c, err := d.DialContext(ctx, "tcp", localAddr(smtpAddr))
+	if err != nil {
+		return fmt.Errorf("smtp listener: %w", err)
+	}
+	return c.Close()
+}
+
+// localAddr is how this machine reaches a listen address.
+func localAddr(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// command runs a subcommand and returns the exit code: healthcheck, for
+// Docker's HEALTHCHECK, since the image has no shell or curl, and backup, for
+// a consistent copy of the live database.
+func command(args []string, stdout, stderr io.Writer) int {
+	switch {
+	case args[0] == "healthcheck" && len(args) == 1:
+		c := http.Client{Timeout: 5 * time.Second}
+		res, err := c.Get("http://" + localAddr(getenv("SENDSCORE_ADDR", "127.0.0.1:3014")) + "/healthz")
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			fmt.Fprintln(stderr, "unhealthy:", res.Status)
+			return 1
+		}
+		fmt.Fprintln(stdout, "ok")
+		return 0
+	case args[0] == "backup" && len(args) == 2:
+		store, err := db.Open(getenv("SENDSCORE_DB", "sendscore.db"))
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		defer store.Close()
+		if err := store.Backup(context.Background(), args[1]); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 1
+		}
+		fmt.Fprintln(stdout, "wrote", args[1])
+		return 0
+	}
+	fmt.Fprintln(stderr, "usage: sendscore-app [healthcheck | backup <new file>]")
+	return 64
+}
+
+// checkConfig refuses settings that would start cleanly and then fail for
+// every visitor.
+func checkConfig(baseURL, mailDomain string, secureCookies bool) error {
+	u, err := url.Parse(baseURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("SENDSCORE_BASE_URL must be a full URL such as https://sendscore.example.com, not %q", baseURL)
+	}
+	if !secureCookies {
+		return nil
+	}
+	if u.Scheme != "https" {
+		return errors.New("SENDSCORE_SECURE_COOKIES needs an https SENDSCORE_BASE_URL, since a browser drops these cookies over http")
+	}
+	if mailDomain == "localhost" {
+		return errors.New("SENDSCORE_MAIL_DOMAIN is required in production: without it, test addresses end in @localhost and mail for your domain is refused")
+	}
+	return nil
+}
+
+// signupsClosed reads SENDSCORE_SIGNUPS: open or closed, and when unset,
+// closed unless billing is on. An instance that sells nothing has Pro limits
+// for everyone, which suit its operator and not the whole internet.
+func signupsClosed(setting string, billing bool) (bool, error) {
+	switch setting {
+	case "open":
+		return false, nil
+	case "closed":
+		return true, nil
+	case "":
+		return !billing, nil
+	}
+	return false, fmt.Errorf("SENDSCORE_SIGNUPS must be open or closed, not %q", setting)
+}
+
+// anonDefault is SENDSCORE_ANON_DAILY_TESTS when unset: off for a public
+// instance with closed sign-ups, whose visitors have no reason to be here.
+func anonDefault(closedSignups, local bool) int {
+	if closedSignups && !local {
+		return 0
+	}
+	return 5
+}
+
+// parseProxies reads SENDSCORE_TRUSTED_PROXIES, comma separated addresses or
+// CIDR ranges, or nil for the default.
+func parseProxies(s string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p == "" {
+			continue
+		}
+		if addr, err := netip.ParseAddr(p); err == nil {
+			out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
+			continue
+		}
+		prefix, err := netip.ParsePrefix(p)
+		if err != nil {
+			return nil, fmt.Errorf("SENDSCORE_TRUSTED_PROXIES: %q is not an address or a CIDR range", p)
+		}
+		out = append(out, prefix)
+	}
+	return out, nil
 }
 
 // creem reads the Creem settings and returns the billing client, or nil
@@ -265,9 +449,9 @@ func sweep(ctx context.Context, store *db.Store, log *slog.Logger) {
 // blocklists reads which domain blocklists to use. The free public zones
 // are for non-commercial use, so a commercial instance uses a Spamhaus DQS key;
 // a personal self-hosted instance may turn the public zones on instead.
-func blocklists() []engine.Blocklist {
+func blocklists(log *slog.Logger) []engine.Blocklist {
 	var out []engine.Blocklist
-	public := os.Getenv("SENDSCORE_PUBLIC_BLOCKLISTS") == "1"
+	public := getbool(log, "SENDSCORE_PUBLIC_BLOCKLISTS", false)
 	switch key := os.Getenv("SENDSCORE_SPAMHAUS_DQS_KEY"); {
 	case key != "":
 		out = append(out, engine.SpamhausDQS(key))
@@ -283,18 +467,39 @@ func blocklists() []engine.Blocklist {
 	return out
 }
 
-// secureCookiesFor reads SENDSCORE_SECURE_COOKIES: true or false, and when
-// unset, on for an https base URL.
-func secureCookiesFor(baseURL, setting string) (bool, error) {
-	switch setting {
-	case "true":
+// parseBool reads a yes or no setting: 1 or true, 0 or false. Anything else is
+// an error, so a misspelled setting never silently means off.
+func parseBool(key, value string) (bool, error) {
+	switch value {
+	case "1", "true":
 		return true, nil
-	case "false":
+	case "0", "false":
 		return false, nil
-	case "":
+	}
+	return false, fmt.Errorf("%s must be true or false, not %q", key, value)
+}
+
+// getbool reads a yes or no setting, exiting on anything else.
+func getbool(log *slog.Logger, key string, fallback bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	b, err := parseBool(key, v)
+	if err != nil {
+		log.Error(err.Error())
+		os.Exit(1)
+	}
+	return b
+}
+
+// secureCookiesFor reads SENDSCORE_SECURE_COOKIES, which when unset is on for
+// an https base URL.
+func secureCookiesFor(baseURL, setting string) (bool, error) {
+	if setting == "" {
 		return strings.HasPrefix(baseURL, "https://"), nil
 	}
-	return false, fmt.Errorf("SENDSCORE_SECURE_COOKIES must be true or false, not %q", setting)
+	return parseBool("SENDSCORE_SECURE_COOKIES", setting)
 }
 
 // needsProxyWarning reports whether a public site runs without trusting the
