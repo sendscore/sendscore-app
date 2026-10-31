@@ -100,14 +100,19 @@ func TestDescribe(t *testing.T) {
 }
 
 func TestIsSignup(t *testing.T) {
-	for _, s := range []string{"Please confirm your subscription", "Welcome to The Friday Letter", "You’re subscribed!", "Verify your email"} {
-		if !IsSignup(s) {
+	for _, s := range []string{"Please confirm your subscription", "You’re subscribed!", "Verify your email"} {
+		if !IsSignup(s, false) {
 			t.Errorf("IsSignup(%q) = false", s)
 		}
 	}
-	for _, s := range []string{"Shooting into the sun", "Issue 42: what we shipped"} {
-		if IsSignup(s) {
-			t.Errorf("IsSignup(%q) = true", s)
+	for _, s := range []string{"Shooting into the sun", "Issue 42: what we shipped", "How to verify your sending domain",
+		"Welcome back: our fall issue", "Confirmed: rates hold steady", "Reactivate lapsed subscribers"} {
+		if IsSignup(s, false) {
+			t.Errorf("IsSignup(%q) = true for a publication with issues", s)
 		}
+	}
+	// A looser match holds only before the first issue.
+	if !IsSignup("Welcome to The Friday Letter", true) || IsSignup("Issue 1", true) {
+		t.Error("first message of a publication")
 	}
 }

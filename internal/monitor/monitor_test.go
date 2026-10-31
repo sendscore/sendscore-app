@@ -362,6 +362,7 @@ func TestFailedAlertIsRetriedByTheHeartbeat(t *testing.T) {
 	}
 	f.out.setFail(false)
 	f.mon = f.newMonitor() // as after a restart
+	f.clock.Set(f.clock.Now().Add(time.Minute))
 	f.mon.Tick(context.Background())
 	f.mon.Tick(context.Background())
 	if n := len(f.out.all()); n != 1 {

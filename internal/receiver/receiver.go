@@ -527,18 +527,18 @@ func (r *Receiver) preparePublication(ctx context.Context, p db.Publication, m *
 	if p.OwnerPlan == db.PlanPro {
 		m.ExpiresAt = m.ReceivedAt.Add(r.cfg.HistoryTTL)
 	}
-	if monitor.IsSignup(subject(raw)) {
+	prev, err := r.store.LatestIssue(ctx, p.ID)
+	if err != nil && !errors.Is(err, db.ErrNotFound) {
+		r.log.Error("previous issue", "publication", p.ID, "err", err)
+	}
+	if monitor.IsSignup(subject(raw), errors.Is(err, db.ErrNotFound)) {
 		m.Kind = db.KindSignup
 		return nil
 	}
 	if s, ok := monitor.ScheduleOf(p); ok {
 		m.SlotAt, m.Late = s.Place(m.ReceivedAt)
 	}
-	prev, err := r.store.LatestIssue(ctx, p.ID)
 	if err != nil {
-		if !errors.Is(err, db.ErrNotFound) {
-			r.log.Error("previous issue", "publication", p.ID, "err", err)
-		}
 		return nil
 	}
 	opts.Previous = prev.Verdict.Fingerprint

@@ -68,7 +68,7 @@ func (s Schedule) slots(from, to time.Time) []time.Time {
 	for i := -1; ; i++ {
 		// Noon is never skipped or repeated by a time change.
 		day := time.Date(start.Year(), start.Month(), start.Day()+i, 12, 0, 0, 0, s.Loc)
-		slot := time.Date(day.Year(), day.Month(), day.Day(), s.Hour, s.Minute, 0, 0, s.Loc)
+		slot := s.at(day)
 		if slot.After(to) && day.After(to) {
 			return out
 		}
@@ -170,4 +170,22 @@ func list(words []string) string {
 		return words[0] + " and " + words[1]
 	}
 	return strings.Join(words[:len(words)-1], ", ") + ", and " + words[len(words)-1]
+}
+
+// at is the schedule's local time on day's date. A time skipped by a change
+// to summer time becomes the first moment after the gap, so the slot never
+// comes before the send it stands for.
+func (s Schedule) at(day time.Time) time.Time {
+	t := time.Date(day.Year(), day.Month(), day.Day(), s.Hour, s.Minute, 0, 0, s.Loc)
+	if t.Hour() == s.Hour && t.Minute() == s.Minute {
+		return t
+	}
+	start, end := t.ZoneBounds()
+	// Go resolves a skipped time with one of the two offsets, so t is on
+	// one side of the gap or the other.
+	wall := time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), 0, 0, time.UTC)
+	if wall.Before(time.Date(day.Year(), day.Month(), day.Day(), s.Hour, s.Minute, 0, 0, time.UTC)) {
+		return end
+	}
+	return start
 }

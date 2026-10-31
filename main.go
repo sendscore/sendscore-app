@@ -68,7 +68,7 @@ func main() {
 		os.Exit(1)
 	case ok:
 		mailer, alerter = ses, ses
-		log.Info("sign-in email and alerts via SES", "from", ses.From(), "alerts_from", mail.AlertFrom())
+		log.Info("sign-in email and alerts via SES", "from", ses.From(), "alerts_from", ses.AlertFrom())
 	case secureCookies:
 		// A production log must never hold working sign-in links.
 		log.Error("SES_ACCESS_KEY_ID and SES_SECRET_ACCESS_KEY are required when SENDSCORE_SECURE_COOKIES=true")
@@ -92,7 +92,10 @@ func main() {
 	historyDays := getpos(log, "SENDSCORE_HISTORY_DAYS", 365)
 	mon := &monitor.Monitor{
 		Store: store, Mailer: alerter, BaseURL: baseURL, Log: log,
-		PerDay: getpos(log, "SENDSCORE_ALERTS_PER_DAY", monitor.DefaultAlertsPerDay),
+		PerDay:       getpos(log, "SENDSCORE_ALERTS_PER_DAY", monitor.DefaultAlertsPerDay),
+		PerAccount:   getpos(log, "SENDSCORE_ALERTS_PER_ACCOUNT", monitor.DefaultAlertsPerAccount),
+		PerRecipient: getpos(log, "SENDSCORE_ALERTS_PER_RECIPIENT", monitor.DefaultAlertsPerRecipient),
+		PerHour:      getpos(log, "SENDSCORE_ALERTS_PER_HOUR", monitor.DefaultAlertsPerHour),
 	}
 
 	trustProxy := os.Getenv("SENDSCORE_TRUST_PROXY") == "1"

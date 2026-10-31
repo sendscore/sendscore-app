@@ -5,6 +5,7 @@ package mail
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -59,14 +60,18 @@ func (l Log) SendAlert(_ context.Context, a Alert) error {
 }
 
 // FromEnv returns an SES sender from SES_ACCESS_KEY_ID, SES_SECRET_ACCESS_KEY,
-// SES_REGION (default us-east-1), SENDSCORE_MAIL_FROM (default
-// "SendScore <hello@sendscore.ai>"), and SENDSCORE_ALERT_FROM (default
-// "SendScore alerts <alerts@sendscore.ai>"), or ok false when the keys are
-// not set.
+// SES_REGION (default us-east-1), SENDSCORE_MAIL_FROM, and
+// SENDSCORE_ALERT_FROM, or ok false when the keys are not set. Both senders
+// are required with the keys, since SES refuses any address it has not
+// verified for this account, and that would stop every sign-in.
 func FromEnv(ctx context.Context) (s *SES, ok bool, err error) {
 	id, secret := os.Getenv("SES_ACCESS_KEY_ID"), os.Getenv("SES_SECRET_ACCESS_KEY")
 	if id == "" || secret == "" {
 		return nil, false, nil
+	}
+	from, alertFrom := os.Getenv("SENDSCORE_MAIL_FROM"), os.Getenv("SENDSCORE_ALERT_FROM")
+	if from == "" || alertFrom == "" {
+		return nil, false, errors.New("SENDSCORE_MAIL_FROM and SENDSCORE_ALERT_FROM are required with the SES keys: set both to addresses SES has verified")
 	}
 	cfg, err := config.LoadDefaultConfig(ctx,
 		config.WithRegion(getenv("SES_REGION", "us-east-1")),
@@ -75,13 +80,19 @@ func FromEnv(ctx context.Context) (s *SES, ok bool, err error) {
 	if err != nil {
 		return nil, false, err
 	}
-	return &SES{client: sesv2.NewFromConfig(cfg), from: getenv("SENDSCORE_MAIL_FROM", "SendScore <hello@sendscore.ai>"),
-		alertFrom: AlertFrom()}, true, nil
+	return &SES{client: sesv2.NewFromConfig(cfg), from: from, alertFrom: alertFrom}, true, nil
 }
 
 // AlertFrom is the sender of alerts.
-func AlertFrom() string {
-	return getenv("SENDSCORE_ALERT_FROM", "SendScore alerts <alerts@sendscore.ai>")
+func (s *SES) AlertFrom() string { return s.alertFrom }
+
+// Permanent reports whether SES refused a send in a way trying again cannot
+// fix, as opposed to an outage or throttling.
+func Permanent(err error) bool {
+	var rejected *types.MessageRejected
+	var bad *types.BadRequestException
+	var domain *types.MailFromDomainNotVerifiedException
+	return errors.As(err, &rejected) || errors.As(err, &bad) || errors.As(err, &domain)
 }
 
 // From is the sender address.
@@ -89,22 +100,8 @@ func (s *SES) From() string { return s.from }
 
 // SendAlert implements Alerter.
 func (s *SES) SendAlert(ctx context.Context, a Alert) error {
-	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
-	defer cancel()
-	_, err := s.client.SendEmail(ctx, &sesv2.SendEmailInput{
-		FromEmailAddress: aws.String(s.alertFrom),
-		Destination:      &types.Destination{ToAddresses: []string{a.To}},
-		Content: &types.EmailContent{
-			Simple: &types.Message{
-				Subject: &types.Content{Data: aws.String(a.Subject), Charset: aws.String("UTF-8")},
-				Body: &types.Body{
-					Text: &types.Content{Data: aws.String(a.Text), Charset: aws.String("UTF-8")},
-					Html: &types.Content{Data: aws.String(a.HTML), Charset: aws.String("UTF-8")},
-				},
-			},
-		},
-	})
-	if err != nil {
+	body := &types.Body{Text: content(a.Text), Html: content(a.HTML)}
+	if err := s.send(ctx, s.alertFrom, a.To, a.Subject, body); err != nil {
 		return fmt.Errorf("send alert: %w", err)
 	}
 	return nil
@@ -112,22 +109,25 @@ func (s *SES) SendAlert(ctx context.Context, a Alert) error {
 
 // Send implements Sender.
 func (s *SES) Send(ctx context.Context, to, subject, body string) error {
-	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
-	defer cancel()
-	_, err := s.client.SendEmail(ctx, &sesv2.SendEmailInput{
-		FromEmailAddress: aws.String(s.from),
-		Destination:      &types.Destination{ToAddresses: []string{to}},
-		Content: &types.EmailContent{
-			Simple: &types.Message{
-				Subject: &types.Content{Data: aws.String(subject)},
-				Body:    &types.Body{Text: &types.Content{Data: aws.String(body)}},
-			},
-		},
-	})
-	if err != nil {
+	if err := s.send(ctx, s.from, to, subject, &types.Body{Text: content(body)}); err != nil {
 		return fmt.Errorf("send email: %w", err)
 	}
 	return nil
+}
+
+func content(s string) *types.Content {
+	return &types.Content{Data: aws.String(s), Charset: aws.String("UTF-8")}
+}
+
+func (s *SES) send(ctx context.Context, from, to, subject string, body *types.Body) error {
+	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
+	defer cancel()
+	_, err := s.client.SendEmail(ctx, &sesv2.SendEmailInput{
+		FromEmailAddress: aws.String(from),
+		Destination:      &types.Destination{ToAddresses: []string{to}},
+		Content:          &types.EmailContent{Simple: &types.Message{Subject: content(subject), Body: body}},
+	})
+	return err
 }
 
 func getenv(key, fallback string) string {
