@@ -31,8 +31,9 @@ ENV SENDSCORE_ADDR=0.0.0.0:3014 \
 VOLUME /data
 EXPOSE 3014 2525
 USER nonroot:nonroot
-# The app gives open sessions up to a minute on SIGTERM, so stop with a
-# timeout over 60 seconds (docker stop -t 90, or stop_grace_period: 90s).
+# The app gives open sessions 70 seconds on SIGTERM, then the heartbeat 15
+# more, so stop with a timeout of 90 (docker stop -t 90, or
+# stop_grace_period: 90s).
 STOPSIGNAL SIGTERM
 # The image has no shell or curl, so the binary checks itself.
 HEALTHCHECK --interval=30s --timeout=6s --start-period=15s CMD ["/usr/local/bin/sendscore-app", "healthcheck"]

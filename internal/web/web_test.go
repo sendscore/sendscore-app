@@ -338,7 +338,18 @@ func TestStopWaitsAnswersOpenPolls(t *testing.T) {
 	addr, _ := store.CreateAddressFor(context.Background(), time.Hour, u.ID)
 	done := make(chan *httptest.ResponseRecorder)
 	go func() { done <- apiDo(h, "GET", "/api/v1/test-addresses/"+addr.Token+"/wait?timeout=50", tok) }()
-	time.Sleep(100 * time.Millisecond)
+	// StopWaits must reach a poll in progress, not just the next one.
+	for start := time.Now(); ; time.Sleep(time.Millisecond) {
+		a.waitMu.Lock()
+		held := a.waits[""]
+		a.waitMu.Unlock()
+		if held == 1 {
+			break
+		}
+		if time.Since(start) > 5*time.Second {
+			t.Fatal("the long poll never started")
+		}
+	}
 	a.StopWaits()
 	select {
 	case w := <-done:

@@ -142,7 +142,7 @@ func TestSessionsPerIP(t *testing.T) {
 // off with a permanent 554.
 func TestSlowBodyIsNotCutOff(t *testing.T) {
 	old := readTimeout
-	readTimeout = 400 * time.Millisecond
+	readTimeout = time.Second
 	defer func() { readTimeout = old }()
 	store, addr := start(t)
 	a, _ := store.CreateAddress(context.Background(), time.Hour)
@@ -153,11 +153,11 @@ func TestSlowBodyIsNotCutOff(t *testing.T) {
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
 	conn.Write([]byte("EHLO mail.sender.test\r\nMAIL FROM:<bounce@real.test>\r\nRCPT TO:<t-" + a.Token + "@in.test>\r\nDATA\r\n"))
-	// The body goes in five parts, 200 ms apart, so it takes about a second
-	// against a 400 ms read timeout.
+	// The body goes in eight parts, 200 ms apart, so it takes 1.6 seconds
+	// against a 1 second read timeout, with a wide margin on each read.
 	raw := bytes.ReplaceAll(sample(t), []byte("\r\n"), []byte("\n"))
 	raw = bytes.ReplaceAll(raw, []byte("\n"), []byte("\r\n"))
-	chunk := len(raw)/5 + 1
+	chunk := len(raw)/8 + 1
 	for i := 0; i < len(raw); i += chunk {
 		time.Sleep(200 * time.Millisecond)
 		conn.Write(raw[i:min(i+chunk, len(raw))])

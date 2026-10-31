@@ -108,7 +108,7 @@ func TestMonitoringAddressComparesWithThePreviousIssue(t *testing.T) {
 		t.Errorf("first issue: publication %q, %d changes", first.Verdict.Publication, len(first.Verdict.Changes))
 	}
 	if d := first.ExpiresAt.Sub(first.ReceivedAt); d != 365*24*time.Hour {
-		t.Errorf("a pro account's issue is kept for %s, want 365 days", d)
+		t.Errorf("a newsletter's issue is kept for %s, want 365 days", d)
 	}
 	if m, err := store.MessageForUser(ctx, first.ID, u.ID); err != nil || m.ID != first.ID {
 		t.Errorf("the owner cannot read the report through the API: %v", err)

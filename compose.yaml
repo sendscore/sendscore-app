@@ -16,8 +16,21 @@ services:
       # The certificate for the mail domain, readable by uid 65532. Mount
       # the directory, not the files, so a renewal is picked up.
       # - /srv/sendscore/certs:/certs:ro
-    # The app gives open sessions up to a minute to finish on SIGTERM.
+    # The app gives open sessions 70 seconds to finish on SIGTERM, then the
+    # heartbeat 15 more.
     stop_grace_period: 90s
+    # It parses mail from anyone, so it gets no more than it needs: nothing
+    # but /data and /tmp is writable, and uploads spill to /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 1g
+    environment:
+      GOMEMLIMIT: 850MiB
 
 volumes:
   sendscore-data:

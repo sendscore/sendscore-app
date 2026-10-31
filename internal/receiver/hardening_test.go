@@ -270,7 +270,18 @@ func TestShutdownWaitsForAMessageInDATA(t *testing.T) {
 	sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	go func() { done <- r.Shutdown(sctx) }()
-	time.Sleep(100 * time.Millisecond)
+	// The listener closing shows shutdown has begun.
+	for {
+		probe, err := net.DialTimeout("tcp", l.Addr().String(), time.Second)
+		if err != nil {
+			break
+		}
+		probe.Close()
+		if sctx.Err() != nil {
+			t.Fatal("shutdown never began")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if err := w.Close(); err != nil {
 		t.Fatalf("the message in flight was refused: %v", err)
 	}

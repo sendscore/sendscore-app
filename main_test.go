@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -174,4 +176,62 @@ func TestBackupCommand(t *testing.T) {
 	if code := command([]string{"nonsense"}, &out, &errOut); code != 64 {
 		t.Errorf("unknown command = %d", code)
 	}
+}
+
+// The real binary, from start to SIGTERM: this is what no unit can show.
+func TestBinaryAnswersHealthAndStopsOnSIGTERM(t *testing.T) {
+	if testing.Short() {
+		t.Skip("builds the binary")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "sendscore-app")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	web, smtpAddr := freeAddr(t), freeAddr(t)
+	cmd := exec.Command(bin)
+	cmd.Dir = dir // so it reads no .env.local of the developer's
+	cmd.Env = append(os.Environ(), "SENDSCORE_ADDR="+web, "SENDSCORE_SMTP_ADDR="+smtpAddr, "SENDSCORE_DB="+filepath.Join(dir, "t.db"),
+		"SENDSCORE_BASE_URL=http://"+web, "SES_ACCESS_KEY_ID=", "SES_SECRET_ACCESS_KEY=", "SENDSCORE_SECURE_COOKIES=")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	healthy := false
+	for start := time.Now(); time.Since(start) < 15*time.Second; time.Sleep(50 * time.Millisecond) {
+		res, err := http.Get("http://" + web + "/healthz")
+		if err == nil {
+			res.Body.Close()
+			if res.StatusCode == http.StatusOK {
+				healthy = true
+				break
+			}
+		}
+	}
+	if !healthy {
+		t.Fatal("/healthz never answered 200")
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("exit after SIGTERM: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the process did not stop on SIGTERM")
+	}
+}
+
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	return l.Addr().String()
 }
