@@ -3,7 +3,7 @@
 # The engine (github.com/sendscore/sendscore) is the version go.mod names.
 # ENGINE_VERSION overrides it with another tag, a commit, or a pseudo-version.
 #
-#   docker build --build-arg ENGINE_VERSION=v0.2.0 -t sendscore-app .
+#   docker build --build-arg ENGINE_VERSION=v0.3.0 -t sendscore-app .
 
 FROM golang:1.26.10-trixie@sha256:a050dcceee6eb9bf110151662dfac7662f3bec40927c7dee48731e3d92083d42 AS build
 ARG ENGINE_VERSION=

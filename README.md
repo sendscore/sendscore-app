@@ -185,7 +185,7 @@ A build needs only this repository, and uses the engine version in `go.mod`. `EN
 
 ```sh
 docker build -t sendscore-app .
-docker build --build-arg ENGINE_VERSION=v0.2.0 -t sendscore-app .
+docker build --build-arg ENGINE_VERSION=v0.3.0 -t sendscore-app .
 ```
 
 To run it, with the certificate directory mounted, use this.
